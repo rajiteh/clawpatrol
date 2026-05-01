@@ -1,4 +1,4 @@
-module github.com/littledivy/clawpatrol
+module github.com/denoland/clawpatrol-go
 
 go 1.26.1
 

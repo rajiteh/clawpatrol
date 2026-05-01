@@ -3,10 +3,10 @@
 # from source. Installs Go on the fly if needed.
 #
 # Usage:
-#   curl -fsSL https://littledivy.github.io/clawpatrol/install.sh | sh
+#   curl -fsSL https://denoland.github.io/clawpatrol-go/install.sh | sh
 #
 # Options (env vars):
-#   CLAWPATROL_REPO     — defaults to https://github.com/littledivy/clawpatrol
+#   CLAWPATROL_REPO     — defaults to https://github.com/denoland/clawpatrol-go
 #   CLAWPATROL_REF      — git ref to build (default: main)
 #   CLAWPATROL_PREFIX   — install dir (default: $HOME/.local/bin)
 #   CLAWPATROL_GO_VER   — go toolchain version to fetch if `go` missing (default: 1.23.4)
@@ -16,7 +16,7 @@
 
 set -eu
 
-REPO="${CLAWPATROL_REPO:-https://github.com/littledivy/clawpatrol}"
+REPO="${CLAWPATROL_REPO:-https://github.com/denoland/clawpatrol-go}"
 REF="${CLAWPATROL_REF:-main}"
 PREFIX="${CLAWPATROL_PREFIX:-$HOME/.local/bin}"
 GO_VER="${CLAWPATROL_GO_VER:-1.23.4}"
