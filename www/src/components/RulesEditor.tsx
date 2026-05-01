@@ -1,0 +1,142 @@
+import { useEffect, useState } from "react";
+import {
+  aiEditRules,
+  getDeviceRulesYAML,
+  getRulesYAML,
+  putDeviceRulesYAML,
+  putRulesYAML,
+} from "../lib/api";
+
+export function RulesEditor({
+  deviceIP,
+  onClose,
+  onSaved,
+}: {
+  deviceIP?: string;
+  onClose: () => void;
+  onSaved: () => void;
+}) {
+  const [yaml, setYaml] = useState("");
+  const [original, setOriginal] = useState("");
+  const [err, setErr] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [okMsg, setOkMsg] = useState<string | null>(null);
+  const [aiPrompt, setAIPrompt] = useState("");
+  const [aiBusy, setAIBusy] = useState(false);
+
+  useEffect(() => {
+    const fetcher = deviceIP ? getDeviceRulesYAML(deviceIP) : getRulesYAML();
+    fetcher
+      .then((y) => {
+        setYaml(y);
+        setOriginal(y);
+      })
+      .catch((e: Error) => setErr(String(e.message ?? e)));
+  }, [deviceIP]);
+
+  async function save() {
+    setBusy(true);
+    setErr(null);
+    setOkMsg(null);
+    try {
+      const r = deviceIP
+        ? await putDeviceRulesYAML(deviceIP, yaml)
+        : await putRulesYAML(yaml);
+      setOkMsg(`saved · ${r.count} rule${r.count === 1 ? "" : "s"} active`);
+      setOriginal(yaml);
+      onSaved();
+    } catch (e: any) {
+      setErr(String(e.message ?? e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function runAI(e: React.FormEvent) {
+    e.preventDefault();
+    if (!aiPrompt.trim()) return;
+    setAIBusy(true);
+    setErr(null);
+    try {
+      const r = await aiEditRules(aiPrompt, yaml, deviceIP ? "device" : "global");
+      setYaml(r.yaml);
+      setAIPrompt("");
+    } catch (e: any) {
+      setErr(String(e.message ?? e));
+    } finally {
+      setAIBusy(false);
+    }
+  }
+
+  const dirty = yaml !== original;
+  const scopeLabel = deviceIP ? `device ${deviceIP}` : "global";
+
+  return (
+    <div
+      className="fixed inset-0 bg-black/30 flex items-center justify-center z-50"
+      onClick={onClose}
+    >
+      <div
+        className="bg-white border border-[#e5e5e5] rounded-md shadow-2xl flex flex-col w-[820px] max-w-full max-h-[85vh]"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center px-4 py-3 border-b border-[#e5e5e5]">
+          <div className="text-[11px] uppercase tracking-[.12em] text-[#a3a3a3]">EDIT RULES · {scopeLabel}</div>
+          <button
+            onClick={onClose}
+            className="ml-auto text-[11px] px-2 py-1 text-[#a3a3a3] hover:text-[#171717]"
+          >
+            ✕
+          </button>
+        </div>
+
+        <textarea
+          value={yaml}
+          onChange={(e) => setYaml(e.target.value)}
+          spellCheck={false}
+          className="flex-1 w-full p-4 text-[12px] font-mono text-[#171717] bg-[#fafafa] focus:outline-none resize-none border-0"
+          style={{ minHeight: 320 }}
+        />
+
+        <form onSubmit={runAI} className="flex items-center gap-2 px-4 py-2.5 border-t border-[#e5e5e5] bg-white">
+          <span className="text-[10px] uppercase tracking-[.09em] text-[#a3a3a3]">AI</span>
+          <input
+            type="text"
+            value={aiPrompt}
+            onChange={(e) => setAIPrompt(e.target.value)}
+            placeholder='e.g. "deny POST to httpbin.org" — uses connected Claude/Codex'
+            className="flex-1 text-[12px] border border-[#e5e5e5] rounded px-2 py-1.5 focus:outline-none focus:border-[#171717] transition-colors"
+          />
+          <button
+            type="submit"
+            disabled={aiBusy || !aiPrompt.trim()}
+            className="text-[11px] px-3 py-1.5 border border-[#171717] text-[#171717] rounded hover:bg-[#171717] hover:text-white disabled:opacity-40"
+          >
+            {aiBusy ? "thinking…" : "apply"}
+          </button>
+        </form>
+
+        <div className="flex items-center px-4 py-3 border-t border-[#e5e5e5] gap-3">
+          {err && <span className="text-[11px] text-red-600 break-all flex-1">{err}</span>}
+          {okMsg && <span className="text-[11px] text-[#16a34a] flex-1">{okMsg}</span>}
+          {!err && !okMsg && (
+            <span className="text-[11px] text-[#a3a3a3] flex-1">{dirty ? "unsaved changes" : "no changes"}</span>
+          )}
+          <button
+            onClick={onClose}
+            className="text-[11px] px-3 py-1.5 border border-[#e5e5e5] text-[#737373] rounded hover:border-[#a3a3a3]"
+          >
+            close
+          </button>
+          <button
+            onClick={save}
+            disabled={busy || !dirty}
+            className="text-[11px] px-3 py-1.5 bg-[#171717] text-white rounded disabled:bg-[#a3a3a3]"
+          >
+            {busy ? "saving…" : "save"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}

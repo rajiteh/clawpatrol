@@ -1,0 +1,100 @@
+import { useEffect, useState } from "react";
+
+export type EventRecord = {
+  ts: string;
+  mode: string;
+  agent_ip?: string;
+  host: string;
+  method?: string;
+  path?: string;
+  status?: number;
+  in?: number;
+  out?: number;
+  ms: number;
+  action?: string;
+  reason?: string;
+};
+
+export function LiveRequests({ agentIP, max = 200, height }: { agentIP?: string; max?: number; height?: string }) {
+  const [events, setEvents] = useState<EventRecord[]>([]);
+  useEffect(() => {
+    setEvents([]);
+    const url = agentIP
+      ? `/api/events?agent=${encodeURIComponent(agentIP)}`
+      : "/api/events";
+    const es = new EventSource(url);
+    es.onmessage = (e) => {
+      try {
+        const ev = JSON.parse(e.data) as EventRecord;
+        setEvents((prev) => [ev, ...prev].slice(0, max));
+      } catch { /* ignore */ }
+    };
+    return () => es.close();
+  }, [agentIP, max]);
+
+  return (
+    <div className="flex flex-col bg-white border border-[#e5e5e5] rounded overflow-hidden" style={{ height: height ?? "420px" }}>
+      <div className="flex items-center px-4 py-2.5 text-[10px] uppercase tracking-[.12em] text-[#a3a3a3] border-b border-[#e5e5e5] flex-shrink-0">
+        <span>LIVE REQUESTS</span>
+        <span className="ml-2 text-[#22c55e] tabular-nums">● {events.length}</span>
+      </div>
+      <div className="flex-1 overflow-y-auto">
+        {events.length === 0 ? (
+          <div className="px-5 py-8 text-center text-[11px] text-[#a3a3a3]">
+            It's empty in here
+          </div>
+        ) : (
+          events.map((e, i) => <Row key={i} ev={e} />)
+        )}
+      </div>
+    </div>
+  );
+}
+
+function Row({ ev }: { ev: EventRecord }) {
+  const t = new Date(ev.ts);
+  const time =
+    t.toLocaleTimeString([], { hour12: false }) + "." + String(t.getMilliseconds()).padStart(3, "0");
+  const status = ev.status || 0;
+  const statusColor =
+    status >= 500 ? "text-[#dc2626]"
+    : status >= 400 ? "text-[#ea580c]"
+    : status >= 300 ? "text-[#ca8a04]"
+    : status >= 200 ? "text-[#16a34a]"
+    : "text-[#737373]";
+  return (
+    <div className="px-4 py-2 border-b border-[#f5f5f5] hover:bg-[#f9f9f9] flex items-center gap-3 min-w-0">
+      <span className="text-[10px] tabular-nums text-[#a3a3a3] flex-shrink-0">{time}</span>
+      <ModeIcon mode={ev.mode} />
+      {ev.method && (
+        <span className="text-[10px] uppercase font-semibold text-[#525252] flex-shrink-0 w-[44px]">{ev.method}</span>
+      )}
+      <span className={"text-[11px] tabular-nums flex-shrink-0 w-[36px] " + statusColor}>{status || "—"}</span>
+      <span className="text-[12px] text-[#171717] truncate flex-1 min-w-0" title={ev.host + (ev.path ?? "")}>
+        <span className="text-[#737373]">{ev.host}</span>
+        <span>{ev.path ?? ""}</span>
+      </span>
+      <span className="text-[10px] tabular-nums text-[#a3a3a3] flex-shrink-0">{ev.ms}ms</span>
+    </div>
+  );
+}
+
+function ModeIcon({ mode }: { mode: string }) {
+  if (mode === "mitm") {
+    return (
+      <span title="MITM — gateway decrypted, inspected, forwarded" className="flex-shrink-0">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="#f6821f">
+          <path d="M7 10V7a5 5 0 0 1 10 0v3h1a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2v-8a2 2 0 0 1 2-2h1Zm2 0h6V7a3 3 0 1 0-6 0v3Z" />
+        </svg>
+      </span>
+    );
+  }
+  return (
+    <span title="Splice — gateway forwarded encrypted bytes untouched" className="flex-shrink-0">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#a3a3a3" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+        <path d="M5 12h14" />
+        <path d="m13 6 6 6-6 6" />
+      </svg>
+    </span>
+  );
+}

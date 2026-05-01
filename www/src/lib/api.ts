@@ -1,0 +1,208 @@
+export type Owner = {
+  owner: string;
+  connected: boolean;
+  expires_at?: number;
+};
+
+export type Integration = {
+  id: string;
+  name: string;
+  has_oauth: boolean;
+  owners: Owner[] | null;
+};
+
+export type Session = {
+  id: string;
+  title?: string;
+  type: string;
+  model?: string;
+  tokens_in?: number;
+  tokens_out?: number;
+  ctx_used?: number;
+  ctx_max?: number;
+  first_at: string;
+  last_at: string;
+  reqs: number;
+  activity?: number[];
+};
+
+export type Agent = {
+  ip: string;
+  hostname: string;
+  user: string;
+  os: string;
+  ua?: string;
+  first_at: string;
+  last_at: string;
+  reqs: number;
+  bytes_in: number;
+  bytes_out: number;
+  last_host: string;
+  activity?: number[];
+  integrations?: string[];
+  sessions?: Session[];
+};
+
+export type RuleSummary = {
+  host: string;
+  device?: string;
+  port?: number;
+  action?: string;
+  reason?: string;
+  auth?: string;
+  body?: boolean;
+  ws_scan?: boolean;
+  match?: {
+    method?: string[];
+    path?: string;
+    query?: Record<string, string[]>;
+    headers?: Record<string, string>;
+  };
+};
+
+export async function getRules(): Promise<RuleSummary[]> {
+  const r = await fetch("/api/rules");
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+export async function getRulesYAML(): Promise<string> {
+  const r = await fetch("/api/rules?format=yaml");
+  if (!r.ok) throw new Error(await r.text());
+  return r.text();
+}
+
+export async function putRulesYAML(yaml: string): Promise<{ ok: boolean; count: number }> {
+  const r = await fetch("/api/rules", {
+    method: "PUT",
+    headers: { "Content-Type": "application/x-yaml" },
+    body: yaml,
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+export async function getDeviceRules(ip: string): Promise<RuleSummary[]> {
+  const r = await fetch(`/api/rules/device?ip=${encodeURIComponent(ip)}`);
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+export async function getDeviceRulesYAML(ip: string): Promise<string> {
+  const r = await fetch(`/api/rules/device?ip=${encodeURIComponent(ip)}&format=yaml`);
+  if (!r.ok) throw new Error(await r.text());
+  return r.text();
+}
+
+export async function putDeviceRulesYAML(ip: string, yaml: string): Promise<{ ok: boolean; count: number }> {
+  const r = await fetch(`/api/rules/device?ip=${encodeURIComponent(ip)}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/x-yaml" },
+    body: yaml,
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+export type HITLPending = {
+  id: string;
+  agent_ip: string;
+  host: string;
+  method: string;
+  path: string;
+  ua?: string;
+  body_sample?: string;
+  reason?: string;
+  created_at: string;
+  expires_at: string;
+};
+
+export async function getHITLPending(): Promise<HITLPending[]> {
+  const r = await fetch("/api/hitl/pending");
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+export async function decideHITL(id: string, allow: boolean): Promise<void> {
+  const r = await fetch("/api/hitl/decide", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ id, allow }),
+  });
+  if (!r.ok) throw new Error(await r.text());
+}
+
+export async function aiEditRules(prompt: string, currentYAML: string, scope: "global" | "device", agent?: string): Promise<{ yaml: string }> {
+  const r = await fetch("/api/rules/ai", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ prompt, current_yaml: currentYAML, scope, agent: agent ?? "" }),
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+export type Whoami = {
+  user: string;
+  device: string;
+  host: string;
+  public_url?: string;
+};
+
+export async function getStatus(): Promise<Integration[]> {
+  const r = await fetch("/api/status");
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+export async function deleteAgent(ip: string): Promise<void> {
+  const r = await fetch(`/api/agents/delete?ip=${encodeURIComponent(ip)}`, { method: "POST" });
+  if (!r.ok) throw new Error(await r.text());
+}
+
+export async function getAgents(): Promise<Agent[]> {
+  const r = await fetch("/api/agents");
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+export async function getWhoami(): Promise<Whoami> {
+  const r = await fetch("/api/whoami");
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+export type OAuthStartResp =
+  | { flow?: "auth_code"; auth_url: string; state: string; owner: string }
+  | { flow: "device"; user_code: string; verification_uri: string; state: string; owner: string; interval: number; expires_in: number };
+
+export async function oauthStart(id: string): Promise<OAuthStartResp> {
+  const r = await fetch(`/api/oauth/start?id=${encodeURIComponent(id)}`, { method: "POST" });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+export async function oauthDevicePoll(state: string): Promise<{ connected?: boolean; owner?: string; error?: string; detail?: string }> {
+  const r = await fetch(`/api/oauth/device-poll?state=${encodeURIComponent(state)}`, { method: "POST" });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+export async function oauthRevoke(id: string, owner: string): Promise<void> {
+  const r = await fetch("/api/oauth/revoke", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ id, owner }),
+  });
+  if (!r.ok) throw new Error(await r.text());
+}
+
+export async function oauthExchange(state: string, code: string): Promise<{ connected: boolean; owner: string; expires: number }> {
+  const r = await fetch("/api/oauth/exchange", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ state, code }),
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}

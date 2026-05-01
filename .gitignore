@@ -1,0 +1,13 @@
+.env
+ca/
+ts-state/
+dist/
+gateway
+clawall
+unclaw
+*.log
+www/node_modules
+www/dist
+config.local.yaml
+oauth/
+spec.md
