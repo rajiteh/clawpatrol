@@ -8,11 +8,13 @@
 package credentials
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 
@@ -46,10 +48,18 @@ type HeaderToken struct {
 type MTLSCredential struct{}
 
 // PostgresCredential: the wire-protocol user the runtime uses when
-// swapping the agent's StartupMessage. Password is fetched by name
-// from the secret store at request time.
+// terminating upstream auth on the agent's behalf. User is the HCL
+// field; password lives in the secret store under the credential's
+// bare name (operator pastes via the dashboard's Postgres slot).
 type PostgresCredential struct {
 	User string `hcl:"user,optional"`
+}
+
+// PostgresAuth implements runtime.PostgresAuthCredential — the
+// postgres endpoint runtime calls this once per session to learn
+// what (user, password) to use for upstream SCRAM / cleartext.
+func (p *PostgresCredential) PostgresAuth(sec runtime.Secret) (string, string) {
+	return p.User, string(sec.Bytes)
 }
 
 // Anthropic — manual key (X-API-Key bearer-style) and the OAuth
@@ -208,6 +218,149 @@ func (g *GitHubOAuth) InjectHTTP(_ context.Context, req *http.Request, sec runti
 	return nil
 }
 
+// SlackTokens: bot + app token pair. Default-injects the bot token
+// as `Authorization: Bearer xoxb-…`. Slack admin endpoints
+// (auth.test, admin.*, apps.*) prefer the app token; if the operator
+// declared one, use it for those paths instead. Falls back to bot
+// when only one slot is filled.
+func (s *SlackTokens) InjectHTTP(_ context.Context, req *http.Request, sec runtime.Secret) error {
+	bot := sec.Extras["bot"]
+	app := sec.Extras["app"]
+	pick := bot
+	if app != "" && slackPathPrefersApp(req.URL.Path) {
+		pick = app
+	}
+	if pick == "" {
+		// Either operator hasn't filled the relevant slot yet, or
+		// they're using a single-slot setup that landed in Bytes.
+		if len(sec.Bytes) > 0 {
+			pick = string(sec.Bytes)
+		}
+	}
+	if pick == "" {
+		return nil
+	}
+	req.Header.Set("Authorization", "Bearer "+pick)
+	return nil
+}
+
+func slackPathPrefersApp(path string) bool {
+	for _, p := range []string{"/api/admin.", "/api/apps.", "/api/auth.test"} {
+		if strings.HasPrefix(path, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// TelegramBotToken: bot token lives in the URL path
+// (`/bot<TOKEN>/<METHOD>`) and sometimes in the request body
+// (setWebhook posts a URL containing the token). We swap every
+// occurrence of the operator-emitted placeholder with the real
+// secret. Mirrors unclaw's plugin model — operator's CLI uses the
+// placeholder verbatim; gateway substitutes globally so token never
+// hits the upstream as the placeholder, and never leaks to logs.
+func (t *TelegramBotToken) InjectHTTP(_ context.Context, req *http.Request, sec runtime.Secret) error {
+	if len(sec.Bytes) == 0 || req.URL == nil {
+		return nil
+	}
+	real := string(sec.Bytes)
+	swap := func(s string) string {
+		return strings.ReplaceAll(s, telegramPlaceholder, real)
+	}
+
+	if strings.Contains(req.URL.Path, telegramPlaceholder) {
+		req.URL.Path = swap(req.URL.Path)
+		// Drop the encoded form so http.Client re-encodes from .Path.
+		req.URL.RawPath = ""
+	}
+	if strings.Contains(req.URL.RawQuery, telegramPlaceholder) {
+		req.URL.RawQuery = swap(req.URL.RawQuery)
+	}
+
+	if req.Body != nil && req.Body != http.NoBody {
+		buf, err := io.ReadAll(req.Body)
+		_ = req.Body.Close()
+		if err != nil {
+			return err
+		}
+		if bytes.Contains(buf, []byte(telegramPlaceholder)) {
+			buf = bytes.ReplaceAll(buf, []byte(telegramPlaceholder), sec.Bytes)
+		}
+		req.Body = io.NopCloser(bytes.NewReader(buf))
+		req.ContentLength = int64(len(buf))
+	}
+	return nil
+}
+
+// GeminiAPIKey: Google Gemini accepts the API key in either the
+// `x-goog-api-key` header or the `?key=` query parameter. Always
+// overwrite both — agents that send placeholder values get them
+// swapped; agents that don't send anything get the real key
+// stamped in.
+func (g *GeminiAPIKey) InjectHTTP(_ context.Context, req *http.Request, sec runtime.Secret) error {
+	if len(sec.Bytes) == 0 || req.URL == nil {
+		return nil
+	}
+	key := string(sec.Bytes)
+	req.Header.Set("x-goog-api-key", key)
+	q := req.URL.Query()
+	if q.Get("key") != "" {
+		// Only rewrite the param when the agent set one — otherwise
+		// header injection above is sufficient and we don't want to
+		// surprise the agent with an extra param.
+		q.Set("key", key)
+		req.URL.RawQuery = q.Encode()
+	}
+	return nil
+}
+
+// NotionOAuth: Bearer token in Authorization header + Notion-Version
+// header (Notion's API requires the version, defaults to a recent
+// stable). Agents wire the OAuth token through their SDK; gateway
+// overwrites at MITM time so per-profile rotation works without
+// reconfiguring the agent.
+func (n *NotionOAuth) InjectHTTP(_ context.Context, req *http.Request, sec runtime.Secret) error {
+	if len(sec.Bytes) == 0 {
+		return nil
+	}
+	req.Header.Set("Authorization", "Bearer "+string(sec.Bytes))
+	if req.Header.Get("Notion-Version") == "" {
+		req.Header.Set("Notion-Version", "2022-06-28")
+	}
+	return nil
+}
+
+// ClickhouseCredential: HTTPS API takes user + password as query
+// params (?user=…&password=…) or basic-auth header. We populate both
+// — basic-auth handles default-auth ClickHouse setups, query params
+// handle setups that disable header auth. User comes from the HCL
+// field; password from the operator-pasted secret bytes.
+func (c *ClickhouseCredential) InjectHTTP(_ context.Context, req *http.Request, sec runtime.Secret) error {
+	if c.User == "" || len(sec.Bytes) == 0 || req.URL == nil {
+		return nil
+	}
+	password := string(sec.Bytes)
+	req.SetBasicAuth(c.User, password)
+	q := req.URL.Query()
+	q.Set("user", c.User)
+	q.Set("password", password)
+	req.URL.RawQuery = q.Encode()
+	return nil
+}
+
+// telegramPlaceholder is the bot-token placeholder operators put in
+// their SDK config / URL when running through the gateway. The agent
+// hits api.telegram.org/bot<placeholder>/method, gateway swaps the
+// placeholder for the real token everywhere it appears (URL path,
+// query string, body — Telegram's setWebhook posts a URL containing
+// the token, so body matters too).
+//
+// Telegram doesn't appear in `clawpatrol env` because Telegram SDKs
+// take the token as an explicit argument rather than reading it from
+// the env, so there's nothing to "push down".
+const telegramPlaceholder = "0000000000:clawpatrol-placeholder-do-not-use"
+
 // ensureBeta appends `beta` to a comma-separated `anthropic-beta`
 // header if it isn't already present. Anthropic gates experimental
 // features (including OAuth bearer auth) behind these tokens.
@@ -284,16 +437,16 @@ func init() {
 		{"cookie_token", newer[CookieToken](), (*CookieToken)(nil)},
 		{"header_token", newer[HeaderToken](), (*HeaderToken)(nil)},
 		{"mtls_credential", newer[MTLSCredential](), (*MTLSCredential)(nil)},
-		{"postgres_credential", newer[PostgresCredential](), nil},
+		{"postgres_credential", newer[PostgresCredential](), (*PostgresCredential)(nil)},
 		{"anthropic_manual_key", newer[AnthropicManualKey](), (*AnthropicManualKey)(nil)},
 		{"anthropic_oauth_subscription", newer[AnthropicOAuthSubscription](), (*AnthropicOAuthSubscription)(nil)},
-		{"slack_tokens", newer[SlackTokens](), nil},
-		{"telegram_bot_token", newer[TelegramBotToken](), nil},
-		{"gemini_api_key", newer[GeminiAPIKey](), nil},
+		{"slack_tokens", newer[SlackTokens](), (*SlackTokens)(nil)},
+		{"telegram_bot_token", newer[TelegramBotToken](), (*TelegramBotToken)(nil)},
+		{"gemini_api_key", newer[GeminiAPIKey](), (*GeminiAPIKey)(nil)},
 		{"openai_codex_oauth", newer[OpenAICodexOAuth](), (*OpenAICodexOAuth)(nil)},
 		{"github_oauth", newer[GitHubOAuth](), (*GitHubOAuth)(nil)},
-		{"notion_oauth", newer[NotionOAuth](), nil},
-		{"clickhouse_credential", newer[ClickhouseCredential](), nil},
+		{"notion_oauth", newer[NotionOAuth](), (*NotionOAuth)(nil)},
+		{"clickhouse_credential", newer[ClickhouseCredential](), (*ClickhouseCredential)(nil)},
 		{"aws_eks_credential", newer[AWSEKSCredential](), nil},
 	}
 	for _, w := range wireds {
@@ -311,13 +464,19 @@ func init() {
 	// contract — catches signature drift early rather than at first
 	// request.
 	var (
-		_ runtime.HTTPCredentialRuntime = (*BearerToken)(nil)
-		_ runtime.HTTPCredentialRuntime = (*CookieToken)(nil)
-		_ runtime.HTTPCredentialRuntime = (*HeaderToken)(nil)
-		_ runtime.HTTPCredentialRuntime = (*AnthropicManualKey)(nil)
-		_ runtime.HTTPCredentialRuntime = (*AnthropicOAuthSubscription)(nil)
-		_ runtime.HTTPCredentialRuntime = (*OpenAICodexOAuth)(nil)
-		_ runtime.HTTPCredentialRuntime = (*GitHubOAuth)(nil)
-		_ runtime.TLSCredentialRuntime  = (*MTLSCredential)(nil)
+		_ runtime.HTTPCredentialRuntime  = (*BearerToken)(nil)
+		_ runtime.HTTPCredentialRuntime  = (*CookieToken)(nil)
+		_ runtime.HTTPCredentialRuntime  = (*HeaderToken)(nil)
+		_ runtime.HTTPCredentialRuntime  = (*AnthropicManualKey)(nil)
+		_ runtime.HTTPCredentialRuntime  = (*AnthropicOAuthSubscription)(nil)
+		_ runtime.HTTPCredentialRuntime  = (*OpenAICodexOAuth)(nil)
+		_ runtime.HTTPCredentialRuntime  = (*GitHubOAuth)(nil)
+		_ runtime.HTTPCredentialRuntime  = (*SlackTokens)(nil)
+		_ runtime.HTTPCredentialRuntime  = (*TelegramBotToken)(nil)
+		_ runtime.HTTPCredentialRuntime  = (*GeminiAPIKey)(nil)
+		_ runtime.HTTPCredentialRuntime  = (*NotionOAuth)(nil)
+		_ runtime.HTTPCredentialRuntime  = (*ClickhouseCredential)(nil)
+		_ runtime.TLSCredentialRuntime   = (*MTLSCredential)(nil)
+		_ runtime.PostgresAuthCredential = (*PostgresCredential)(nil)
 	)
 }

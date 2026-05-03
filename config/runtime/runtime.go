@@ -12,6 +12,7 @@ import (
 	"errors"
 	"net"
 	"net/http"
+	"time"
 
 	"github.com/denoland/clawpatrol-go/config"
 	"github.com/denoland/clawpatrol-go/config/match"
@@ -34,6 +35,14 @@ type HTTPCredentialRuntime interface {
 // front-end calls this once per session.
 type PostgresCredentialRuntime interface {
 	InjectPostgres(ctx context.Context, startup *PostgresStartup, sec Secret) error
+}
+
+// PostgresAuthCredential is what the postgres endpoint runtime needs
+// from a credential plugin to terminate upstream auth. The credential
+// returns its (user, password) — runtime drives the SCRAM / cleartext
+// handshake itself, so the agent never sees an auth challenge.
+type PostgresAuthCredential interface {
+	PostgresAuth(sec Secret) (user, password string)
 }
 
 // TLSCredentialRuntime customizes the upstream TLS configuration
@@ -143,10 +152,36 @@ type PostgresStartup struct {
 	Password string
 }
 
+// HITLNotifier is the optional interface a credential plugin
+// implements when it can deliver a HITL approval prompt to a human
+// (Slack chat.postMessage, Discord webhook, Telegram sendMessage,
+// SMTP, PagerDuty alert, etc.). HumanApprover dispatches to its
+// configured credential's notifier — adding a new channel =
+// implementing this on a new credential plugin, no main-package
+// changes.
+type HITLNotifier interface {
+	NotifyHITL(ctx context.Context, req ApproveRequest, target HITLTarget) error
+}
+
+// HITLTarget is the per-approver config the notifier needs:
+// where to send the prompt, whether to render interactive buttons,
+// and the pending entry's id (for action_id payload encoding).
+type HITLTarget struct {
+	CredentialName string // bare name — for SecretStore.Get
+	Channel        string // routing target (#chan / chat_id / email)
+	Interactive    bool   // approve/deny buttons vs. dashboard-only
+	PendingID      string // pool's pending entry id
+	DashboardURL   string // for fallback dashboard link in non-interactive mode
+}
+
 // ApproverRuntime evaluates one stage of an approve = [...] chain.
-// LLMApprover and HumanApprover plugins both implement it; the
-// outcome semantics are the same — return Verdict + reason or surface
-// a timeout.
+// Built-in approvers (dashboard, human, llm) implement it; out-of-tree
+// plugins ship their own approver type and runtime via the same
+// interface. Return Verdict + reason or surface a timeout.
+//
+// Implementations live on the approver plugin's decoded body so the
+// dispatcher can type-assert and invoke per-approver logic without
+// new wiring per type.
 type ApproverRuntime interface {
 	Approve(ctx context.Context, req ApproveRequest) (ApproveVerdict, error)
 }
@@ -159,12 +194,45 @@ type ApproveRequest struct {
 	Endpoint *config.CompiledEndpoint
 	Rule     *config.CompiledRule
 	Request  *match.Request
+	// ApproverName is the bare name from the stage — also the key the
+	// approver should use against Pool / Secrets when it needs to
+	// disambiguate per-approver state.
+	ApproverName string
+	// Profile of the originating peer; SecretStore lookup key for
+	// per-profile credentials.
+	Profile string
+	// Method / Host / Path / UA / BodySample carry the request shape
+	// for HITL prompts. Endpoint plugins fill these so approvers
+	// don't have to know the family-specific Request internals.
+	Method     string
+	Host       string
+	Path       string
+	UA         string
+	BodySample string
+	Reason     string
+
+	// Pool exposes the gateway's shared pending-approval list — the
+	// dashboard / Slack approvers use it to publish a pending entry
+	// and block until a decision arrives. Synchronous approvers
+	// (LLM) leave it nil-handled.
+	Pool HITLPool
+	// Secrets fetches the bot token / API key the approver needs to
+	// post a notification or call an LLM judge.
+	Secrets SecretStore
+	// DashboardURL is the operator-facing dashboard origin used for
+	// deep links in Slack messages and similar notifications.
+	DashboardURL string
+
 	// Policy text resolved from the stage's Policy reference, when
 	// the stage names one. Empty for bare-name stages.
 	PolicyText string
 	// Defaults from the file's defaults {} block; plugins fall back
 	// to these when their own config doesn't override.
 	Defaults config.Defaults
+	// Policy gives approvers access to the full compiled policy —
+	// HumanApprover uses it to look up its referenced credential
+	// entity and dispatch via HITLNotifier.
+	Policy *config.CompiledPolicy
 }
 
 // ApproveVerdict is what an approver returns. "" Decision means the
@@ -173,6 +241,53 @@ type ApproveRequest struct {
 type ApproveVerdict struct {
 	Decision string // "allow" | "deny" | ""
 	Reason   string
+	By       string // who decided ("dashboard:<user>" / "slack:#chan" / "llm:<model>")
+}
+
+// HITLPool is the shared pending-approval surface the dashboard
+// presents to operators. Approver runtimes that need human input
+// (dashboard, Slack human-approver, etc.) call Add to publish an
+// entry and block on the returned channel until the dashboard's
+// PUT /api/hitl/decide signals back.
+//
+// The pool implementation lives in the gateway main package; runtime
+// only declares the contract so approver plugins can satisfy
+// ApproverRuntime without depending on main.
+type HITLPool interface {
+	// Add publishes a pending entry. Returns the assigned id (used
+	// by Decide) and a channel that fires exactly once when the
+	// pool gets a verdict. Caller must select on ctx.Done() too;
+	// if ctx fires first, call Discard(id) to clean up.
+	Add(p HITLPending) (id string, decision <-chan HITLDecision)
+	// Discard drops a pending entry without a decision. Use when
+	// the caller's context expires before the channel fires.
+	Discard(id string)
+}
+
+// HITLPending mirrors the dashboard's pending-approval shape. Stays
+// here (vs main package) so approver plugins can construct it. JSON
+// tags match the dashboard's existing field names — that endpoint is
+// public API to the in-tree React UI.
+type HITLPending struct {
+	ID         string    `json:"id"`
+	AgentIP    string    `json:"agent_ip"`
+	Host       string    `json:"host"`
+	Method     string    `json:"method"`
+	Path       string    `json:"path"`
+	UA         string    `json:"ua,omitempty"`
+	BodySample string    `json:"body_sample,omitempty"`
+	Reason     string    `json:"reason,omitempty"`
+	Approvers  []string  `json:"approvers,omitempty"`
+	CreatedAt  time.Time `json:"created_at"`
+	ExpiresAt  time.Time `json:"expires_at"`
+}
+
+// HITLDecision is what the pool delivers when an operator approves
+// or denies a pending entry.
+type HITLDecision struct {
+	Allow  bool
+	Reason string
+	By     string
 }
 
 // ErrUnsupported is returned by a plugin's runtime hook when the

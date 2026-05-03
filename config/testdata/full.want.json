@@ -4,24 +4,30 @@
       "billing": {
         "body": {
           "Channel": "#billing-approvals",
+          "Credential": "",
           "Timeout": 0,
-          "RequireApprovers": 0
+          "RequireApprovers": 0,
+          "Interactive": false
         },
         "type": "human_approver"
       },
       "billing-strict": {
         "body": {
           "Channel": "#billing-approvals",
+          "Credential": "",
           "Timeout": 0,
-          "RequireApprovers": 2
+          "RequireApprovers": 2,
+          "Interactive": false
         },
         "type": "human_approver"
       },
       "console-dba": {
         "body": {
           "Channel": "#agent-db",
+          "Credential": "",
           "Timeout": 0,
-          "RequireApprovers": 0
+          "RequireApprovers": 0,
+          "Interactive": false
         },
         "type": "human_approver"
       },
@@ -42,32 +48,40 @@
       "notion-archive": {
         "body": {
           "Channel": "#agent-notion",
+          "Credential": "",
           "Timeout": 0,
-          "RequireApprovers": 0
+          "RequireApprovers": 0,
+          "Interactive": false
         },
         "type": "human_approver"
       },
       "observability": {
         "body": {
           "Channel": "#observability",
+          "Credential": "",
           "Timeout": 0,
-          "RequireApprovers": 0
+          "RequireApprovers": 0,
+          "Interactive": false
         },
         "type": "human_approver"
       },
       "scheduler-ops": {
         "body": {
           "Channel": "#agent-db",
+          "Credential": "",
           "Timeout": 0,
-          "RequireApprovers": 0
+          "RequireApprovers": 0,
+          "Interactive": false
         },
         "type": "human_approver"
       },
       "support-ops": {
         "body": {
           "Channel": "#agent-support",
+          "Credential": "",
           "Timeout": 86400,
-          "RequireApprovers": 0
+          "RequireApprovers": 0,
+          "Interactive": false
         },
         "type": "human_approver"
       }
@@ -504,6 +518,7 @@
         "body": {
           "Host": "deployng-prod.cluster-cnmc6k08siv7.us-east-2.rds.amazonaws.com:5432",
           "Database": "deployng",
+          "SSLMode": "",
           "Credential": "",
           "Credentials": [
             {
@@ -523,6 +538,7 @@
         "body": {
           "Host": "scheduler-prod.cluster-cnmc6k08siv7.us-east-2.rds.amazonaws.com:5432",
           "Database": "scheduler",
+          "SSLMode": "",
           "Credential": "pg-scheduler-cred"
         },
         "family": "sql",

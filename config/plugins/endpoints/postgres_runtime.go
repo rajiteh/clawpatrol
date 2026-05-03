@@ -45,6 +45,20 @@ const sslRequestCode = 80877103
 // HandleConn is the postgres ConnEndpointRuntime entry point.
 // One call per inbound TCP connection; returns when either side
 // closes.
+//
+// Flow:
+//
+//  1. SSLRequest from agent → reply 'N' (refuse TLS, WG already
+//     encrypts).
+//  2. Read agent's StartupMessage; extract `database` for upstream.
+//  3. Resolve credential, get (user, password) via PostgresAuthCredential.
+//  4. Dial upstream, send our own StartupMessage(real_user, database).
+//  5. Drive upstream auth (SCRAM-SHA-256 or cleartext) using real
+//     password. Buffer post-auth frames (ParameterStatus*,
+//     BackendKeyData, ReadyForQuery).
+//  6. Synthesize AuthenticationOk to agent + replay buffered
+//     post-auth frames so agent proceeds as if it just authed.
+//  7. Bidirectional pump with per-query inspection.
 func (PostgresEndpointRuntime) HandleConn(ctx context.Context, ch *runtime.ConnHandle) error {
 	defer ch.Conn.Close()
 	if ch.Endpoint == nil || ch.Endpoint.Family != "sql" {
@@ -55,39 +69,113 @@ func (PostgresEndpointRuntime) HandleConn(ctx context.Context, ch *runtime.ConnH
 	if upstreamAddr == "" {
 		return fmt.Errorf("postgres endpoint %q has no host", ch.Endpoint.Name)
 	}
-	upstream, err := ch.DialUpstream(ctx, "tcp", upstreamAddr)
-	if err != nil {
-		return fmt.Errorf("dial %s: %w", upstreamAddr, err)
-	}
-	defer upstream.Close()
 
-	// SSLRequest peek: 4-byte length + 4-byte code. If it matches,
-	// reply 'N' so the agent retries plaintext. Otherwise the bytes
-	// we just read are the start of a StartupMessage; forward them.
+	// Step 1: agent's first 8 bytes — SSLRequest or StartupMessage.
 	hdr := make([]byte, 8)
 	if _, err := io.ReadFull(ch.Conn, hdr); err != nil {
 		return nil
 	}
 	length := binary.BigEndian.Uint32(hdr[:4])
 	code := binary.BigEndian.Uint32(hdr[4:8])
+	var startupHead []byte
 	if length == 8 && code == sslRequestCode {
 		if _, err := ch.Conn.Write([]byte{'N'}); err != nil {
 			return nil
 		}
-		// Next bytes are the real StartupMessage — fall into the loop.
+		startupHead = nil
 	} else {
-		if _, err := upstream.Write(hdr); err != nil {
-			return nil
+		startupHead = hdr // actually the start of the StartupMessage
+	}
+
+	// Step 2: read full StartupMessage from agent.
+	startupBody, err := pgReadStartup(ch.Conn, startupHead)
+	if err != nil {
+		return fmt.Errorf("read agent startup: %w", err)
+	}
+	database := pgStartupParam(startupBody, "database")
+	if database == "" {
+		database = pgStartupParam(startupBody, "user") // pg default
+	}
+
+	// Step 3: resolve credential. Multi-credential postgres endpoints
+	// (account ro/rw) dispatch on the placeholder string the agent
+	// embedded in the StartupMessage user field — operator sets
+	// PGUSER=PH_pg_deployng_ro and the gateway picks the matching
+	// credential. Single-credential endpoints fall through to the
+	// only entry.
+	agentUser := pgStartupParam(startupBody, "user")
+	cc := pgResolveCredential(ch.Endpoint, agentUser)
+	if cc == nil {
+		pgWriteError(ch.Conn, "no credential bound to postgres endpoint")
+		return fmt.Errorf("no credential")
+	}
+	// Plugin.Runtime is a typed-nil sentinel used for interface
+	// dispatch checks; the actual decoded HCL value is on Body.
+	auth, ok := cc.Credential.Body.(runtime.PostgresAuthCredential)
+	if !ok {
+		pgWriteError(ch.Conn, "credential plugin does not implement postgres auth")
+		return fmt.Errorf("credential %q has no PostgresAuth", cc.Credential.Symbol.Name)
+	}
+	sec, err := ch.Secrets.Get(cc.Credential.Symbol.Name, ch.Profile)
+	if err != nil {
+		pgWriteError(ch.Conn, "fetch secret: "+err.Error())
+		return err
+	}
+	realUser, realPassword := auth.PostgresAuth(sec)
+	if realUser == "" {
+		pgWriteError(ch.Conn, "postgres credential has no user — set `user = ...` in HCL")
+		return fmt.Errorf("credential %q missing user", cc.Credential.Symbol.Name)
+	}
+	if realPassword == "" {
+		pgWriteError(ch.Conn, fmt.Sprintf("postgres credential %q has no password — paste it via the dashboard", cc.Credential.Symbol.Name))
+		return fmt.Errorf("credential %q missing password", cc.Credential.Symbol.Name)
+	}
+
+	// Step 4: dial upstream, optionally negotiate TLS, then send our
+	// own StartupMessage with real (user, database).
+	upstream, err := ch.DialUpstream(ctx, "tcp", upstreamAddr)
+	if err != nil {
+		pgWriteError(ch.Conn, "dial upstream: "+err.Error())
+		return fmt.Errorf("dial %s: %w", upstreamAddr, err)
+	}
+	defer upstream.Close()
+
+	pgEp, _ := ch.Endpoint.Body.(*PostgresEndpoint)
+	sslmode := "prefer"
+	if pgEp != nil && pgEp.SSLMode != "" {
+		sslmode = pgEp.SSLMode
+	}
+	if sslmode != "disable" {
+		secured, sslErr := pgUpgradeSSL(upstream, pgEp, sslmode)
+		if sslErr != nil {
+			pgWriteError(ch.Conn, "upstream tls: "+sslErr.Error())
+			return sslErr
 		}
-		if length > 8 {
-			if _, err := io.CopyN(upstream, ch.Conn, int64(length-8)); err != nil {
-				return nil
-			}
+		if secured != nil {
+			upstream = secured
 		}
 	}
 
-	// Two pumps: server→client unmodified, client→server with
-	// per-message inspection.
+	if err := pgSendStartup(upstream, realUser, database); err != nil {
+		pgWriteError(ch.Conn, "send upstream startup: "+err.Error())
+		return err
+	}
+
+	// Step 5 + 6: drive upstream auth, replay post-auth to agent.
+	postAuth, err := pgPerformAuth(upstream, realUser, realPassword)
+	if err != nil {
+		pgWriteError(ch.Conn, "upstream auth: "+err.Error())
+		return err
+	}
+	if err := pgWriteAuthOK(ch.Conn, postAuth); err != nil {
+		return nil
+	}
+
+	// Step 7: bidirectional pump with per-query inspection. The
+	// picked credential's bare name flows into match.Request.Credential
+	// so SQL rules with `match = { credential = pg-deployng-ro }`
+	// resolve against the right account.
+	credName := cc.Credential.Symbol.Name
 	done := make(chan struct{}, 2)
 	go func() {
 		_, _ = io.Copy(ch.Conn, upstream)
@@ -95,15 +183,76 @@ func (PostgresEndpointRuntime) HandleConn(ctx context.Context, ch *runtime.ConnH
 	}()
 	go func() {
 		defer func() { done <- struct{}{} }()
-		pgClientToServer(ctx, ch, upstream)
+		pgClientToServer(ctx, ch, upstream, credName)
 	}()
 	<-done
 	return nil
 }
 
+// pgReadStartup reads the rest of a StartupMessage given the first 8
+// bytes already pulled off the wire. The first 4 bytes are length;
+// payload is length-4 bytes total (the 8-byte head includes 4 bytes
+// of payload — typically the protocol version 196608).
+func pgReadStartup(r io.Reader, head []byte) ([]byte, error) {
+	if head == nil {
+		head = make([]byte, 8)
+		if _, err := io.ReadFull(r, head); err != nil {
+			return nil, err
+		}
+	}
+	length := binary.BigEndian.Uint32(head[:4])
+	if length < 8 || length > 1<<20 {
+		return nil, fmt.Errorf("bogus startup length %d", length)
+	}
+	out := make([]byte, length)
+	copy(out, head)
+	rest := length - 8
+	if rest > 0 {
+		if _, err := io.ReadFull(r, out[8:]); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+// pgStartupParam pulls one named parameter out of a StartupMessage
+// body. Params start at offset 8 (after length + protocol version),
+// alternating null-terminated key/value strings, terminated by an
+// extra null byte.
+func pgStartupParam(body []byte, key string) string {
+	if len(body) < 8 {
+		return ""
+	}
+	b := body[8:]
+	for len(b) > 0 && b[0] != 0 {
+		end := 0
+		for end < len(b) && b[end] != 0 {
+			end++
+		}
+		k := string(b[:end])
+		if end+1 > len(b) {
+			break
+		}
+		b = b[end+1:]
+		end = 0
+		for end < len(b) && b[end] != 0 {
+			end++
+		}
+		v := string(b[:end])
+		if end+1 > len(b) {
+			break
+		}
+		b = b[end+1:]
+		if k == key {
+			return v
+		}
+	}
+	return ""
+}
+
 // pgClientToServer pumps the agent's outbound message stream to the
 // upstream, inspecting Query / Parse for policy.
-func pgClientToServer(ctx context.Context, ch *runtime.ConnHandle, upstream net.Conn) {
+func pgClientToServer(ctx context.Context, ch *runtime.ConnHandle, upstream net.Conn, credName string) {
 	buf := make([]byte, 0, 64*1024)
 	tmp := make([]byte, 32*1024)
 	for {
@@ -119,7 +268,7 @@ func pgClientToServer(ctx context.Context, ch *runtime.ConnHandle, upstream net.
 				if msg.typ == 'Q' || msg.typ == 'P' {
 					sql := pgExtractSQL(msg.typ, msg.payload)
 					if sql != "" {
-						verdict, reason := pgEvaluate(ch, sql)
+						verdict, reason := pgEvaluate(ch, sql, credName)
 						if verdict == "deny" {
 							pgWriteDeny(ch.Conn, reason)
 							log.Printf("pg-deny %s: %s", ch.PeerIP, reason)
@@ -149,11 +298,12 @@ func pgClientToServer(ctx context.Context, ch *runtime.ConnHandle, upstream net.
 //	  rejected, or approve chain timed out (host applies its
 //	  configured fail mode).
 //	("", "")         — no rule fires or the matched rule allows.
-func pgEvaluate(ch *runtime.ConnHandle, sql string) (string, string) {
+func pgEvaluate(ch *runtime.ConnHandle, sql, credName string) (string, string) {
 	info := parseSQL(sql)
 	mreq := &match.Request{
-		Family: "sql",
-		PeerIP: ch.PeerIP,
+		Family:     "sql",
+		PeerIP:     ch.PeerIP,
+		Credential: credName,
 		SQL: &match.SQLMeta{
 			Verb:      info.Verb,
 			Tables:    info.Tables,
@@ -233,6 +383,45 @@ func pgWriteDeny(conn net.Conn, reason string) {
 	// Z (ReadyForQuery) — 5 bytes total: 'Z' + length(5) + 'I'.
 	ready := []byte{'Z', 0, 0, 0, 5, 'I'}
 	_, _ = conn.Write(append(msg, ready...))
+}
+
+// pgResolveCredential picks the credential entry for this connection.
+//
+// Single-binding endpoints (one entry, no placeholder) return that
+// entry. Multi-credential endpoints dispatch on the agent-supplied
+// StartupMessage user field — exact match against each entry's
+// placeholder. Trailing no-placeholder entry is the fallback when no
+// placeholder matched.
+//
+// Returns nil only when the endpoint declared zero credentials.
+func pgResolveCredential(ep *config.CompiledEndpoint, agentUser string) *config.CompiledCredential {
+	if ep == nil || len(ep.Credentials) == 0 {
+		return nil
+	}
+	if len(ep.Credentials) == 1 && ep.Credentials[0].Placeholder == "" {
+		return ep.Credentials[0]
+	}
+	var fallback *config.CompiledCredential
+	for _, c := range ep.Credentials {
+		if c.Placeholder == "" {
+			fallback = c
+			continue
+		}
+		if agentUser == c.Placeholder {
+			return c
+		}
+	}
+	return fallback
+}
+
+// pgWriteError sends an ErrorResponse during the pre-auth phase
+// (before AuthenticationOk). No ReadyForQuery follows — postgres
+// closes the connection on auth failure.
+func pgWriteError(conn net.Conn, reason string) {
+	body := []byte("SFATAL\x00C28000\x00M" + reason + "\x00\x00")
+	msg := append([]byte{'E'}, encUint32(uint32(len(body)+4))...)
+	msg = append(msg, body...)
+	_, _ = conn.Write(msg)
 }
 
 func pgSummary(info pgInfo) string {

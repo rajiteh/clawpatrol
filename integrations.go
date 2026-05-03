@@ -16,18 +16,8 @@ import (
 	"strings"
 	"sync"
 	"time"
-)
 
-// Placeholder tokens. Agent CLIs (claude, gh, codex) refuse to start
-// without these env vars set, even though the gateway swaps in the
-// real OAuth-issued token server-side via the credential plugin.
-const (
-	envClaudePlaceholder = "sk-ant-oat01-clawpatrol-placeholder-token-do-not-use-as-real-key"
-	envGitHubPlaceholder = "ghp_clawpatrol_placeholder_token_do_not_use_as_real_key"
-	// codex CLI / OpenAI SDKs validate OPENAI_API_KEY starts with `sk-`
-	// before sending. The real OAuth bearer is swapped in at MITM time
-	// via the codex integration's Authorization header rewrite.
-	envCodexPlaceholder = "sk-clawpatrol-placeholder-token-do-not-use-as-real-key"
+	"github.com/denoland/clawpatrol-go/config"
 )
 
 // resolveTemplate expands `{{secret:NAME}}` placeholders in s by
@@ -52,9 +42,61 @@ func resolveTemplate(s string) string {
 	return out
 }
 
+// pushdownEnvVar carries one env var contributed by the credential
+// plugins' EnvPushdownProvider impls plus the CA-bundle vars. Used
+// by both `clawpatrol env` (prints export lines) and `clawpatrol run`
+// (sets them on the wrapped child process via os.Setenv).
+type pushdownEnvVar struct {
+	Name        string
+	Value       string
+	Description string // shown only by `env`; `run` ignores
+	PluginType  string
+}
+
+// envPushdownVars returns every var the operator's CLI environment
+// needs: CA bundle paths + per-credential placeholder tokens. caPath
+// must be the absolute path to ca.crt. Plugin order is registry-
+// stable (alphabetical by Type); first writer wins on duplicate
+// names so the same env var across two plugins doesn't double up.
+func envPushdownVars(caPath string) []pushdownEnvVar {
+	var out []pushdownEnvVar
+	for _, k := range []string{
+		"SSL_CERT_FILE",
+		"NODE_EXTRA_CA_CERTS",
+		"REQUESTS_CA_BUNDLE",
+		"CURL_CA_BUNDLE",
+		"GIT_SSL_CAINFO",
+	} {
+		out = append(out, pushdownEnvVar{Name: k, Value: caPath})
+	}
+	seen := map[string]bool{}
+	for _, p := range config.AllPlugins(config.KindCredential) {
+		body := p.New()
+		ep, ok := body.(config.EnvPushdownProvider)
+		if !ok {
+			continue
+		}
+		for _, ev := range ep.EnvVars() {
+			if seen[ev.Name] {
+				continue
+			}
+			seen[ev.Name] = true
+			out = append(out, pushdownEnvVar{
+				Name:        ev.Name,
+				Value:       ev.Value,
+				Description: ev.Description,
+				PluginType:  p.Type,
+			})
+		}
+	}
+	return out
+}
+
 // runEnv is the `clawpatrol env` subcommand: prints export lines for
-// the agent CLIs, pointing them at our CA bundle and stuffing
-// placeholder tokens into the slots they require.
+// the agent CLIs, pointing them at the CA bundle and stuffing
+// placeholder tokens into the slots they require. The gateway
+// overwrites the auth slot at MITM time, so the placeholder bytes
+// never reach the upstream.
 func runEnv(args []string) {
 	fs := flag.NewFlagSet("env", flag.ExitOnError)
 	caDir := fs.String("ca-dir", defaultClawpatrolDir(), "directory containing ca.crt")
@@ -65,22 +107,39 @@ func runEnv(args []string) {
 		fmt.Fprintf(os.Stderr, "clawpatrol: ca not found at %s — run `clawpatrol login` first\n", caPath)
 		os.Exit(2)
 	}
-	for _, k := range []string{
-		"SSL_CERT_FILE",
-		"NODE_EXTRA_CA_CERTS",
-		"REQUESTS_CA_BUNDLE",
-		"CURL_CA_BUNDLE",
-		"GIT_SSL_CAINFO",
-	} {
-		fmt.Printf("export %s=%q\n", k, caPath)
+	for _, ev := range envPushdownVars(caPath) {
+		if ev.Description != "" {
+			if ev.PluginType != "" {
+				fmt.Printf("# %s — %s\n", ev.Description, ev.PluginType)
+			} else {
+				fmt.Printf("# %s\n", ev.Description)
+			}
+		}
+		fmt.Printf("export %s=%q\n", ev.Name, ev.Value)
 	}
-	fmt.Printf("export ANTHROPIC_AUTH_TOKEN=%q\n", envClaudePlaceholder)
-	fmt.Printf("export GH_TOKEN=%q\n", envGitHubPlaceholder)
-	fmt.Printf("export GITHUB_TOKEN=%q\n", envGitHubPlaceholder)
-	// codex OPENAI_API_KEY pushes the CLI into api-key mode, which
-	// targets api.openai.com — wrong endpoint for ChatGPT OAuth.
-	// OAuth-mode codex reads strictly from ~/.codex/auth.json; once
-	// `clawpatrol run -- codex` wraps that, we emit it conditionally.
+}
+
+// applyEnvPushdown sets every pushdown var on the current process
+// environment. Called by `clawpatrol run` before exec'ing the child
+// command, so the wrapped agent CLI inherits the placeholders + CA
+// paths without the operator having to source `clawpatrol env`
+// separately.
+func applyEnvPushdown(caDir string) {
+	caPath := filepath.Join(caDir, "ca.crt")
+	if _, err := os.Stat(caPath); err != nil {
+		// CA not set up yet — `clawpatrol join` hasn't run. Don't
+		// silently skip; the agent CLI will fail TLS verification
+		// and the operator will be confused. Log and continue.
+		log.Printf("clawpatrol: ca not found at %s — env pushdown skipped (run `clawpatrol join` first)", caPath)
+		return
+	}
+	for _, ev := range envPushdownVars(caPath) {
+		// Don't clobber values the operator already set deliberately.
+		if os.Getenv(ev.Name) != "" {
+			continue
+		}
+		_ = os.Setenv(ev.Name, ev.Value)
+	}
 }
 
 // Model context-window lookup. Sourced from litellm's
