@@ -9,12 +9,43 @@ export type Owner = {
   expires_at?: number;
 };
 
+export type SecretSlot = {
+  name: string;
+  label: string;
+  multiline?: boolean;
+  description?: string;
+};
+
 export type Integration = {
   id: string;
   name: string;
+  type: string; // credential plugin type (e.g. "postgres_credential")
   has_oauth: boolean;
+  slots?: SecretSlot[] | null;
   owners: Owner[] | null;
 };
+
+export async function setCredentialSlots(
+  id: string,
+  owner: string,
+  slots: Record<string, string>,
+): Promise<void> {
+  const r = await fetch("/api/credentials/set", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ id, owner, slots }),
+  });
+  if (!r.ok) throw new Error(await r.text());
+}
+
+export async function clearCredential(id: string, owner: string): Promise<void> {
+  const r = await fetch("/api/credentials/clear", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ id, owner }),
+  });
+  if (!r.ok) throw new Error(await r.text());
+}
 
 export type Session = {
   id: string;
@@ -50,22 +81,41 @@ export type Agent = {
 };
 
 export type RuleSummary = {
-  host: string;
-  device?: string;
+  // Rule's bare-name identifier (declared in HCL as
+  // `rule "<type>" "<name>"`). Unique across the file.
+  name: string;
+  // "https" | "sql" | "k8s" — protocol family the rule's match
+  // facets apply to. Determines which fields appear in `match`.
+  family: string;
+  // Endpoint this rule attaches to. Multi-endpoint rules emit one
+  // RuleSummary per attachment site.
+  endpoint: string;
+  // device_ip set when this rule comes from a `device "<ip>" {}` block;
+  // empty for profile-level rules.
+  device_ip?: string;
+  // Profile that includes the endpoint. Empty when the row came
+  // back from a non-profile-scoped query.
   profile?: string;
-  port?: number;
-  action?: string;
-  approve?: string[];
+  // Priority — higher wins. Negative values are catch-alls;
+  // priority 0 is the default declaration-order tier.
+  priority?: number;
+  disabled?: boolean;
+  // verdict: "allow" | "deny". Empty when approve = [...] is the
+  // outcome instead.
+  verdict?: string;
   reason?: string;
-  auth?: string;
-  body?: boolean;
-  ws_scan?: boolean;
-  match?: {
-    method?: string[];
-    path?: string;
-    query?: Record<string, string[]>;
-    headers?: Record<string, string>;
-  };
+  // Approve chain stages. Each stage names an approver (LLM or
+  // human); some stages additionally bind a policy + cache_ttl.
+  approve?: Array<{
+    name: string;
+    policy?: string;
+    cache_ttl?: number;
+  }>;
+  // Match facet map. Keys vary by family — http rules have
+  // method / path / headers; sql rules have verb / tables / function;
+  // k8s rules have resource / verb / namespace / name. Values are
+  // either a string or a list of strings; "!prefix" entries negate.
+  match?: Record<string, unknown>;
 };
 
 export async function getRules(): Promise<RuleSummary[]> {
@@ -194,7 +244,12 @@ export async function decideHITL(id: string, allow: boolean): Promise<void> {
   if (!r.ok) throw new Error(await r.text());
 }
 
-export async function aiEditRules(prompt: string, currentYAML: string, scope: "global" | "device", agent?: string): Promise<{ yaml: string }> {
+export async function aiEditRules(
+  prompt: string,
+  currentYAML: string,
+  scope: "global" | "device",
+  agent?: string,
+): Promise<{ yaml: string; refused?: string }> {
   const r = await api("/api/rules/ai", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -211,8 +266,9 @@ export type Whoami = {
   public_url?: string;
 };
 
-export async function getStatus(): Promise<Integration[]> {
-  const r = await api("/api/status");
+export async function getStatus(profile?: string): Promise<Integration[]> {
+  const url = profile ? `/api/status?profile=${encodeURIComponent(profile)}` : "/api/status";
+  const r = await api(url);
   if (!r.ok) throw new Error(await r.text());
   return r.json();
 }

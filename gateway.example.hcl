@@ -4,18 +4,28 @@
 #
 #     clawpatrol gateway -config /etc/clawpatrol/gateway.hcl
 #
-# Hot-reloadable: profile / ruleset / approver blocks + admin_email.
-# Listen ports / ca_dir / oauth_dir / tailscale block need a restart.
+# Hot-reloadable: every policy block + admin_email. Listen ports /
+# ca_dir / oauth_dir / tailscale block need a restart.
 #
-# Concepts:
-#   integrations — auth providers (claude, codex, github). Their hosts
-#                  auto-MITM and inject OAuth tokens.
-#   rules        — host-scoped policy, with match grammars per protocol
-#                  (HTTP / Kubernetes / SQL).
-#   rulesets     — named bundles of rules; profiles compose by name.
-#   profiles     — bind integrations + rulesets + inline rules to
-#                  onboarded devices. `extend = ["base"]` inherits.
-#   approvers    — HITL notifiers. `dashboard` always-available.
+# Top-level kinds:
+#
+#   defaults   {}                     global fallbacks for fail-mode,
+#                                     cache TTL, unknown-host policy
+#   approver   "<type>" "<name>"      who arbitrates (llm_approver |
+#                                     human_approver)
+#   policy     "<name>"               reusable LLM proctor prompt
+#   credential "<type>" "<name>"      typed handle to a secret
+#   endpoint   "<type>" "<name>"      typed upstream binding
+#   rule       "<type>" "<name>"      one policy decision targeting
+#                                     one or more endpoints
+#   profile    "<name>"               endpoint membership list — a
+#                                     device's profile gets exactly
+#                                     these endpoints
+#
+# References are bare names — no kind prefix. The flat namespace is
+# globally unique; collisions are a load error.
+
+# ── operational --------------------------------------------------------
 
 listen      = "0.0.0.0:8443"
 info_listen = "0.0.0.0:8080"
@@ -30,72 +40,53 @@ gateway {
   wg_subnet_cidr = "10.55.0.0/24"
 }
 
-# -- profiles ---------------------------------------------------------
+# ── policy --------------------------------------------------------------
 
-profile "default" {
-  integrations = ["claude", "codex", "github"]
+defaults {
+  unknown_host     = "passthrough"
+  llm_fail_mode    = "closed"
+  llm_cache_ttl    = 300
+  human_timeout    = 600
+  human_on_timeout = "deny"
 }
 
-# profile "engineering" {
-#   extend       = ["default"]
-#   rules        = ["block-gh-push", "k8s-readonly"]
-# }
+# Credentials: one per upstream secret. The body lists only injection
+# parameters; the actual secret is stored separately keyed by name.
 
-# -- rulesets ---------------------------------------------------------
-#
-# Match grammar per protocol:
-#
-#   HTTP  : method, path, query, headers, body_json, body_contains
-#   K8s   : resource, verb, namespace, name, params (path-derived)
-#   SQL   : sql_verb, tables, function, statement, statement_regex,
-#           account  (declared, but inert until postgres gateway lands)
-#
-# Glob patterns supported. Prefix a value with "!" to negate.
+credential "bearer_token" "github-pat" {}
 
-# ruleset "block-gh-push" {
-#   rule {
-#     host = "api.github.com"
-#     match {
-#       method    = ["POST"]
-#       path      = "/repos/*/git/refs/heads/main"
-#       body_json = { force = "true" }
-#     }
-#     action = "deny"
-#     reason = "force-push to main goes through PR review"
-#   }
-# }
+# Endpoints: hosts + which credential the agent uses against them.
 
-# ruleset "k8s-readonly" {
-#   rule {
-#     host = "k8s.example.com"
-#     match { resource = ["secrets"] }
-#     action = "deny"
-#     reason = "secret values must not leave the cluster"
-#   }
-#   rule {
-#     host = "k8s.example.com"
-#     match {
-#       resource = ["pods/exec", "pods/attach"]
-#       params   = { stdin = "true" }
-#     }
-#     action = "deny"
-#     reason = "no interactive shells"
-#   }
-#   rule {
-#     host = "k8s.example.com"
-#     match {
-#       verb = ["create", "update", "patch", "delete"]
-#       name = ["!debug-*"]
-#     }
-#     action = "deny"
-#     reason = "only debug-* pods may be created / modified / deleted"
-#   }
-# }
+endpoint "https" "github" {
+  hosts      = ["api.github.com", "github.com"]
+  credential = github-pat
+}
 
-# -- approvers --------------------------------------------------------
+# Approvers: who arbitrates when a rule needs human / LLM review.
 
-# approver "ops" {
-#   type    = "slack"           # only "dashboard" is wired today;
-#   channel = "#agent-ops"      # slack/llm reserved for plugins.
-#   timeout = 600
-# }
+approver "human_approver" "ops" {
+  channel = "#agent-ops"
+  timeout = 600
+}
+
+# Rules: typed by protocol family. http_rule applies to https endpoints,
+# sql_rule to postgres / clickhouse_*, k8s_rule to kubernetes.
+
+rule "http_rule" "github-reads" {
+  endpoint = github
+  match    = { method = ["GET", "HEAD"] }
+  verdict  = "allow"
+}
+
+rule "http_rule" "github-writes" {
+  endpoint = github
+  match    = { method = ["POST", "PUT", "PATCH", "DELETE"] }
+  approve  = [ops]
+}
+
+# Profiles: bind a device identity to an endpoint set. Rules ride along
+# automatically because they're attached to endpoints.
+
+profile "default" {
+  endpoints = [github]
+}

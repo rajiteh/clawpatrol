@@ -9,26 +9,27 @@ import (
 	"net"
 	"os"
 
+	"github.com/denoland/clawpatrol-go/config"
 	"tailscale.com/tsnet"
 )
 
-func openListener(cfg *Config) (net.Listener, error) {
-	authKey := cfg.Gateway.AuthKey
+func openListener(cfg *config.Gateway) (net.Listener, error) {
+	authKey := cfg.Tailscale.AuthKey
 	if authKey == "" {
 		authKey = os.Getenv("TS_AUTHKEY")
 	}
 	if authKey == "" {
 		return net.Listen("tcp", cfg.Listen)
 	}
-	hn := cfg.Gateway.Hostname
+	hn := cfg.Tailscale.Hostname
 	if hn == "" {
 		hn = "clawpatrol-gateway"
 	}
 	s := &tsnet.Server{
 		Hostname:   hn,
 		AuthKey:    authKey,
-		ControlURL: cfg.Gateway.ControlURL,
-		Dir:        cfg.Gateway.StateDir,
+		ControlURL: cfg.Tailscale.ControlURL,
+		Dir:        cfg.Tailscale.StateDir,
 	}
 	port := cfg.Listen
 	if port == "" {

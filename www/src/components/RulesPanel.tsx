@@ -1,169 +1,254 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { getDeviceRules, getRules, type RuleSummary } from "../lib/api";
+import { EditGlyph } from "./Logos";
 import { RulesEditor } from "./RulesEditor";
 
-// scope=undefined → global rules. scope=ip → per-device rules layered
-// on top of global ones (shown together in the table; only device rules
-// are editable here).
-export function RulesPanel({ deviceIP, profile }: { deviceIP?: string; profile?: string }) {
-  const [globalRules, setGlobalRules] = useState<RuleSummary[]>([]);
-  const [deviceRules, setDeviceRules] = useState<RuleSummary[]>([]);
+// Rules panel. On a device page (deviceIP set) it splits rules into
+// two sections — Profile rules (read-only, edited via the dashboard's
+// global gateway.hcl editor) and Device rules (editable in-place via
+// the device's HCL block, pencil button in the section header).
+// On the global view there's one section with the pencil that opens
+// gateway.hcl.
+export function RulesPanel({ deviceIP }: { deviceIP?: string; profile?: string }) {
+  const [rows, setRows] = useState<RuleSummary[]>([]);
   const [err, setErr] = useState<string | null>(null);
-  const [editing, setEditing] = useState(false);
+  const [editing, setEditing] = useState<"" | "global" | "device">("");
 
   function reload() {
-    getRules()
-      .then((r) => setGlobalRules(r ?? []))
+    const fetcher = deviceIP ? getDeviceRules(deviceIP) : getRules();
+    fetcher
+      .then((r) => setRows(r ?? []))
       .catch((e) => setErr(String(e)));
-    if (deviceIP) {
-      getDeviceRules(deviceIP)
-        .then((r) => setDeviceRules(r ?? []))
-        .catch(() => setDeviceRules([]));
-    }
   }
   useEffect(() => {
     reload();
   }, [deviceIP]);
-  // On a device page only show rules that apply to this device:
-  // device-scoped rules + global rules whose profile is empty (catch-all)
-  // or matches the device's assigned profile. Otherwise rules from
-  // sibling profiles render as duplicate-looking rows.
-  const inheritedFromGlobal = (globalRules ?? []).filter(
-    (r) => !r.device && (!r.profile || !profile || r.profile === profile),
+
+  const profileRows = useMemo(() => rows.filter((r) => !r.device_ip), [rows]);
+  const deviceRows = useMemo(
+    () => rows.filter((r) => r.device_ip === deviceIP),
+    [rows, deviceIP],
   );
-  const rules = deviceIP
-    ? [...(deviceRules ?? []), ...inheritedFromGlobal]
-    : (globalRules ?? []);
 
   return (
-    <div className="bg-white border border-[#e5e5e5] rounded overflow-hidden relative">
-      <button
-        onClick={() => setEditing(true)}
-        className="absolute top-2 right-2 z-10 text-[10px] px-2 py-0.5 border border-[#e5e5e5] text-[#737373] rounded bg-white hover:border-[#a3a3a3] hover:text-[#171717]"
-      >
-        edit
-      </button>
+    <div className="bg-white border border-[#e5e5e5] rounded">
+      {err && <div className="px-4 py-3 text-[11px] text-red-600">{err}</div>}
+
+      {/* Single "Rules" section. Device-pinned rules render with a
+          "device" badge and float to the top of their endpoint group
+          (their +1000 priority bump from the compiler does this for
+          free); endpoint groups containing any device rules sort
+          before pure profile-rule groups. The pencil is context-
+          aware: device editor on a device page, gateway.hcl on the
+          root. */}
+      <Section
+        title="Rules"
+        rows={[...deviceRows, ...profileRows]}
+        onEdit={() => setEditing(deviceIP ? "device" : "global")}
+        editTitle={deviceIP ? "edit device overrides" : "edit gateway.hcl"}
+      />
+
       {editing && (
         <RulesEditor
-          deviceIP={deviceIP}
-          onClose={() => setEditing(false)}
+          deviceIP={editing === "device" ? deviceIP : undefined}
+          onClose={() => setEditing("")}
           onSaved={() => {
             reload();
+            setEditing("");
           }}
         />
       )}
-      {err && <div className="px-4 py-3 text-[11px] text-red-600">{err}</div>}
-      <table className="w-full table-fixed border-collapse">
-        <colgroup>
-          <col style={{ width: 220 }} />
-          <col style={{ width: 80 }} />
-          <col />
-          <col style={{ width: 110 }} />
-        </colgroup>
-        <thead>
-          <tr className="border-b border-[#e5e5e5]">
-            <Th>HOST</Th>
-            <Th>ACTION</Th>
-            <Th>MATCH</Th>
-            <Th className="text-right">FLAGS</Th>
-          </tr>
-        </thead>
-        <tbody>
-          {rules.length === 0 && (
-            <tr>
-              <td colSpan={4} className="px-5 py-6 text-center text-[11px] text-[#a3a3a3]">
-                no rules configured
-              </td>
-            </tr>
-          )}
-          {rules.map((r, i) => (
-            <tr key={i} className="border-b border-[#f5f5f5] hover:bg-[#f9f9f9]">
-              <Td>
-                <div className="text-[12px] text-[#171717] truncate" title={r.host}>{r.host}</div>
-                {r.auth && (
-                  <div className="text-[10px] text-[#737373]">auth: {r.auth}</div>
-                )}
-              </Td>
-              <Td>
-                <ActionBadge action={(r.approve && r.approve.length > 0) ? "hitl" : (r.action || "allow")} />
-              </Td>
-              <Td>
-                <MatchSummary r={r} />
-              </Td>
-              <Td className="text-right">
-                <Flags r={r} />
-              </Td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
     </div>
   );
 }
 
-function ActionBadge({ action }: { action: string }) {
+function Section({
+  title,
+  rows,
+  onEdit,
+  editTitle,
+  emptyHint,
+}: {
+  title: string;
+  rows: RuleSummary[];
+  onEdit?: () => void;
+  editTitle?: string;
+  emptyHint?: string;
+}) {
+  // Group by endpoint. Server already sorts rules within an endpoint
+  // by priority desc (device rules have a +1000 bump so they land at
+  // the top of their group naturally). Endpoint groups themselves
+  // sort alphabetically.
+  const groups = useMemo(() => {
+    const m = new Map<string, { endpoint: string; family: string; rules: RuleSummary[] }>();
+    for (const r of rows) {
+      const g = m.get(r.endpoint) ?? { endpoint: r.endpoint, family: r.family, rules: [] };
+      g.rules.push(r);
+      m.set(r.endpoint, g);
+    }
+    return Array.from(m.values()).sort((a, b) => a.endpoint.localeCompare(b.endpoint));
+  }, [rows]);
+
+  return (
+    <div className="border-b border-[#e5e5e5] last:border-b-0">
+      <div className="flex items-center px-4 py-2.5 border-b border-[#e5e5e5]">
+        <div className="text-[11px] uppercase tracking-[.09em] text-[#a3a3a3] font-medium">
+          {title}
+        </div>
+        <span className="ml-2 text-[10px] text-[#a3a3a3] tabular-nums">
+          {rows.length} rule{rows.length === 1 ? "" : "s"}
+        </span>
+        {onEdit && (
+          <button
+            onClick={onEdit}
+            title={editTitle ?? "edit"}
+            className="ml-auto p-1 text-[#a3a3a3] hover:text-[#171717] transition-colors"
+          >
+            <EditGlyph />
+          </button>
+        )}
+      </div>
+      {groups.length === 0 ? (
+        <div className="px-5 py-5 text-center text-[11px] text-[#a3a3a3]">
+          {emptyHint ?? "no rules configured"}
+        </div>
+      ) : (
+        <div className="flex flex-col">
+          {groups.map((g) => (
+            <EndpointGroup key={g.endpoint} group={g} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function EndpointGroup({
+  group,
+}: {
+  group: { endpoint: string; family: string; rules: RuleSummary[] };
+}) {
+  return (
+    <div className="border-b border-[#f5f5f5] last:border-b-0">
+      <div className="flex items-center gap-2 px-4 py-2 bg-[#fafafa]">
+        <FamilyDot family={group.family} />
+        <span className="text-[12px] font-mono text-[#171717]">{group.endpoint}</span>
+        <span className="text-[10px] text-[#a3a3a3]">{group.family}</span>
+        <span className="ml-auto text-[10px] text-[#737373] tabular-nums">
+          {group.rules.length} rule{group.rules.length === 1 ? "" : "s"}
+        </span>
+      </div>
+      {group.rules.map((r, i) => (
+        <RuleRow key={`${r.name}/${i}`} rule={r} />
+      ))}
+    </div>
+  );
+}
+
+function RuleRow({ rule: r }: { rule: RuleSummary }) {
+  return (
+    <div
+      className={
+        "flex items-start gap-3 px-4 py-2 border-t border-[#f5f5f5] hover:bg-[#fcfcfc] " +
+        (r.disabled ? "opacity-50" : "")
+      }
+    >
+      <div className="flex-1 min-w-0">
+        <div className="flex items-center gap-2 flex-wrap">
+          <Verdict r={r} />
+          {r.reason && (
+            <span className="text-[12px] text-[#525252] truncate" title={r.reason}>
+              {r.reason}
+            </span>
+          )}
+        </div>
+        <div
+          className="text-[11px] text-[#737373] mt-1 font-mono truncate"
+          title={renderMatch(r.match)}
+        >
+          {renderMatch(r.match)}
+        </div>
+      </div>
+      <div className="flex flex-col items-end gap-0.5 flex-shrink-0">
+        <span className="text-[11px] text-[#a3a3a3] truncate max-w-[160px]" title={r.name}>
+          {r.name}
+        </span>
+        {displayPriority(r) ? (
+          <span className="text-[10px] text-[#a3a3a3] tabular-nums">
+            p{displayPriority(r)! > 0 ? "+" : ""}
+            {displayPriority(r)}
+          </span>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+// displayPriority strips the +1000 bump the compiler adds to device-
+// block rules — that's a tie-breaker implementation detail, not
+// something the operator wrote. Returns null when there's nothing
+// meaningful to show (zero priority).
+function displayPriority(r: RuleSummary): number | null {
+  let p = r.priority ?? 0;
+  if (r.device_ip) p -= 1000;
+  return p === 0 ? null : p;
+}
+
+function FamilyDot({ family }: { family: string }) {
+  const palette: Record<string, string> = {
+    https: "bg-[#3b82f6]",
+    sql: "bg-[#f59e0b]",
+    k8s: "bg-[#8b5cf6]",
+  };
+  return (
+    <span
+      className={"inline-block w-[6px] h-[6px] rounded-full " + (palette[family] ?? "bg-[#a3a3a3]")}
+      title={family}
+    />
+  );
+}
+
+function Verdict({ r }: { r: RuleSummary }) {
+  if (r.approve && r.approve.length > 0) {
+    const names = r.approve.map((s) => s.name).join(" → ");
+    return (
+      <span
+        className="text-[10px] uppercase tracking-[.08em] px-1.5 py-0.5 rounded border bg-[#fef9c3] border-[#fde68a] text-[#854d0e]"
+        title={names}
+      >
+        approve
+      </span>
+    );
+  }
+  const verdict = r.verdict || "allow";
   const palette: Record<string, string> = {
     allow: "bg-[#f0fdf4] border-[#bbf7d0] text-[#166534]",
     deny: "bg-[#fef2f2] border-[#fecaca] text-[#991b1b]",
-    hitl: "bg-[#fef3c7] border-[#fde68a] text-[#92400e]",
   };
-  const cls = palette[action] || "bg-white border-[#e5e5e5] text-[#737373]";
+  const cls = palette[verdict] ?? "bg-white border-[#e5e5e5] text-[#737373]";
   return (
     <span className={"text-[10px] uppercase tracking-[.08em] px-1.5 py-0.5 rounded border " + cls}>
-      {action}
+      {verdict}
     </span>
   );
 }
 
-function MatchSummary({ r }: { r: RuleSummary }) {
-  const m = r.match;
+function renderMatch(match?: Record<string, unknown>): string {
+  if (!match || Object.keys(match).length === 0) return "matches every request";
   const parts: string[] = [];
-  if (m?.method?.length) parts.push(m.method.join("|"));
-  if (m?.path) parts.push(m.path);
-  if (m?.query) {
-    for (const [k, v] of Object.entries(m.query)) {
-      parts.push(`${k}=${v.join(",")}`);
+  for (const [k, v] of Object.entries(match)) {
+    if (Array.isArray(v)) {
+      if (v.length === 1) parts.push(`${k} = ${scalar(v[0])}`);
+      else parts.push(`${k} in [${v.map(scalar).join(", ")}]`);
+    } else {
+      parts.push(`${k} = ${scalar(v)}`);
     }
   }
-  if (m?.headers) {
-    for (const [k, v] of Object.entries(m.headers)) {
-      parts.push(`${k}: ${v}`);
-    }
-  }
-  if (r.reason) parts.push(`(${r.reason})`);
-  if (!parts.length) return <span className="text-[10px] text-[#a3a3a3]">all</span>;
-  return <span className="text-[11px] text-[#525252] truncate block" title={parts.join(" · ")}>{parts.join(" · ")}</span>;
+  return parts.join(" · ");
 }
 
-function Flags({ r }: { r: RuleSummary }) {
-  const flags = [];
-  if (r.body) flags.push("body");
-  if (r.ws_scan) flags.push("ws");
-  if (r.port && r.port !== 443) flags.push(":" + r.port);
-  if (!flags.length) return <span className="text-[10px] text-[#a3a3a3]">—</span>;
-  return (
-    <span className="inline-flex gap-1">
-      {flags.map((f) => (
-        <span key={f} className="text-[9px] uppercase tracking-[.08em] px-1 py-0.5 border border-[#e5e5e5] text-[#737373] rounded">
-          {f}
-        </span>
-      ))}
-    </span>
-  );
-}
-
-function Th({ children, className = "" }: { children: React.ReactNode; className?: string }) {
-  return (
-    <th className={"px-3 sm:px-[14px] py-[9px] text-left text-[10px] uppercase tracking-[.09em] text-[#a3a3a3] font-medium bg-white " + className}>
-      {children}
-    </th>
-  );
-}
-
-function Td({ children, className = "", ...rest }: { children: React.ReactNode; className?: string; title?: string }) {
-  return (
-    <td className={"px-3 sm:px-[14px] py-[9px] align-middle overflow-hidden " + className} {...rest}>
-      {children}
-    </td>
-  );
+function scalar(v: unknown): string {
+  if (v === null || v === undefined) return "";
+  if (typeof v === "object") return JSON.stringify(v);
+  return String(v);
 }

@@ -19,14 +19,15 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/hashicorp/hcl/v2/hclsimple"
-	"github.com/hashicorp/hcl/v2/hclwrite"
 	"golang.org/x/oauth2"
+
+	"github.com/denoland/clawpatrol-go/config"
 )
 
 //go:embed all:www/dist
@@ -38,10 +39,12 @@ var loginHTML string
 var loginTpl = template.Must(template.New("login").Parse(loginHTML))
 
 type IntegrationRow struct {
-	ID       string  `json:"id"`
-	Name     string  `json:"name"`
-	HasOAuth bool    `json:"has_oauth"`
-	Owners   []Owner `json:"owners"`
+	ID       string              `json:"id"`
+	Name     string              `json:"name"`
+	Type     string              `json:"type"` // credential plugin type
+	HasOAuth bool                `json:"has_oauth"`
+	Slots    []config.SecretSlot `json:"slots,omitempty"`
+	Owners   []Owner             `json:"owners"`
 }
 
 type Owner struct {
@@ -62,14 +65,14 @@ type oauthSession struct {
 type webMux struct {
 	g         *Gateway
 	caDir     string
-	ts        GatewayConfig // for onboarding key minting
+	ts        Tailscale // for onboarding key minting
 	publicURL string
 	mu        sync.Mutex
 	sessions  map[string]*oauthSession
 	onboard   *onboardRegistry
 }
 
-func newWebMux(g *Gateway, caDir string, ts GatewayConfig, publicURL string) http.Handler {
+func newWebMux(g *Gateway, caDir string, ts Tailscale, publicURL string) http.Handler {
 	w := &webMux{g: g, caDir: caDir, ts: ts, publicURL: publicURL, sessions: map[string]*oauthSession{}, onboard: g.onboard}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/info", w.serveInfo)
@@ -90,6 +93,8 @@ func newWebMux(g *Gateway, caDir string, ts GatewayConfig, publicURL string) htt
 	mux.HandleFunc("/api/oauth/exchange", w.apiOAuthExchange)
 	mux.HandleFunc("/api/oauth/device-poll", w.apiOAuthDevicePoll)
 	mux.HandleFunc("/api/oauth/revoke", w.apiOAuthRevoke)
+	mux.HandleFunc("/api/credentials/set", w.apiCredentialsSet)
+	mux.HandleFunc("/api/credentials/clear", w.apiCredentialsClear)
 	mux.HandleFunc("/api/events", w.apiEventsSSE)
 	mux.HandleFunc("/api/onboard/start", w.apiOnboardStart)
 	mux.HandleFunc("/api/onboard/poll", w.apiOnboardPoll)
@@ -226,8 +231,8 @@ func (w *webMux) tailnetGate(next http.Handler) http.Handler {
 	// In wireguard / proxy mode there is no tailnet identity to gate
 	// against. Operators put the dashboard behind their own
 	// authentication (Cloudflare Access, basic auth proxy, etc).
-	skipGate := !strings.EqualFold(w.g.cfg.Gateway.Control, "tailscale") &&
-		w.g.cfg.Gateway.Control != ""
+	skipGate := !strings.EqualFold(w.g.cfg.Tailscale.Control, "tailscale") &&
+		w.g.cfg.Tailscale.Control != ""
 
 	return http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
 		if publicPaths[r.URL.Path] || skipGate {
@@ -318,8 +323,8 @@ func (w *webMux) ownerForCaller(r *http.Request) (key, label string) {
 	if p := r.Header.Get("X-Clawpatrol-Profile"); p != "" {
 		return p, p
 	}
-	if profiles := w.g.cfg.Profiles; len(profiles) > 0 {
-		return profiles[0].Name, profiles[0].Name
+	if names := orderedProfileNames(w.g.cfg.Policy); len(names) > 0 {
+		return names[0], names[0]
 	}
 	if w.g.cfg.AdminEmail != "" {
 		return w.g.cfg.AdminEmail, w.g.cfg.AdminEmail
@@ -348,15 +353,33 @@ func (w *webMux) apiWhoami(rw http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (w *webMux) apiStatus(rw http.ResponseWriter, _ *http.Request) {
+// apiStatus returns the credentials list for the dashboard. Filters
+// by profile when ?profile=NAME is set — only credentials referenced
+// by an endpoint in that profile come back. Without the param, every
+// declared credential ships (root view).
+func (w *webMux) apiStatus(rw http.ResponseWriter, r *http.Request) {
 	out := []IntegrationRow{}
-	for _, name := range allIntegrationKeys() {
-		def, ok := defaultIntegrations[name]
-		if !ok {
+	policy := w.g.policy.Load()
+	if policy == nil {
+		writeJSON(rw, out)
+		return
+	}
+	profile := r.URL.Query().Get("profile")
+	allowed := credentialsInProfile(policy, profile) // nil = no filter
+
+	names := make([]string, 0, len(policy.Credentials))
+	for name := range policy.Credentials {
+		if allowed != nil && !allowed[name] {
 			continue
 		}
-		row := IntegrationRow{ID: name, Name: name}
-		if def.OAuth != nil {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	caller, _ := w.ownerForCaller(r)
+	for _, name := range names {
+		ent := policy.Credentials[name]
+		row := IntegrationRow{ID: name, Name: name, Type: ent.Plugin.Type}
+		if _, ok := ent.Body.(config.OAuthFlowProvider); ok {
 			row.HasOAuth = true
 			for _, owner := range w.g.oauth.Owners(name) {
 				connected, exp := w.g.oauth.Status(name, owner)
@@ -367,9 +390,160 @@ func (w *webMux) apiStatus(rw http.ResponseWriter, _ *http.Request) {
 				row.Owners = append(row.Owners, o)
 			}
 		}
+		if sp, ok := ent.Body.(config.SecretSlotsProvider); ok {
+			row.Slots = sp.SecretSlots()
+			if caller != "" {
+				present, _ := credentialSlotPresence(w.g.db, name, caller)
+				if len(present) > 0 {
+					row.Owners = append(row.Owners, Owner{Owner: caller, Connected: true})
+				}
+			}
+		}
 		out = append(out, row)
 	}
 	writeJSON(rw, out)
+}
+
+// credentialsInProfile returns the set of credential bare names that
+// any endpoint in the given profile references. nil means "no filter
+// — return everything." Used by apiStatus and the device-page card
+// render so per-device views only show credentials the device's
+// profile actually uses.
+func credentialsInProfile(policy *config.CompiledPolicy, profile string) map[string]bool {
+	if profile == "" || policy == nil {
+		return nil
+	}
+	prof, ok := policy.Profiles[profile]
+	if !ok {
+		return map[string]bool{} // unknown profile → empty set, not nil
+	}
+	out := map[string]bool{}
+	for _, ep := range prof.Endpoints {
+		for _, cb := range ep.Credentials {
+			if cb.Credential != nil {
+				out[cb.Credential.Symbol.Name] = true
+			}
+		}
+	}
+	return out
+}
+
+// apiCredentialsSet persists one or more slot values for a non-OAuth
+// credential. Owner defaults to the caller's profile. Body shape:
+//
+//	{ "id": "stripe-live", "owner": "default", "slots": { "": "sk_live_…" } }
+//
+// Multi-slot credentials (mtls, slack tokens) pass multiple keys.
+// Empty values clear the slot.
+func (w *webMux) apiCredentialsSet(rw http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(rw, "POST", 405)
+		return
+	}
+	var body struct {
+		ID    string            `json:"id"`
+		Owner string            `json:"owner"`
+		Slots map[string]string `json:"slots"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(rw, err.Error(), 400)
+		return
+	}
+	if body.ID == "" {
+		http.Error(rw, "missing id", 400)
+		return
+	}
+	if body.Owner == "" {
+		body.Owner, _ = w.ownerForCaller(r)
+	}
+	if body.Owner == "" {
+		http.Error(rw, "missing owner", 400)
+		return
+	}
+	policy := w.g.policy.Load()
+	ent, ok := policy.Credentials[body.ID]
+	if !ok {
+		http.Error(rw, "unknown credential: "+body.ID, 404)
+		return
+	}
+	sp, ok := ent.Body.(config.SecretSlotsProvider)
+	if !ok {
+		http.Error(rw, "credential is OAuth-flow, use /api/oauth/start", 400)
+		return
+	}
+	valid := map[string]bool{}
+	for _, s := range sp.SecretSlots() {
+		valid[s.Name] = true
+	}
+	for slot, v := range body.Slots {
+		if !valid[slot] {
+			http.Error(rw, "unknown slot: "+slot, 400)
+			return
+		}
+		if v == "" {
+			// Empty value = clear that slot specifically.
+			if _, err := w.g.db.Exec(
+				`DELETE FROM credential_secrets WHERE credential = ? AND profile = ? AND slot = ?`,
+				body.ID, body.Owner, slot,
+			); err != nil {
+				http.Error(rw, err.Error(), 500)
+				return
+			}
+			continue
+		}
+		if err := setCredentialSlot(w.g.db, body.ID, body.Owner, slot, v); err != nil {
+			http.Error(rw, err.Error(), 500)
+			return
+		}
+	}
+	writeJSON(rw, map[string]any{"ok": true})
+}
+
+// apiCredentialsClear drops every slot for (id, owner). Disconnect
+// button on the dashboard.
+func (w *webMux) apiCredentialsClear(rw http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(rw, "POST", 405)
+		return
+	}
+	var body struct {
+		ID    string `json:"id"`
+		Owner string `json:"owner"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(rw, err.Error(), 400)
+		return
+	}
+	if body.ID == "" {
+		http.Error(rw, "missing id", 400)
+		return
+	}
+	if body.Owner == "" {
+		body.Owner, _ = w.ownerForCaller(r)
+	}
+	if err := clearCredentialSecrets(w.g.db, body.ID, body.Owner); err != nil {
+		http.Error(rw, err.Error(), 500)
+		return
+	}
+	writeJSON(rw, map[string]any{"ok": true})
+}
+
+// lookupOAuthFlow finds the OAuth flow for a credential bare name in
+// the loaded policy. Returns nil when the credential doesn't exist or
+// the credential type isn't an OAuth-flow type.
+func lookupOAuthFlow(policy *config.CompiledPolicy, name string) *config.OAuthIntegration {
+	if policy == nil {
+		return nil
+	}
+	ent, ok := policy.Credentials[name]
+	if !ok {
+		return nil
+	}
+	fp, ok := ent.Body.(config.OAuthFlowProvider)
+	if !ok {
+		return nil
+	}
+	return fp.OAuthFlow()
 }
 
 func (w *webMux) apiAgents(rw http.ResponseWriter, _ *http.Request) {
@@ -454,9 +628,10 @@ func (w *webMux) apiAgentProfile(rw http.ResponseWriter, r *http.Request) {
 		http.Error(rw, "missing ip or profile", 400)
 		return
 	}
+	names := orderedProfileNames(w.g.cfg.Policy)
 	known := false
-	for _, p := range w.g.cfg.Profiles {
-		if p.Name == profile {
+	for _, n := range names {
+		if n == profile {
 			known = true
 			break
 		}
@@ -472,134 +647,199 @@ func (w *webMux) apiAgentProfile(rw http.ResponseWriter, r *http.Request) {
 // apiProfiles lists declared profile names so the dashboard can
 // render a profile picker per device.
 func (w *webMux) apiProfiles(rw http.ResponseWriter, _ *http.Request) {
-	out := make([]string, 0, len(w.g.cfg.Profiles))
-	for _, p := range w.g.cfg.Profiles {
-		out = append(out, p.Name)
-	}
-	writeJSON(rw, out)
+	writeJSON(rw, orderedProfileNames(w.g.cfg.Policy))
 }
 
+// RuleSummary is the JSON shape the dashboard renders for each rule.
+// It flattens a CompiledRule plus its enclosing endpoint and profile
+// context so the table view doesn't need to walk the policy graph
+// itself.
+type RuleSummary struct {
+	Name     string                `json:"name"`
+	Family   string                `json:"family"` // "https" | "sql" | "k8s"
+	Endpoint string                `json:"endpoint"`
+	Profile  string                `json:"profile,omitempty"`
+	DeviceIP string                `json:"device_ip,omitempty"` // "" for profile rules, IP for device-pinned
+	Priority int                   `json:"priority,omitempty"`
+	Disabled bool                  `json:"disabled,omitempty"`
+	Match    map[string]any        `json:"match,omitempty"`
+	Verdict  string                `json:"verdict,omitempty"`
+	Reason   string                `json:"reason,omitempty"`
+	Approve  []config.ApproveStage `json:"approve,omitempty"`
+}
+
+// apiRules returns every compiled rule across every profile, flattened
+// for the dashboard table view. Rules attached to multiple endpoints
+// emit one row per endpoint so the operator sees each attachment
+// site individually.
+//
+// Read-only. Edits go through PUT /api/config (whole-file HCL via
+// the new typed-block validator).
 func (w *webMux) apiRules(rw http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case "GET":
-		writeJSON(rw, w.g.cfg.Rules)
-	case "PUT":
-		body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
-		if err != nil {
-			http.Error(rw, err.Error(), 400)
-			return
-		}
-		var rules []Rule
-		if err := json.Unmarshal(body, &rules); err != nil {
-			http.Error(rw, "json: "+err.Error(), 400)
-			return
-		}
-		w.g.cfg.Rules = rules
-		rulesCopy := append([]Rule(nil), rules...)
-		w.g.rules.Store(&rulesCopy)
-		if err := writeConfigHCL(w.g.cfg, w.g.cfgPath); err != nil {
-			http.Error(rw, "persist: "+err.Error(), 500)
-			return
-		}
-		writeJSON(rw, map[string]any{"ok": true, "count": len(rules)})
+		writeJSON(rw, w.collectRuleSummaries(""))
 	default:
-		http.Error(rw, "GET or PUT", 405)
+		http.Error(rw, "edit rules through PUT /api/config", http.StatusNotImplemented)
 	}
 }
 
-// apiDeviceRules manages per-device rules. Device IP is read from
-// ?ip= query param. Operations only touch rules with Device=ip; global
-// rules (Device=="") are passed through untouched.
+// apiDeviceRules returns the rules that apply to one device. The
+// device's profile is read from g.profileFor(ip); rules are filtered
+// to endpoints declared in that profile.
+//
+// Read-only — same as apiRules.
 func (w *webMux) apiDeviceRules(rw http.ResponseWriter, r *http.Request) {
 	ip := r.URL.Query().Get("ip")
 	if ip == "" {
 		http.Error(rw, "missing ip", 400)
 		return
 	}
-	hcl := r.URL.Query().Get("format") == "hcl"
+	hclMode := r.URL.Query().Get("format") == "hcl"
 	switch r.Method {
 	case "GET":
-		deviceRules := []Rule{}
-		for _, x := range w.g.cfg.Rules {
-			if x.Device == ip {
-				deviceRules = append(deviceRules, x)
+		if hclMode {
+			body, err := readDeviceBlockHCL(w.g.cfgPath, ip)
+			if err != nil {
+				http.Error(rw, err.Error(), 500)
+				return
 			}
-		}
-		if hcl {
 			rw.Header().Set("Content-Type", "text/plain; charset=utf-8")
-			rw.Write(emitDeviceRulesHCL(w.g, ip, deviceRules))
+			rw.Write([]byte(body))
 			return
 		}
-		writeJSON(rw, deviceRules)
+		profile := w.g.profileFor(ip)
+		writeJSON(rw, w.collectRuleSummariesForDevice(profile, ip))
 	case "PUT":
+		if !hclMode {
+			http.Error(rw, "PUT requires ?format=hcl", 400)
+			return
+		}
 		body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 		if err != nil {
 			http.Error(rw, err.Error(), 400)
 			return
 		}
-		var newRules []Rule
-		if hcl {
-			var holder struct {
-				Rules []Rule `hcl:"rule,block"`
-			}
-			if err := hclsimple.Decode("device.hcl", body, nil, &holder); err != nil {
-				http.Error(rw, "hcl: "+err.Error(), 400)
-				return
-			}
-			newRules = holder.Rules
-		} else {
-			if err := json.Unmarshal(body, &newRules); err != nil {
-				http.Error(rw, "json: "+err.Error(), 400)
-				return
-			}
-		}
-		// Force Device=ip on every submitted rule (server-side trust:
-		// don't let a device's editor accidentally edit other devices'
-		// or global rules).
-		for i := range newRules {
-			newRules[i].Device = ip
-		}
-		var merged []Rule
-		for _, x := range w.g.cfg.Rules {
-			if x.Device != ip {
-				merged = append(merged, x)
-			}
-		}
-		merged = append(merged, newRules...)
-		w.g.cfg.Rules = merged
-		mergedCopy := append([]Rule(nil), merged...)
-		w.g.rules.Store(&mergedCopy)
-		if err := writeConfigHCL(w.g.cfg, w.g.cfgPath); err != nil {
-			http.Error(rw, "persist: "+err.Error(), 500)
+		// Splice the new device block into gateway.hcl, then validate
+		// the merged file via the typed-block loader before persisting
+		// — same diagnostic path as PUT /api/config.
+		merged, err := spliceDeviceBlockHCL(w.g.cfgPath, ip, string(body))
+		if err != nil {
+			http.Error(rw, err.Error(), 400)
 			return
 		}
-		writeJSON(rw, map[string]any{"ok": true, "count": len(newRules)})
+		if _, diags := config.LoadBytes(merged, "gateway.hcl"); diags.HasErrors() {
+			http.Error(rw, "hcl: "+diags.Error(), 400)
+			return
+		}
+		tmp := w.g.cfgPath + ".tmp"
+		if err := os.WriteFile(tmp, merged, 0o600); err != nil {
+			http.Error(rw, "write: "+err.Error(), 500)
+			return
+		}
+		if err := os.Rename(tmp, w.g.cfgPath); err != nil {
+			http.Error(rw, "rename: "+err.Error(), 500)
+			return
+		}
+		writeJSON(rw, map[string]any{"ok": true})
 	default:
 		http.Error(rw, "GET or PUT", 405)
 	}
 }
 
-// emitDeviceRulesHCL renders a per-device editing fragment: a
-// commented summary of which profile the device sits in (read-only
-// context for the operator) plus the editable `rule {}` blocks scoped
-// to this device. Operators edit only the device-scoped rules; profile
-// + global config lives in /api/config.
-func emitDeviceRulesHCL(g *Gateway, ip string, deviceRules []Rule) []byte {
-	profile := g.profileFor(ip)
-	var b []byte
-	b = append(b, []byte("# device: "+ip+"\n# profile: "+profile+"\n")...)
-	b = append(b, []byte("# (this editor manages device-scoped rule overrides only —\n#  profile + global rules live in the gateway settings editor.)\n\n")...)
-	if len(deviceRules) == 0 {
-		b = append(b, []byte("# no device-scoped rules yet. Add `rule { ... }` blocks below.\n")...)
-		return b
+// collectRuleSummariesForDevice yields the same set as
+// collectRuleSummaries(profileFilter) PLUS every device-pinned rule
+// whose DeviceIP matches the device — even when the rule's endpoint
+// isn't part of that device's profile (the AI may declare a new
+// endpoint inside a device fragment that doesn't get added to the
+// profile until later).
+func (w *webMux) collectRuleSummariesForDevice(profile, deviceIP string) []RuleSummary {
+	out := w.collectRuleSummaries(profile)
+	policy := w.g.Policy()
+	if policy == nil {
+		return out
 	}
-	f := hclwrite.NewEmptyFile()
-	for _, r := range deviceRules {
-		f.Body().AppendNewline()
-		writeRuleHCL(f.Body(), r)
+	seen := map[string]bool{}
+	for _, s := range out {
+		seen[s.Endpoint+"\x00"+s.Name] = true
 	}
-	b = append(b, f.Bytes()...)
-	return b
+	for epName, ep := range policy.Endpoints {
+		for _, r := range ep.Rules {
+			if r.DeviceIP != deviceIP {
+				continue
+			}
+			key := epName + "\x00" + r.Name
+			if seen[key] {
+				continue
+			}
+			out = append(out, RuleSummary{
+				Name:     r.Name,
+				Family:   ep.Family,
+				Endpoint: epName,
+				DeviceIP: r.DeviceIP,
+				Priority: r.Priority,
+				Disabled: r.Disabled,
+				Match:    matchSourceMap(r),
+				Verdict:  r.Outcome.Verdict,
+				Reason:   r.Outcome.Reason,
+				Approve:  r.Outcome.Approve,
+			})
+		}
+	}
+	return out
+}
+
+// collectRuleSummaries walks the compiled policy and emits one
+// RuleSummary per (rule × endpoint × profile) triple. When profile is
+// empty, every profile contributes; otherwise only that profile.
+//
+// Sort: by profile, then endpoint, then descending priority (so the
+// dashboard mirrors first-match-wins order within each endpoint).
+func (w *webMux) collectRuleSummaries(profileFilter string) []RuleSummary {
+	policy := w.g.Policy()
+	if policy == nil {
+		return []RuleSummary{}
+	}
+	var out []RuleSummary
+	for profileName, prof := range policy.Profiles {
+		if profileFilter != "" && profileName != profileFilter {
+			continue
+		}
+		for epName, ep := range prof.Endpoints {
+			for _, r := range ep.Rules {
+				out = append(out, RuleSummary{
+					Name:     r.Name,
+					Family:   ep.Family,
+					Endpoint: epName,
+					Profile:  profileName,
+					DeviceIP: r.DeviceIP,
+					Priority: r.Priority,
+					Disabled: r.Disabled,
+					Match:    matchSourceMap(r),
+					Verdict:  r.Outcome.Verdict,
+					Reason:   r.Outcome.Reason,
+					Approve:  r.Outcome.Approve,
+				})
+			}
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Profile != out[j].Profile {
+			return out[i].Profile < out[j].Profile
+		}
+		if out[i].Endpoint != out[j].Endpoint {
+			return out[i].Endpoint < out[j].Endpoint
+		}
+		return out[i].Priority > out[j].Priority
+	})
+	return out
+}
+
+func matchSourceMap(r *config.CompiledRule) map[string]any {
+	if r == nil {
+		return nil
+	}
+	return r.Match
 }
 
 // apiConfig serves the entire gateway.hcl for the global settings
@@ -622,10 +862,11 @@ func (w *webMux) apiConfig(rw http.ResponseWriter, r *http.Request) {
 			http.Error(rw, err.Error(), 400)
 			return
 		}
-		// validate by parsing into a fresh Config
-		var probe Config
-		if err := hclsimple.Decode("gateway.hcl", body, nil, &probe); err != nil {
-			http.Error(rw, "hcl: "+err.Error(), 400)
+		// Validate via the new typed-block loader before persisting —
+		// rejects unknown attributes / dangling references / kind
+		// mismatches with precise diagnostics.
+		if _, diags := config.LoadBytes(body, "gateway.hcl"); diags.HasErrors() {
+			http.Error(rw, "hcl: "+diags.Error(), 400)
 			return
 		}
 		// atomic write — mtime watcher reloads + applies.
@@ -676,12 +917,16 @@ func (w *webMux) apiRulesAI(rw http.ResponseWriter, r *http.Request) {
 		http.Error(rw, "tailnet identity required", 403)
 		return
 	}
-	out, err := generateRuleHCL(r.Context(), w.g.oauth, body.Agent, owner, body.Prompt, body.CurrentYAML, body.Scope)
+	out, refused, err := generateRuleHCL(r.Context(), w.g, body.Agent, owner, body.Prompt, body.CurrentYAML, body.Scope)
 	if err != nil {
 		http.Error(rw, "ai: "+err.Error(), 502)
 		return
 	}
-	writeJSON(rw, map[string]string{"yaml": out})
+	resp := map[string]string{"yaml": out}
+	if refused != "" {
+		resp["refused"] = refused
+	}
+	writeJSON(rw, resp)
 }
 
 func (w *webMux) apiHITLPending(rw http.ResponseWriter, _ *http.Request) {
@@ -716,8 +961,8 @@ func (w *webMux) apiOAuthStart(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := r.URL.Query().Get("id")
-	def, ok := defaultIntegrations[id]
-	if !ok || def.OAuth == nil {
+	flow := lookupOAuthFlow(w.g.policy.Load(), id)
+	if flow == nil {
 		http.Error(rw, "no oauth integration: "+id, 400)
 		return
 	}
@@ -727,8 +972,8 @@ func (w *webMux) apiOAuthStart(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Branch: device flow vs auth-code+PKCE.
-	if def.OAuth.Flow == "device" {
-		w.startDeviceFlow(rw, def.OAuth, owner, ownerLabel)
+	if flow.Flow == "device" {
+		w.startDeviceFlow(rw, flow, owner, ownerLabel)
 		return
 	}
 
@@ -737,11 +982,11 @@ func (w *webMux) apiOAuthStart(rw http.ResponseWriter, r *http.Request) {
 	challenge := base64.RawURLEncoding.EncodeToString(sum[:])
 	state := randomString(32)
 	cfg := &oauth2.Config{
-		ClientID:     resolveTemplate(def.OAuth.OAuth.ClientID),
-		ClientSecret: resolveTemplate(def.OAuth.OAuth.ClientSecret),
-		Scopes:       def.OAuth.OAuth.Scopes,
-		RedirectURL:  def.OAuth.OAuth.RedirectURI,
-		Endpoint:     oauth2.Endpoint{AuthURL: def.OAuth.OAuth.AuthURL, TokenURL: def.OAuth.OAuth.TokenURL},
+		ClientID:     resolveTemplate(flow.OAuth.ClientID),
+		ClientSecret: resolveTemplate(flow.OAuth.ClientSecret),
+		Scopes:       flow.OAuth.Scopes,
+		RedirectURL:  flow.OAuth.RedirectURI,
+		Endpoint:     oauth2.Endpoint{AuthURL: flow.OAuth.AuthURL, TokenURL: flow.OAuth.TokenURL},
 	}
 	authURL := cfg.AuthCodeURL(state,
 		oauth2.SetAuthURLParam("code_challenge", challenge),
@@ -1167,8 +1412,10 @@ func (w *webMux) apiOnboardApprove(rw http.ResponseWriter, r *http.Request) {
 	// Operator picks which profile this device joins. Falls back to the
 	// first declared profile when the dashboard didn't pass one.
 	profile := r.URL.Query().Get("profile")
-	if profile == "" && len(w.g.cfg.Profiles) > 0 {
-		profile = w.g.cfg.Profiles[0].Name
+	if profile == "" {
+		if names := orderedProfileNames(w.g.cfg.Policy); len(names) > 0 {
+			profile = names[0]
+		}
 	}
 	s := w.onboard.byUserCode(code)
 	if s == nil {

@@ -12,29 +12,19 @@ import (
 	"time"
 
 	"golang.org/x/oauth2"
+
+	"github.com/denoland/clawpatrol-go/config"
 )
 
 const ScopeUser = "user"
 
-type OAuthConfig struct {
-	ClientID     string   `yaml:"client_id"`
-	ClientSecret string   `yaml:"client_secret"`
-	AuthURL      string   `yaml:"auth_url"`
-	TokenURL     string   `yaml:"token_url"`
-	DeviceURL    string   `yaml:"device_url"` // used by Flow="device"
-	RedirectURI  string   `yaml:"redirect_uri"`
-	Scopes       []string `yaml:"scopes"`
-	RefreshToken string   `yaml:"refresh_token"` // bootstrap; per-owner tokens override
-}
-
-type OAuthIntegration struct {
-	ID     string      `yaml:"id"`
-	Type   string      `yaml:"type"`
-	Header string      `yaml:"header"`
-	Prefix string      `yaml:"prefix"`
-	Flow   string      `yaml:"flow"` // "auth_code" (default) | "device"
-	OAuth  OAuthConfig `yaml:"oauth"`
-}
+// OAuthConfig + OAuthIntegration moved to config/oauth.go so credential
+// plugins can ship their own OAuth flow data without import cycles.
+// Aliased here so existing call sites in this package don't churn.
+type (
+	OAuthConfig      = config.OAuthConfig
+	OAuthIntegration = config.OAuthIntegration
+)
 
 type tokenStore struct {
 	AccessToken  string    `json:"access_token"`
@@ -134,6 +124,46 @@ func (r *OAuthRegistry) Inject(id, owner string, req *http.Request) (bool, error
 	}
 	req.Header.Set(s.header, s.prefix+t.AccessToken)
 	return true, nil
+}
+
+// Token returns the current access token for (id, owner) — refreshing
+// it through the underlying oauth2.TokenSource if it's stale. Empty
+// string + nil error means no token has been captured yet for this
+// owner; the caller decides between fail-closed and pass-through.
+//
+// Used by the runtime SecretStore bridge so credential plugins
+// (which know how to format Authorization / x-api-key / cookie)
+// can stamp the bytes onto the request — OAuthRegistry.Inject
+// hardcodes the header shape and predates the per-credential plugin
+// model.
+func (r *OAuthRegistry) Token(id, owner string) (string, error) {
+	if id == "" {
+		return "", nil
+	}
+	s := r.get(id, owner)
+	if s == nil || s.source == nil {
+		return "", nil
+	}
+	t, err := s.source.Token()
+	if err != nil {
+		return "", err
+	}
+	return t.AccessToken, nil
+}
+
+// Register adds an OAuth integration definition at runtime. Used at
+// gateway boot to register OAuth-flow credentials from the new
+// policy under their bare-name as the ID. Idempotent: re-registering
+// the same ID with an identical definition is a no-op; replacing one
+// with a different definition overwrites.
+func (r *OAuthRegistry) Register(id string, def OAuthIntegration) {
+	if id == "" {
+		return
+	}
+	def.ID = id
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.integrations[id] = &def
 }
 
 // Status returns connected info for a given (id, owner).
@@ -319,6 +349,16 @@ func (s *oauthState) persist(t *oauth2.Token) {
 			expiry_ns     = excluded.expiry_ns,
 			updated_ns    = excluded.updated_ns
 	`, s.id, s.owner, t.AccessToken, t.TokenType, t.RefreshToken, expiryNs, time.Now().UnixNano())
+}
+
+// LoadFromDB rehydrates every (id, owner) credential row whose
+// integration is currently registered. Safe to call repeatedly —
+// re-running after registerOAuthCredentials picks up tokens for IDs
+// that were registered after NewOAuthRegistry's initial pass.
+// Idempotent: existing in-memory state for an (id, owner) is
+// overwritten with the DB-stored token.
+func (r *OAuthRegistry) LoadFromDB() error {
+	return r.loadFromDB()
 }
 
 // loadFromDB rehydrates every (id, owner) credential row whose

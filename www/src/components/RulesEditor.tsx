@@ -1,13 +1,11 @@
 import { useEffect, useState } from "react";
-import {
-  aiEditRules,
-  getDeviceRulesHCL,
-  getRulesJSON,
-  putDeviceRulesHCL,
-  putRulesJSON,
-} from "../lib/api";
+import { aiEditRules, getConfigHCL, getDeviceRulesHCL, putConfigHCL, putDeviceRulesHCL } from "../lib/api";
 import { HCLEditor } from "./HCLEditor";
 
+// RulesEditor edits HCL. Two modes:
+//   - Global: opens the whole gateway.hcl file (deviceIP undefined).
+//   - Device: opens just the `device "<ip>" {}` block, splices on save.
+// Validation runs server-side; diagnostics surface in the err panel.
 export function RulesEditor({
   deviceIP,
   onClose,
@@ -26,8 +24,8 @@ export function RulesEditor({
   const [aiBusy, setAIBusy] = useState(false);
 
   useEffect(() => {
-    const fetcher = deviceIP ? getDeviceRulesHCL(deviceIP) : getRulesJSON();
-    fetcher
+    const loader = deviceIP ? getDeviceRulesHCL(deviceIP) : getConfigHCL();
+    loader
       .then((t) => {
         setText(t);
         setOriginal(t);
@@ -40,10 +38,13 @@ export function RulesEditor({
     setErr(null);
     setOkMsg(null);
     try {
-      const r = deviceIP
-        ? await putDeviceRulesHCL(deviceIP, text)
-        : await putRulesJSON(text);
-      setOkMsg(`saved · ${r.count} rule${r.count === 1 ? "" : "s"} active`);
+      if (deviceIP) {
+        await putDeviceRulesHCL(deviceIP, text);
+        setOkMsg("saved");
+      } else {
+        const r = await putConfigHCL(text);
+        setOkMsg(`saved · ${r.bytes} bytes`);
+      }
       setOriginal(text);
       onSaved();
     } catch (e: any) {
@@ -59,8 +60,22 @@ export function RulesEditor({
     setAIBusy(true);
     setErr(null);
     try {
-      const r = await aiEditRules(aiPrompt, text, deviceIP ? "device" : "global");
-      setText(r.yaml);
+      // 4th arg is the LLM agent name (claude/codex), not the
+      // device IP — leave empty so the backend auto-picks the first
+      // connected provider.
+      const r = await aiEditRules(
+        aiPrompt,
+        text,
+        deviceIP ? "device" : "global",
+      );
+      if (r.refused) {
+        // AI declined to apply the change — keep the editor as-is and
+        // surface the model's reason as the err text. Empty `yaml`
+        // means "don't touch the buffer."
+        setErr("AI declined: " + r.refused);
+      } else if (r.yaml) {
+        setText(r.yaml);
+      }
       setAIPrompt("");
     } catch (e: any) {
       setErr(String(e.message ?? e));
@@ -70,7 +85,6 @@ export function RulesEditor({
   }
 
   const dirty = text !== original;
-  const scopeLabel = deviceIP ? `device ${deviceIP}` : "global";
 
   return (
     <div
@@ -82,7 +96,9 @@ export function RulesEditor({
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center px-4 py-3 border-b border-[#e5e5e5]">
-          <div className="text-[11px] uppercase tracking-[.12em] text-[#a3a3a3]">EDIT RULES · {scopeLabel}</div>
+          <div className="text-[11px] uppercase tracking-[.12em] text-[#a3a3a3]">
+            {deviceIP ? `EDIT DEVICE ${deviceIP}` : "EDIT GATEWAY.HCL"}
+          </div>
           <button
             onClick={onClose}
             className="ml-auto text-[11px] px-2 py-1 text-[#a3a3a3] hover:text-[#171717]"
@@ -95,13 +111,16 @@ export function RulesEditor({
           <HCLEditor value={text} onChange={setText} minHeight={320} />
         </div>
 
-        <form onSubmit={runAI} className="flex items-center gap-2 px-4 py-2.5 border-t border-[#e5e5e5] bg-white">
+        <form
+          onSubmit={runAI}
+          className="flex items-center gap-2 px-4 py-2.5 border-t border-[#e5e5e5] bg-white"
+        >
           <span className="text-[10px] uppercase tracking-[.09em] text-[#a3a3a3]">AI</span>
           <input
             type="text"
             value={aiPrompt}
             onChange={(e) => setAIPrompt(e.target.value)}
-            placeholder='e.g. "deny POST to httpbin.org" — uses connected Claude/Codex'
+            placeholder='e.g. "deny POSTs to api.github.com" — uses connected Claude/Codex'
             className="flex-1 text-[12px] border border-[#e5e5e5] rounded px-2 py-1.5 focus:outline-none focus:border-[#171717] transition-colors"
           />
           <button
@@ -114,10 +133,14 @@ export function RulesEditor({
         </form>
 
         <div className="flex items-center px-4 py-3 border-t border-[#e5e5e5] gap-3">
-          {err && <span className="text-[11px] text-red-600 break-all flex-1">{err}</span>}
+          {err && (
+            <span className="text-[11px] text-red-600 break-all flex-1">{err}</span>
+          )}
           {okMsg && <span className="text-[11px] text-[#16a34a] flex-1">{okMsg}</span>}
           {!err && !okMsg && (
-            <span className="text-[11px] text-[#a3a3a3] flex-1">{dirty ? "unsaved changes" : "no changes"}</span>
+            <span className="text-[11px] text-[#a3a3a3] flex-1">
+              {dirty ? "unsaved changes" : "no changes"}
+            </span>
           )}
           <button
             onClick={onClose}
@@ -127,8 +150,8 @@ export function RulesEditor({
           </button>
           <button
             onClick={save}
-            disabled={busy || !dirty}
-            className="text-[11px] px-3 py-1.5 bg-[#171717] text-white rounded disabled:bg-[#a3a3a3]"
+            disabled={!dirty || busy}
+            className="text-[11px] px-3 py-1.5 border border-[#171717] text-white bg-[#171717] rounded hover:bg-[#262626] disabled:opacity-40"
           >
             {busy ? "saving…" : "save"}
           </button>

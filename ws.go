@@ -1,8 +1,21 @@
 package main
 
-// RFC 6455 WebSocket frame relay with optional permessage-deflate
-// (RFC 7692) support. Used to scan-replace text payloads and observe
-// LLM token usage in WS-based agents (Codex).
+// WebSocket bridging for the new policy. RFC 6455 frames pass
+// through verbatim — placeholder substitution is gone with the
+// legacy Swap field, so the bridge is just byte-faithful in both
+// directions. Text frames going server-bound get observed (decoded
+// + permessage-deflate inflated) for codex-WS token-usage tracking
+// when the host matches; nothing is mutated on the wire.
+//
+// Why a separate bridge instead of letting http.Transport.RoundTrip
+// handle the 101 Switching Protocols: Cloudflare's WAF on
+// chatgpt.com closes the connection with 1007 ("invalid frame
+// payload data") if forwarded frames don't byte-match what the
+// client sent, and Go's http.Response.Write mangles hop-by-hop
+// headers (Connection / Upgrade) on 101 responses, breaking the
+// handshake on the client side. Forwarding bytes verbatim like
+// unclaw does is the only thing that works against Cloudflare-
+// fronted WS endpoints.
 
 import (
 	"bufio"
@@ -56,23 +69,25 @@ func parseWSExtensions(headerVal string) wsParams {
 	return p
 }
 
-type wsRewrite struct {
-	swaps     []Swap
-	onPayload func(text []byte)
-}
-
+// isWSUpgrade returns true iff req is an HTTP/1.1 WebSocket upgrade
+// (RFC 6455 §4.1: `Upgrade: websocket` + `Connection: upgrade`).
 func isWSUpgrade(req *http.Request) bool {
 	conn := strings.ToLower(req.Header.Get("Connection"))
 	upg := strings.ToLower(req.Header.Get("Upgrade"))
 	return strings.Contains(conn, "upgrade") && upg == "websocket"
 }
 
-func (g *Gateway) handleWSUpgrade(client *tls.Conn, br *bufio.Reader, req *http.Request, rule *Rule, upstream string) {
-	agentAddr := peerIP(client) // capture before the conn races to closed
-	// Cloudflare flags non-browser TLS fingerprints on WS handshakes to
-	// chatgpt.com with "Attack attempt detected". Use uTLS Chrome
-	// fingerprint for the upstream WS dial regardless of host (cheap,
-	// and only WS upgrades hit this path).
+// handleWSUpgrade swaps the http.Transport-driven request loop for a
+// raw byte bridge once the agent's request looks like a WS upgrade.
+// The connection stays alive until either side closes; pumpWS
+// observes text frames for codex usage tracking when applicable.
+func (g *Gateway) handleWSUpgrade(client *tls.Conn, br *bufio.Reader, req *http.Request, upstream string) {
+	agentAddr := peerIP(client) // capture before netstack races to nil
+
+	// Cloudflare flags non-browser TLS fingerprints on WS handshakes
+	// to chatgpt.com with "Attack attempt detected". Use uTLS Chrome
+	// fingerprint for every WS upstream — cheap, and only WS
+	// upgrades hit this path.
 	up, err := dialBrowserTLS(context.Background(), "tcp", net.JoinHostPort(upstream, "443"), upstream)
 	if err != nil {
 		fmt.Fprintf(client, "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
@@ -80,20 +95,19 @@ func (g *Gateway) handleWSUpgrade(client *tls.Conn, br *bufio.Reader, req *http.
 		return
 	}
 	defer up.Close()
+
 	// Build raw HTTP/1.1 upgrade request — Go's http.Request.Write +
 	// http.ReadResponse + http.Response.Write round-trip mangles
-	// hop-by-hop headers (Connection, Upgrade) on 101 responses, which
-	// breaks the WS handshake on the client side. Forward bytes verbatim
-	// like unclaw does.
+	// Connection / Upgrade on 101 responses, which breaks the WS
+	// handshake on the client side. Forward bytes verbatim.
 	var reqBuf bytes.Buffer
 	fmt.Fprintf(&reqBuf, "%s %s HTTP/1.1\r\n", req.Method, req.URL.RequestURI())
-	if req.Host != "" {
-		fmt.Fprintf(&reqBuf, "Host: %s\r\n", req.Host)
-	} else {
-		fmt.Fprintf(&reqBuf, "Host: %s\r\n", upstream)
+	host := req.Host
+	if host == "" {
+		host = upstream
 	}
+	fmt.Fprintf(&reqBuf, "Host: %s\r\n", host)
 	for name, values := range req.Header {
-		// Host already written above; skip duplicates.
 		if strings.EqualFold(name, "Host") {
 			continue
 		}
@@ -108,8 +122,8 @@ func (g *Gateway) handleWSUpgrade(client *tls.Conn, br *bufio.Reader, req *http.
 	}
 
 	// Read upstream response headers raw (until "\r\n\r\n"). Anything
-	// beyond the header terminator is the start of the WS frame stream
-	// and must be forwarded to the client BEFORE we hand off to pumpWS.
+	// past the terminator is the start of the WS frame stream and
+	// must reach the client BEFORE we hand off to pumpWS.
 	upBR := bufio.NewReader(up)
 	headerBytes, err := readHTTPHeader(upBR)
 	if err != nil {
@@ -132,31 +146,36 @@ func (g *Gateway) handleWSUpgrade(client *tls.Conn, br *bufio.Reader, req *http.
 		log.Printf("ws resp.Write: %v", err)
 		return
 	}
+
 	params := parseWSExtensions(respHeaders.Get("Sec-WebSocket-Extensions"))
-	rw := &wsRewrite{swaps: rule.Swap}
+
+	// Codex / chatgpt.com WS sends agent prompt + usage envelopes
+	// inside text frames. trackKindFor returns "codex_ws_usage" for
+	// hosts that need this; the inspector decodes (unmasks +
+	// inflates) frame text without modifying the on-wire bytes.
+	var onPayload func([]byte)
 	if trackKindFor(upstream) == "codex_ws_usage" {
-		rw.onPayload = func(text []byte) {
+		onPayload = func(text []byte) {
 			g.trackCodexWSUsage(agentAddr, text)
 		}
 	}
-	clientBR := br
+
 	done := make(chan struct{}, 2)
-	// client → server (frames ARE masked from client; server-side deflate)
+	// client → server (frames are masked on this side)
 	go func() {
-		_ = pumpWS(clientBR, up, rw, true, params, true)
+		_ = pumpWS(br, up, params, true, onPayload)
 		done <- struct{}{}
 	}()
-	// server → client (frames NOT masked from server)
+	// server → client (frames are NOT masked)
 	go func() {
-		_ = pumpWS(upBR, client, rw, false, params, false)
+		_ = pumpWS(upBR, client, params, false, onPayload)
 		done <- struct{}{}
 	}()
 	<-done
 }
 
 // readHTTPHeader reads bytes from br up to and including "\r\n\r\n".
-// Used to forward an upgrade response to the client byte-verbatim
-// (avoids Go's http.Response.Write mangling Connection/Upgrade on 101).
+// Used to forward a 101 response to the client byte-verbatim.
 func readHTTPHeader(br *bufio.Reader) ([]byte, error) {
 	var buf bytes.Buffer
 	for {
@@ -194,18 +213,17 @@ func parseRespHeaders(raw []byte) http.Header {
 
 // pumpWS reads frames from src and forwards bytes verbatim to dst.
 // For text frames, a COPY of the payload is unmasked + decompressed
-// (if RSV1 set and deflate negotiated) and passed to rw.onPayload for
-// inspection. We do NOT modify or re-mask frames — Cloudflare's WAF on
-// chatgpt.com closes the connection with 1007 ("invalid frame payload
-// data") if forwarded frames don't byte-match what the client sent.
+// (if RSV1 set and deflate negotiated) and passed to onPayload for
+// inspection. We do NOT modify or re-mask frames — Cloudflare's WAF
+// on chatgpt.com closes the connection with 1007 ("invalid frame
+// payload data") if forwarded frames don't byte-match what the
+// client sent.
 //
 // fromClient controls which deflate context-takeover state to use.
-func pumpWS(src *bufio.Reader, dst io.Writer, rw *wsRewrite, _ bool, params wsParams, fromClient bool) error {
-	var noTakeover bool
+func pumpWS(src *bufio.Reader, dst io.Writer, params wsParams, fromClient bool, onPayload func([]byte)) error {
+	noTakeover := params.serverNoTakeover
 	if fromClient {
 		noTakeover = params.clientNoTakeover
-	} else {
-		noTakeover = params.serverNoTakeover
 	}
 	infl := &wsInflater{}
 	for {
@@ -216,7 +234,7 @@ func pumpWS(src *bufio.Reader, dst io.Writer, rw *wsRewrite, _ bool, params wsPa
 		if _, werr := dst.Write(raw); werr != nil {
 			return werr
 		}
-		if op == wsOpText && rw != nil && rw.onPayload != nil {
+		if op == wsOpText && onPayload != nil {
 			plain := payload
 			if masked {
 				plain = make([]byte, len(payload))
@@ -229,7 +247,7 @@ func pumpWS(src *bufio.Reader, dst io.Writer, rw *wsRewrite, _ bool, params wsPa
 					plain = dec
 				}
 			}
-			rw.onPayload(plain)
+			onPayload(plain)
 		}
 		if op == wsOpClose {
 			return nil
@@ -239,9 +257,9 @@ func pumpWS(src *bufio.Reader, dst io.Writer, rw *wsRewrite, _ bool, params wsPa
 
 // wsInflater handles permessage-deflate decompression with optional
 // LZ77 context-takeover across messages (RFC 7692 §7.2.3.1). When
-// takeover is in effect the LZ77 sliding window from message N is the
-// initial dictionary for message N+1; we save the trailing 32KB of
-// decoded output and replay it as a dict for the next message.
+// takeover is in effect the LZ77 sliding window from message N is
+// the initial dictionary for message N+1; we save the trailing 32KB
+// of decoded output and replay it as a dict for the next message.
 type wsInflater struct {
 	dict []byte
 }
@@ -257,7 +275,7 @@ func (w *wsInflater) decompress(payload []byte, noTakeover bool) []byte {
 	fr := flate.NewReaderDict(&src, dict)
 	defer fr.Close()
 	out, err := io.ReadAll(fr)
-	// io.ErrUnexpectedEOF is expected — permessage-deflate trailer
+	// io.ErrUnexpectedEOF is expected — permessage-deflate's trailer
 	// (00 00 ff ff) is a non-final SYNC block, so flate never sees a
 	// real EOF marker. We accept the bytes decoded up to that point.
 	if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
@@ -273,8 +291,9 @@ func (w *wsInflater) decompress(payload []byte, noTakeover bool) []byte {
 	return out
 }
 
-// readFrameRaw reads one WebSocket frame, returning both the verbatim
-// bytes (for forwarding) and parsed components (for inspection).
+// readFrameRaw reads one WebSocket frame, returning both the
+// verbatim bytes (for forwarding) and parsed components (for
+// inspection).
 func readFrameRaw(br *bufio.Reader) (raw []byte, b0 byte, op byte, compressed, masked bool, maskKey [4]byte, payload []byte, err error) {
 	var rawBuf bytes.Buffer
 	hdr := make([]byte, 2)
