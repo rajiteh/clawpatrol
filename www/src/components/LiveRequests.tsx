@@ -1,23 +1,5 @@
 import { useEffect, useState } from "react";
-
-export type EventRecord = {
-  ts: string;
-  id?: string;
-  phase?: "" | "start" | "end" | "frame";
-  mode: string;
-  agent_ip?: string;
-  host: string;
-  method?: string;
-  path?: string;
-  status?: number;
-  in?: number;
-  out?: number;
-  ms: number;
-  action?: string;
-  reason?: string;
-  frame?: string;
-  direction?: string;
-};
+import { type EventRecord } from "../lib/api";
 
 type RowState = EventRecord & { frames?: { direction: string; frame: string; ts: string }[] };
 
@@ -59,7 +41,9 @@ export function LiveRequests({ agentIP, max = 200, height }: {
             Waiting for requests<AnimatedDots />
           </div>
         ) : (
-          events.map((e, i) => <Row key={i} ev={e} />)
+          events.map((e, i) => (
+            <Row key={i} ev={e} />
+          ))
         )}
       </div>
     </div>
@@ -108,9 +92,13 @@ function pathSeparator(path: string): string {
 }
 
 function Row({ ev }: { ev: RowState }) {
+  const onClick = ev.id
+    ? () => { window.location.hash = `#/request/${ev.id}`; }
+    : undefined;
   const t = new Date(ev.ts);
   const time =
-    t.toLocaleTimeString([], { hour12: false }) + "." + String(t.getMilliseconds()).padStart(3, "0");
+    t.toLocaleTimeString([], { hour12: false })
+    + "." + String(t.getMilliseconds()).padStart(3, "0");
   const inFlight = ev.phase === "start";
   const status = ev.status || 0;
   const statusColor = inFlight
@@ -125,7 +113,15 @@ function Row({ ev }: { ev: RowState }) {
   const hasFrames = (ev.frames?.length ?? 0) > 0;
   return (
     <div className="border-b border-[#f5f5f5]">
-      <div className={"px-4 py-2 hover:bg-[#f9f9f9] flex items-center gap-3 min-w-0 " + (inFlight ? "opacity-70" : "")}>
+      <div
+        onClick={onClick}
+        className={
+          "px-4 py-2 flex items-center gap-3 min-w-0 transition-colors"
+          + (onClick ? " cursor-pointer" : "")
+          + (inFlight ? " opacity-70" : "")
+          + " hover:bg-[#f9f9f9]"
+        }
+      >
         <span className="text-[10px] tabular-nums text-[#a3a3a3] flex-shrink-0">{time}</span>
         <ModeIcon mode={ev.mode} />
         {ev.method && (
