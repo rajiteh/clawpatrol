@@ -126,6 +126,18 @@ type ConnHandle struct {
 	// support HITL for this conn family — plugins must default to
 	// deny in that case.
 	Approve func(req ApproveCallRequest) ApproveVerdict
+	// CADir is the gateway's CA / persistent state root (matches
+	// cfg.CADir). Endpoint runtimes that need to persist material
+	// per endpoint — e.g. SSH host keys at <CADir>/ssh/<name>.key —
+	// derive paths from this. Empty when the gateway hasn't been
+	// configured with a CA dir; plugins that need persistence error
+	// out clearly in that case.
+	CADir string
+	// DstPort is the destination port the agent connection arrived
+	// on (post-VIP / direct dial). Endpoints whose host strings
+	// carry a non-default port (`hosts = ["x.com:22222"]`) consult
+	// this to pick which Hosts[i] the connection corresponds to.
+	DstPort uint16
 }
 
 // ApproveCallRequest is what a ConnEndpointRuntime hands to
