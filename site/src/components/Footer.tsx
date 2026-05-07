@@ -2,7 +2,7 @@ export function Footer() {
   return (
     <footer
       class="px-8 py-16 text-xs
-        font-mono text-cream bg-slate-dark"
+        font-mono text-canvas bg-console-dark"
     >
       <div
         className="w-full max-w-6xl mx-auto flex flex-col
@@ -15,18 +15,18 @@ export function Footer() {
             <a
               href="https://github.com/denoland/clawpatrol/blob/main/LICENSE"
               class="underline underline-offset-4
-                hover:text-accent"
+                hover:text-rust"
             >
               MIT license
             </a>
             .
           </p>
-          <p class="max-w-sm leading-relaxed">
+          <p class="max-w-sm ">
             Made by the folks at{" "}
             <a
               href="https://deno.com"
               class="underline underline-offset-4
-                hover:text-accent"
+                hover:text-rust"
             >
               Deno
             </a>
@@ -40,21 +40,21 @@ export function Footer() {
           <a
             href="/docs/"
             class="underline underline-offset-4
-              hover:text-accent"
+              hover:text-rust"
           >
             Docs
           </a>
           <a
             href="https://github.com/denoland/clawpatrol"
             class="underline underline-offset-4
-              hover:text-accent"
+              hover:text-rust"
           >
             GitHub
           </a>
           <a
             href="https://github.com/denoland/clawpatrol/blob/main/LICENSE"
             class="underline underline-offset-4
-              hover:text-accent"
+              hover:text-rust"
           >
             License
           </a>

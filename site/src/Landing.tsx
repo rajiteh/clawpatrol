@@ -1,23 +1,24 @@
 import { Layout } from "./Layout";
-import { HeroSection } from "./sections/HeroSection";
-import { ProblemSection } from "./sections/ProblemSection";
-import { ScrollDiagram } from "./components/ScrollDiagram";
-import { ScrollDiagramSolution } from "./components/ScrollDiagramSolution";
-import { HowItWorksSection } from "./sections/HowItWorksSection";
 import { AnalyticsSection } from "./sections/AnalyticsSection";
+import { ApproversSection } from "./sections/ApproversSection";
 import { ComparisonSection } from "./sections/ComparisonSection";
-import { IntegrationsSection } from "./sections/IntegrationsSection";
 import { CtaSection } from "./sections/CtaSection";
-import { Stripe } from "./components/Stripe";
+import { HeroSection } from "./sections/HeroSection";
+import { HowItWorksSection } from "./sections/HowItWorksSection";
+import { IntegrationsSection } from "./sections/IntegrationsSection";
+import { ProblemSection } from "./sections/ProblemSection";
+import { ProtocolDepthSection } from "./sections/ProtocolDepthSection";
+import { RulesSection } from "./sections/RulesSection";
 
 export function Landing() {
   return (
     <Layout>
       <HeroSection />
       <ProblemSection />
-      <Stripe />
-      <ScrollDiagram />
-      <ScrollDiagramSolution />
+
+      <RulesSection />
+      <ApproversSection />
+      <ProtocolDepthSection />
       <HowItWorksSection />
       <AnalyticsSection />
       <ComparisonSection />
