@@ -1,7 +1,10 @@
 package endpoints
 
 import (
+	"context"
+	"net"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 
@@ -180,6 +183,28 @@ func TestPgExtractSQL(t *testing.T) {
 	}
 	if got := pgExtractSQL('B', []byte("ignored")); got != "" {
 		t.Errorf("non-Q/P extract should return empty, got %q", got)
+	}
+}
+
+func TestPgClientToServerReturnsOnContextCancel(t *testing.T) {
+	agent, gateway := net.Pipe()
+	defer func() { _ = agent.Close() }()
+	upstream, upstreamPeer := net.Pipe()
+	defer func() { _ = upstream.Close() }()
+	defer func() { _ = upstreamPeer.Close() }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		pgClientToServer(ctx, &runtime.ConnHandle{Conn: gateway}, upstream, "")
+	}()
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("pgClientToServer did not return after context cancellation")
 	}
 }
 
