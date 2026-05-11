@@ -20,18 +20,18 @@ endpoint "https" "github" {
 
 profile "default" { endpoints = [github] }
 
-rule "http_rule" "reads" {
-  endpoint = github
-  match    = { method = ["GET", "HEAD"] }
-  verdict  = "allow"
+rule "reads" {
+  endpoint  = github
+  condition = "http.method in ['GET', 'HEAD']"
+  verdict   = "allow"
 }
-rule "http_rule" "writes" {
-  endpoint = github
-  match    = { method = ["POST", "PATCH", "DELETE"] }
-  verdict  = "deny"
-  reason   = "writes go through PR review"
+rule "writes" {
+  endpoint  = github
+  condition = "http.method in ['POST', 'PATCH', 'DELETE']"
+  verdict   = "deny"
+  reason    = "writes go through PR review"
 }
-rule "http_rule" "github-default" {
+rule "github-default" {
   endpoint = github
   priority = -100
   verdict  = "deny"

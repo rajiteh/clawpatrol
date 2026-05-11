@@ -59,15 +59,9 @@
           "endpoints": [
             "github"
           ],
-          "match": {
-            "method": [
-              "GET",
-              "HEAD"
-            ]
-          },
+          "condition": "http.method in ['GET', 'HEAD']",
           "verdict": "allow"
-        },
-        "type": "http_rule"
+        }
       },
       "github-writes": {
         "body": {
@@ -76,21 +70,13 @@
           "endpoints": [
             "github"
           ],
-          "match": {
-            "method": [
-              "POST",
-              "PUT",
-              "PATCH",
-              "DELETE"
-            ]
-          },
+          "condition": "http.method in ['POST', 'PUT', 'PATCH', 'DELETE']",
           "approve": [
             {
               "name": "ops"
             }
           ]
-        },
-        "type": "http_rule"
+        }
       }
     }
   },

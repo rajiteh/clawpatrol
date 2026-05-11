@@ -1,24 +1,19 @@
-// Package rules registers the three rule kinds: http_rule, sql_rule,
-// and k8s_rule. Each rule is one policy decision targeting one or more
-// endpoints of a matching protocol family.
+// Package rules registers the single `rule` block kind. Each rule is
+// one policy decision targeting one or more endpoints; the rule's
+// protocol family (https / sql / k8s) is inferred from the resolved
+// endpoints at validate/build time. Mixed-family endpoint sets are
+// rejected with a clean diagnostic.
 //
-// The match block is decoded as a raw cty.Value because its keys are
-// family-specific (http_rule has `path`/`method`, k8s_rule has
-// `resource`/`verb`/`namespace`) and each value can be either a single
-// string or a list. After gohcl decoding, Build interprets the cty
-// shape into a typed Match record per family.
-//
-// `approve` is similarly heterogeneous: a list whose elements are
-// either bare-name approver references or struct stages with
-// `name` / `policy` / `cache_ttl`.
-//
-// Rule type ↔ endpoint family compatibility is enforced via RefSpec
-// FamilyConstraint.
+// The match predicate is expressed as a single CEL string in the
+// `condition` attribute, evaluated against the facet-owned environment
+// for the rule's family (see config/plugins/facets/{https,sql,k8s}/).
+// `approve` is a list whose elements are bare-name approver
+// references.
 package rules
 
 import (
 	"fmt"
-	"strings"
+	"sort"
 
 	"github.com/hashicorp/hcl/v2"
 	"github.com/hashicorp/hcl/v2/hclsyntax"
@@ -29,22 +24,28 @@ import (
 	"github.com/denoland/clawpatrol/config/facet"
 )
 
-// RuleBody is the shared body shape across the three rule types
-// (`http_rule`, `sql_rule`, `k8s_rule`). The available keys inside the
-// `match` block depend on the rule's family (listed per kind below);
-// the outer frame is identical: endpoint targeting, priority, outcome.
+// RuleBody is the gohcl-tagged decode target. The match predicate is
+// family-agnostic at the HCL layer (just a CEL string); the facet's
+// *cel.Env decides which variables are valid once the family has
+// been inferred from the endpoint refs.
 type RuleBody struct {
 	Endpoint  string   `hcl:"endpoint,optional"`
 	Endpoints []string `hcl:"endpoints,optional"`
 	Priority  int      `hcl:"priority,optional"`
 	Disabled  bool     `hcl:"disabled,optional"`
 
-	// Match is a free-form block whose keys depend on the rule
-	// family. Each value is either a single string or a list of
-	// strings. Omitting `match` matches every request — the
-	// catch-all pattern (`rule "..." "X-default" { priority = -100;
-	// verdict = "deny" }`) relies on this.
-	Match cty.Value `hcl:"match,optional"`
+	// Condition is a CEL expression evaluated against the
+	// family-specific variable set. An absent / empty condition
+	// matches everything — the catch-all pattern (`rule
+	// "X-default" { priority = -100; verdict = "deny" }`) relies
+	// on this.
+	Condition string `hcl:"condition,optional"`
+
+	// Credential, if set, is a bare-name reference to a credential
+	// block. The runtime treats it as an extra match predicate
+	// (request must have been dispatched against this credential)
+	// evaluated before the CEL expression.
+	Credential string `hcl:"credential,optional"`
 
 	// Verdict is the outcome when the rule matches. Set exactly one
 	// of `verdict` (`"allow"` / `"deny"`) or `approve`.
@@ -57,24 +58,18 @@ type RuleBody struct {
 }
 
 // Rule is the canonical, family-stamped record stored in
-// Policy.Rules[name].Body. Match is a JSON-friendly Go shape produced
-// at Build time from the raw HCL object; family-specific matchers
-// added when wiring runtime walk this shape.
+// Policy.Rules[name].Body.
 type Rule struct {
-	Name      string                `json:"name"`
-	Family    string                `json:"family"` // "https" | "sql" | "k8s"
-	Endpoints []string              `json:"endpoints"`
-	Priority  int                   `json:"priority,omitempty"`
-	Disabled  bool                  `json:"disabled,omitempty"`
-	Match     map[string]any        `json:"match"`
-	Verdict   string                `json:"verdict,omitempty"` // "allow" | "deny" | "" (when Approve is set)
-	Reason    string                `json:"reason,omitempty"`
-	Approve   []config.ApproveStage `json:"approve,omitempty"`
-	// CredentialRef, if set, is the resolved bare-name reference from
-	// `match = { credential = X }`. The runtime treats it as an extra
-	// match predicate (request must have been dispatched against this
-	// credential).
-	CredentialRef string `json:"credential_ref,omitempty"`
+	Name       string                `json:"name"`
+	Family     string                `json:"family"` // "https" | "sql" | "k8s"
+	Endpoints  []string              `json:"endpoints"`
+	Priority   int                   `json:"priority,omitempty"`
+	Disabled   bool                  `json:"disabled,omitempty"`
+	Condition  string                `json:"condition,omitempty"`
+	Credential string                `json:"credential,omitempty"`
+	Verdict    string                `json:"verdict,omitempty"` // "allow" | "deny" | "" (when Approve is set)
+	Reason     string                `json:"reason,omitempty"`
+	Approve    []config.ApproveStage `json:"approve,omitempty"`
 }
 
 // Compile lowers a built rule into the runtime-friendly *CompiledRule
@@ -85,16 +80,17 @@ type Rule struct {
 // Returns the compiled rule plus the list of endpoint names this
 // rule attaches to.
 func (r *Rule) Compile() (*config.CompiledRule, []string, error) {
-	matcher, err := facet.NewMatcher(r.Family, r.Match)
+	matcher, err := facet.NewMatcher(r.Family, r.Condition)
 	if err != nil {
-		return nil, nil, fmt.Errorf("match: %w", err)
+		return nil, nil, fmt.Errorf("condition: %w", err)
 	}
 	return &config.CompiledRule{
-		Name:     r.Name,
-		Priority: r.Priority,
-		Disabled: r.Disabled,
-		Match:    r.Match,
-		Matcher:  matcher,
+		Name:       r.Name,
+		Priority:   r.Priority,
+		Disabled:   r.Disabled,
+		Condition:  r.Condition,
+		Credential: r.Credential,
+		Matcher:    matcher,
 		Outcome: config.Outcome{
 			Verdict: r.Verdict,
 			Reason:  r.Reason,
@@ -103,31 +99,59 @@ func (r *Rule) Compile() (*config.CompiledRule, []string, error) {
 	}, r.Endpoints, nil
 }
 
-// validatedFamily defines the family + endpoint family-constraint
-// for one rule type. The set of valid match keys comes from
-// facet.KnownKeys at validate time so the validator and the matcher
-// can't drift apart — adding a match key in a facet plugin
-// automatically makes it valid here.
-type validatedFamily struct {
-	family           string
-	endpointFamilies []string
-}
-
-// knownMatchKeys returns the per-family valid match keys as a set,
-// memoized off facet.KnownKeys.
-func knownMatchKeys(family string) map[string]bool {
-	out := map[string]bool{}
-	for _, k := range facet.KnownKeys(family) {
-		out[k] = true
+// inferFamily walks the rule's endpoint list, looks each one up in
+// the symbol table, and reports the common endpoint family. Returns
+// "" plus a diagnostic if the endpoints span more than one family
+// (the rule's CEL env can only bind one facet's variables) or if no
+// endpoint is set (caught separately by the shape check, but a
+// defensive empty-set check keeps the family lookup safe). Unknown
+// endpoint names are skipped — the framework's ref-resolution pass
+// already emitted "unknown endpoint" diagnostics for those.
+func inferFamily(endpoints []string, name string, ctx *config.BuildCtx) (string, *hcl.Diagnostic) {
+	seen := map[string]struct{}{}
+	for _, ep := range endpoints {
+		sym := ctx.Symbols.Get(config.KindEndpoint, ep)
+		if sym == nil || sym.Family == "" {
+			continue
+		}
+		seen[sym.Family] = struct{}{}
 	}
-	return out
+	if len(seen) == 0 {
+		return "", nil
+	}
+	if len(seen) > 1 {
+		fams := make([]string, 0, len(seen))
+		for f := range seen {
+			fams = append(fams, f)
+		}
+		sort.Strings(fams)
+		return "", &hcl.Diagnostic{
+			Severity: hcl.DiagError,
+			Summary:  fmt.Sprintf("Rule %q targets endpoints from mixed families", name),
+			Detail:   fmt.Sprintf("Endpoints span families %v. A rule's CEL condition is evaluated against a single facet's variable set; split into one rule per family.", fams),
+			Subject:  &ctx.Block.DefRange,
+		}
+	}
+	for f := range seen {
+		return f, nil
+	}
+	return "", nil
 }
 
-func validate(body any, name string, ctx *config.BuildCtx, fam validatedFamily) hcl.Diagnostics {
+func endpointList(rb *RuleBody) []string {
+	if rb.Endpoint != "" {
+		return []string{rb.Endpoint}
+	}
+	return rb.Endpoints
+}
+
+func validate(body any, name string, ctx *config.BuildCtx) hcl.Diagnostics {
 	rb := body.(*RuleBody)
 	var diags hcl.Diagnostics
 
-	// Exactly one of endpoint / endpoints.
+	// Exactly one of endpoint / endpoints. Catch shape errors first
+	// so the family-inference diagnostic doesn't fire on a rule that
+	// already has a clearer problem to fix.
 	if rb.Endpoint != "" && len(rb.Endpoints) > 0 {
 		diags = append(diags, &hcl.Diagnostic{
 			Severity: hcl.DiagError,
@@ -143,6 +167,29 @@ func validate(body any, name string, ctx *config.BuildCtx, fam validatedFamily) 
 			Detail:   "Set `endpoint = X` or `endpoints = [X, Y]`.",
 			Subject:  &ctx.Block.DefRange,
 		})
+	}
+
+	// Infer family from the endpoint set so condition compilation
+	// can pick the right facet env.
+	fam, famDiag := inferFamily(endpointList(rb), name, ctx)
+	if famDiag != nil {
+		diags = append(diags, famDiag)
+	}
+
+	// CEL condition syntactic + type validation. Compile against the
+	// inferred facet's environment so unknown variables and result-
+	// type mismatches are caught at Load time. With no family
+	// (unknown endpoints, etc.) skip the compile — the unknown-
+	// endpoint diagnostic is enough.
+	if rb.Condition != "" && fam != "" {
+		if _, err := facet.NewMatcher(fam, rb.Condition); err != nil {
+			diags = append(diags, &hcl.Diagnostic{
+				Severity: hcl.DiagError,
+				Summary:  fmt.Sprintf("Invalid CEL condition on rule %q", name),
+				Detail:   err.Error(),
+				Subject:  &ctx.Block.DefRange,
+			})
+		}
 	}
 
 	// Outcome: exactly one of verdict / approve.
@@ -173,72 +220,30 @@ func validate(body any, name string, ctx *config.BuildCtx, fam validatedFamily) 
 		})
 	}
 
-	// Match keys: detect typos. An absent match block (cty.NilVal)
-	// is fine — it matches every request.
-	if !rb.Match.IsNull() {
-		if !rb.Match.Type().IsObjectType() {
-			diags = append(diags, &hcl.Diagnostic{
-				Severity: hcl.DiagError,
-				Summary:  fmt.Sprintf("Rule %q match must be an object literal", name),
-				Detail:   "Expected `match = { ... }`.",
-				Subject:  &ctx.Block.DefRange,
-			})
-		} else {
-			valid := knownMatchKeys(fam.family)
-			it := rb.Match.ElementIterator()
-			for it.Next() {
-				k, _ := it.Element()
-				key := k.AsString()
-				if !valid[key] {
-					diags = append(diags, &hcl.Diagnostic{
-						Severity: hcl.DiagError,
-						Summary:  fmt.Sprintf("Unknown match key %q for %s", key, fam.family),
-						Detail:   fmt.Sprintf("Valid keys for this rule type: %s.", strings.Join(facet.KnownKeys(fam.family), ", ")),
-						Subject:  &ctx.Block.DefRange,
-					})
-				}
-			}
-		}
-	}
-
 	return diags
 }
 
-func build(body any, name string, ctx *config.BuildCtx, fam validatedFamily) (any, hcl.Diagnostics) {
+func build(body any, name string, ctx *config.BuildCtx) (any, hcl.Diagnostics) {
 	rb := body.(*RuleBody)
 	var diags hcl.Diagnostics
 
-	endpoints := rb.Endpoints
-	if rb.Endpoint != "" {
-		endpoints = []string{rb.Endpoint}
+	endpoints := endpointList(rb)
+	fam, famDiag := inferFamily(endpoints, name, ctx)
+	if famDiag != nil {
+		// Already reported by validate; don't double-emit.
+		_ = famDiag
 	}
 
-	matchMap := ctyObjectToMap(rb.Match)
-	if matchMap == nil {
-		matchMap = map[string]any{} // explicit empty match-all
-	}
 	r := &Rule{
-		Name:      name,
-		Family:    fam.family,
-		Endpoints: endpoints,
-		Priority:  rb.Priority,
-		Disabled:  rb.Disabled,
-		Match:     matchMap,
-		Verdict:   rb.Verdict,
-		Reason:    rb.Reason,
-	}
-
-	// Resolve `match = { credential = X }` against the symbol table —
-	// this nested ref doesn't fit the standard RefSpec.Path syntax.
-	if !rb.Match.IsNull() && rb.Match.Type().IsObjectType() && rb.Match.Type().HasAttribute("credential") {
-		credVal := rb.Match.GetAttr("credential")
-		if credVal.Type() == cty.String {
-			cred := credVal.AsString()
-			r.CredentialRef = cred
-			if d := requireKind(ctx, cred, config.KindCredential, name, "match.credential"); d != nil {
-				diags = append(diags, d)
-			}
-		}
+		Name:       name,
+		Family:     fam,
+		Endpoints:  endpoints,
+		Priority:   rb.Priority,
+		Disabled:   rb.Disabled,
+		Condition:  rb.Condition,
+		Credential: rb.Credential,
+		Verdict:    rb.Verdict,
+		Reason:     rb.Reason,
 	}
 
 	// Approve chain.
@@ -310,54 +315,11 @@ func requireKind(ctx *config.BuildCtx, name string, kind config.Kind, ruleName, 
 	}
 }
 
-// ctyObjectToMap converts the raw HCL match object to a JSON-friendly
-// map. Strings, numbers, and bools become themselves; lists/tuples
-// become []any; nested objects recurse. Null returns nil.
-func ctyObjectToMap(v cty.Value) map[string]any {
-	if v.IsNull() || !v.Type().IsObjectType() {
-		return nil
-	}
-	out := map[string]any{}
-	it := v.ElementIterator()
-	for it.Next() {
-		k, el := it.Element()
-		out[k.AsString()] = ctyToGo(el)
-	}
-	return out
-}
-
-func ctyToGo(v cty.Value) any {
-	if v.IsNull() {
-		return nil
-	}
-	t := v.Type()
-	switch {
-	case t == cty.String:
-		return v.AsString()
-	case t == cty.Number:
-		i, _ := v.AsBigFloat().Int64()
-		return i
-	case t == cty.Bool:
-		return v.True()
-	case t.IsObjectType() || t.IsMapType():
-		return ctyObjectToMap(v)
-	case t.IsTupleType() || t.IsListType() || t.IsSetType():
-		var out []any
-		it := v.ElementIterator()
-		for it.Next() {
-			_, el := it.Element()
-			out = append(out, ctyToGo(el))
-		}
-		return out
-	}
-	return v.GoString()
-}
-
 // emitRule serializes a built *Rule back to HCL block body. Endpoints
 // are emitted as bare-name idents (singular vs list forms preserved
-// to round-trip the operator's choice). Match emits as an object
-// literal; approve mixes bare-name idents and struct stages depending
-// on each entry's shape.
+// to round-trip the operator's choice). Condition emits as a quoted
+// string; credential as a bare-name ident; approve mixes bare-name
+// idents.
 func emitRule(body any, _ string, b *hclwrite.Body) {
 	r := body.(*Rule)
 	if len(r.Endpoints) == 1 {
@@ -371,8 +333,11 @@ func emitRule(body any, _ string, b *hclwrite.Body) {
 	if r.Disabled {
 		b.SetAttributeValue("disabled", cty.True)
 	}
-	if len(r.Match) > 0 {
-		b.SetAttributeRaw("match", matchToTokens(r.Match))
+	if r.Credential != "" {
+		config.SetIdent(b, "credential", r.Credential)
+	}
+	if r.Condition != "" {
+		b.SetAttributeValue("condition", cty.StringVal(r.Condition))
 	}
 	if r.Verdict != "" {
 		b.SetAttributeValue("verdict", cty.StringVal(r.Verdict))
@@ -383,98 +348,6 @@ func emitRule(body any, _ string, b *hclwrite.Body) {
 	if len(r.Approve) > 0 {
 		b.SetAttributeRaw("approve", approveToTokens(r.Approve))
 	}
-}
-
-// matchToTokens emits a match map as `{ key = value, ... }`. Values
-// that are bare-name refs (currently only `credential = X`) get
-// emitted as identifiers, not quoted strings.
-func matchToTokens(m map[string]any) hclwrite.Tokens {
-	tokens := hclwrite.Tokens{
-		{Type: hclsyntax.TokenOBrace, Bytes: []byte("{ ")},
-	}
-	first := true
-	// Stable order: sorted keys.
-	keys := sortedKeys(m)
-	for _, k := range keys {
-		if !first {
-			tokens = append(tokens, &hclwrite.Token{Type: hclsyntax.TokenComma, Bytes: []byte(", ")})
-		}
-		first = false
-		tokens = append(tokens, &hclwrite.Token{Type: hclsyntax.TokenIdent, Bytes: []byte(k + " = ")})
-		tokens = append(tokens, valueTokens(k, m[k])...)
-	}
-	tokens = append(tokens, &hclwrite.Token{Type: hclsyntax.TokenCBrace, Bytes: []byte(" }")})
-	return tokens
-}
-
-func valueTokens(key string, v any) hclwrite.Tokens {
-	// `credential = X` is a bare-name ref.
-	if key == "credential" {
-		if s, ok := v.(string); ok {
-			return hclwrite.Tokens{{Type: hclsyntax.TokenIdent, Bytes: []byte(s)}}
-		}
-	}
-	// Other shapes emit via hclwrite.TokensForValue from the cty form.
-	cv, err := goToCty(v)
-	if err != nil {
-		return hclwrite.Tokens{{Type: hclsyntax.TokenIdent, Bytes: []byte("null")}}
-	}
-	return hclwrite.TokensForValue(cv)
-}
-
-func goToCty(v any) (cty.Value, error) {
-	switch x := v.(type) {
-	case nil:
-		return cty.NullVal(cty.DynamicPseudoType), nil
-	case string:
-		return cty.StringVal(x), nil
-	case bool:
-		return cty.BoolVal(x), nil
-	case int:
-		return cty.NumberIntVal(int64(x)), nil
-	case int64:
-		return cty.NumberIntVal(x), nil
-	case float64:
-		return cty.NumberFloatVal(x), nil
-	case []any:
-		if len(x) == 0 {
-			return cty.ListValEmpty(cty.String), nil
-		}
-		out := make([]cty.Value, len(x))
-		for i, e := range x {
-			cv, err := goToCty(e)
-			if err != nil {
-				return cty.NilVal, err
-			}
-			out[i] = cv
-		}
-		return cty.TupleVal(out), nil
-	case map[string]any:
-		out := make(map[string]cty.Value, len(x))
-		for k, e := range x {
-			cv, err := goToCty(e)
-			if err != nil {
-				return cty.NilVal, err
-			}
-			out[k] = cv
-		}
-		return cty.ObjectVal(out), nil
-	}
-	return cty.NilVal, fmt.Errorf("unsupported value type %T", v)
-}
-
-func sortedKeys(m map[string]any) []string {
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	// In-place sort. Avoiding sort import here is a wash; small.
-	for i := 1; i < len(keys); i++ {
-		for j := i; j > 0 && keys[j] < keys[j-1]; j-- {
-			keys[j], keys[j-1] = keys[j-1], keys[j]
-		}
-	}
-	return keys
 }
 
 // approveToTokens emits the approve list as bare-name idents.
@@ -492,37 +365,28 @@ func approveToTokens(stages []config.ApproveStage) hclwrite.Tokens {
 	return tokens
 }
 
-// PluginFor returns the config.Plugin that registers `<facet>_rule`
-// as a config.KindRule. Each facet package calls this from its init()
-// to install a rule type for its protocol family, so adding a new
-// facet plugin doesn't require touching the rules package at all.
-//
-// The returned Plugin closes over the facet's identity so the rule
-// loader's validation, build, and compile paths consult the right
-// match-key set and emit the right family stamp on the built Rule.
-func PluginFor(f facet.Runtime) *config.Plugin {
-	fam := validatedFamily{
-		family:           f.Name(),
-		endpointFamilies: f.EndpointFamilies(),
-	}
+// Plugin returns the single config.Plugin that registers `rule` as
+// a one-label config.KindRule. Family inference happens at validate
+// time based on the resolved endpoints, so this plugin doesn't carry
+// a family constraint on its endpoint refs — the inferFamily walk
+// reports mixed-family endpoint sets directly.
+func Plugin() *config.Plugin {
 	return &config.Plugin{
-		Kind:     config.KindRule,
-		Type:     f.RuleType(),
-		Families: fam.endpointFamilies,
-		New:      func() any { return &RuleBody{} },
+		Kind: config.KindRule,
+		Type: "",
+		New:  func() any { return &RuleBody{} },
 		Refs: []config.RefSpec{
-			{Path: "Endpoint", Kind: config.KindEndpoint, FamilyConstraint: fam.endpointFamilies, Optional: true},
-			{Path: "Endpoints[*]", Kind: config.KindEndpoint, FamilyConstraint: fam.endpointFamilies, Optional: true},
+			{Path: "Endpoint", Kind: config.KindEndpoint, Optional: true},
+			{Path: "Endpoints[*]", Kind: config.KindEndpoint, Optional: true},
+			{Path: "Credential", Kind: config.KindCredential, Optional: true},
 		},
-		Validate: func(d any, name string, ctx *config.BuildCtx) hcl.Diagnostics {
-			return validate(d, name, ctx, fam)
-		},
-		Build: func(d any, name string, ctx *config.BuildCtx) (any, hcl.Diagnostics) {
-			return build(d, name, ctx, fam)
-		},
-		CompileRule: func(body any, _ string) (*config.CompiledRule, []string, error) {
-			return body.(*Rule).Compile()
-		},
-		Emit: emitRule,
+		Validate:    validate,
+		Build:       build,
+		CompileRule: func(body any, _ string) (*config.CompiledRule, []string, error) { return body.(*Rule).Compile() },
+		Emit:        emitRule,
 	}
+}
+
+func init() {
+	config.Register(Plugin())
 }

@@ -1,27 +1,41 @@
-// Package sql is the SQL protocol-family facet. It owns the SQL
-// match-key set (verb/tables/function/statement/statement_regex/
-// credential), the matcher that walks a parsed SQL statement, the
-// Meta type wire-frame frontends (postgres, clickhouse) populate
-// on match.Request.Meta, and the per-family report fields the
-// dashboard shows for a SQL query.
+// Package sql is the SQL protocol-family facet. It owns the SQL CEL
+// environment (verb / tables / function / statement, exposed as
+// fields on the `sql` variable), the matcher that walks a parsed SQL
+// statement, the Meta type wire-frame frontends (postgres,
+// clickhouse) populate on match.Request.Meta, and the per-family
+// report fields the dashboard shows for a SQL query.
 //
 // SQL endpoints derive Meta themselves from the wire frame (the
 // postgres / clickhouse runtimes parse the Query message and stash
 // a *Meta on the request before dispatch), so PrepareRequest is a
 // no-op. The matcher type-asserts req.Meta to *Meta and fails the
 // match cleanly when the assertion fails — e.g. when an https-
-// family request accidentally reaches a sql_rule.
+// family request accidentally reaches a sql rule.
 package sql
 
 import (
 	"fmt"
-	"regexp"
+	"reflect"
+	"strings"
 
-	"github.com/denoland/clawpatrol/config"
+	"github.com/google/cel-go/cel"
+	"github.com/google/cel-go/ext"
+
 	"github.com/denoland/clawpatrol/config/facet"
 	"github.com/denoland/clawpatrol/config/match"
-	"github.com/denoland/clawpatrol/config/plugins/rules"
 )
+
+// SqlFields is the CEL-facing view of a SQL statement. Exposed as
+// the `sql` variable in rule conditions (`sql.verb`, `sql.tables`,
+// `sql.function`, `sql.statement`). The Go-level Function field is
+// named in singular to match the CEL field; the dashboard column
+// stays plural ("functions") for readability.
+type SqlFields struct {
+	Verb      string   `cel:"verb"`
+	Tables    []string `cel:"tables"`
+	Function  []string `cel:"function"`
+	Statement string   `cel:"statement"`
+}
 
 // Meta carries the per-request SQL fields the matcher reads. The
 // postgres and clickhouse endpoint runtimes build one of these from
@@ -40,10 +54,7 @@ type Facet struct{}
 // Name reports the family identifier this facet handles.
 func (Facet) Name() string { return "sql" }
 
-// RuleType reports the HCL rule label that targets this facet.
-func (Facet) RuleType() string { return "sql_rule" }
-
-// EndpointFamilies enumerates endpoint families a sql_rule may
+// EndpointFamilies enumerates endpoint families a sql rule may
 // attach to.
 func (Facet) EndpointFamilies() []string { return []string{"sql"} }
 
@@ -60,18 +71,6 @@ func (Facet) HITLQueryLabel() string { return "Query" }
 // HostIsResource reports that a SQL request's Host is typically a
 // virtual IP, not a label the operator would recognise.
 func (Facet) HostIsResource() bool { return false }
-
-// MatchKeys lists every key allowed in a sql_rule's match{} block.
-func (Facet) MatchKeys() []facet.MatchKeySpec {
-	return []facet.MatchKeySpec{
-		{Name: "verb", Kind: facet.MatchStringList},
-		{Name: "tables", Kind: facet.MatchGlobList},
-		{Name: "function", Kind: facet.MatchGlobList},
-		{Name: "statement", Kind: facet.MatchString},
-		{Name: "statement_regex", Kind: facet.MatchRegex},
-		{Name: "credential", Kind: facet.MatchCredentialRef},
-	}
-}
 
 // ReportFields declares the per-family columns the SQL facet emits.
 func (Facet) ReportFields() []facet.ReportFieldSpec {
@@ -103,75 +102,56 @@ func (Facet) Report(req *match.Request) map[string]any {
 	}
 }
 
-// NewMatcher compiles a sql_rule match map into a Matcher.
-func (Facet) NewMatcher(raw map[string]any) (match.Matcher, error) {
-	m := &sqlMatcher{
-		verb:       match.LowerAll(match.StringList(raw["verb"])),
-		tables:     match.ParseGlobs(raw["tables"]),
-		function:   match.ParseGlobs(raw["function"]),
-		statement:  match.StringValue(raw["statement"]),
-		credential: match.StringValue(raw["credential"]),
-	}
-	if r := match.StringValue(raw["statement_regex"]); r != "" {
-		re, err := regexp.Compile(r)
-		if err != nil {
-			return nil, fmt.Errorf("statement_regex: %w", err)
-		}
-		m.statementRegex = re
-	}
-	return m, nil
-}
-
-type sqlMatcher struct {
-	verb           []string
-	tables         []match.Glob
-	function       []match.Glob
-	statement      string // glob pattern
-	statementRegex *regexp.Regexp
-	credential     string
-}
-
-func (m *sqlMatcher) Match(req *match.Request) bool {
-	meta, _ := req.Meta.(*Meta)
-	if meta == nil {
-		return false
-	}
-	if m.credential != "" && req.Credential != m.credential {
-		return false
-	}
-	if len(m.verb) > 0 {
-		ok := false
-		for _, v := range m.verb {
-			if match.EqualsIgnoreCase(meta.Verb, v) {
-				ok = true
-				break
-			}
-		}
-		if !ok {
-			return false
-		}
-	}
-	if len(m.tables) > 0 {
-		if !match.AnyOfStrings(meta.Tables, m.tables) {
-			return false
-		}
-	}
-	if len(m.function) > 0 {
-		if !match.AnyOfStrings(meta.Functions, m.function) {
-			return false
-		}
-	}
-	if m.statement != "" && !match.PatternMatch(m.statement, meta.Statement) {
-		return false
-	}
-	if m.statementRegex != nil && !m.statementRegex.MatchString(meta.Statement) {
-		return false
-	}
-	return true
-}
+// celEnv is the SQL CEL environment. Built once at init.
+var celEnv *cel.Env
 
 func init() {
-	f := Facet{}
-	facet.Register(f)
-	config.Register(rules.PluginFor(f))
+	env, err := cel.NewEnv(
+		ext.Sets(),
+		ext.NativeTypes(
+			reflect.TypeFor[SqlFields](),
+			ext.ParseStructTags(true),
+		),
+		cel.Variable("sql", cel.ObjectType("sql.SqlFields")),
+	)
+	if err != nil {
+		panic(fmt.Sprintf("sql facet: cel env: %v", err))
+	}
+	celEnv = env
+
+	facet.Register(Facet{})
+}
+
+// NewMatcher compiles a CEL condition into a Matcher. An empty
+// condition is the catch-all match-everything case.
+func (Facet) NewMatcher(condition string) (match.Matcher, error) {
+	if condition == "" {
+		return match.PassThrough{}, nil
+	}
+	return match.CompileCondition(celEnv, condition, buildActivation)
+}
+
+func buildActivation(req *match.Request) map[string]any {
+	if req == nil {
+		return nil
+	}
+	meta, _ := req.Meta.(*Meta)
+	if meta == nil {
+		return nil
+	}
+	return map[string]any{
+		"sql": &SqlFields{
+			Verb:      strings.ToLower(meta.Verb),
+			Tables:    coalesceList(meta.Tables),
+			Function:  coalesceList(meta.Functions),
+			Statement: meta.Statement,
+		},
+	}
+}
+
+func coalesceList(xs []string) []string {
+	if xs == nil {
+		return []string{}
+	}
+	return xs
 }

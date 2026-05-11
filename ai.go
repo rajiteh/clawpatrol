@@ -22,40 +22,54 @@ const ruleSystemPrompt = `You edit clawpatrol gateway policy expressed in the v1
 
 # Grammar
 
-A rule is a top-level block with two labels: rule TYPE NAME { ... }.
-TYPE is one of:
+A rule is a top-level block with one label: rule NAME { ... }. The
+rule's protocol family (https / sql / k8s) is inferred from the
+endpoint(s) it targets — all endpoints on one rule must be from the
+same family.
 
-  http_rule  — for endpoints whose family is "https" / "kubernetes"
-  sql_rule   — for endpoints whose family is "sql"  (postgres / clickhouse)
-  k8s_rule   — for endpoints whose family is "k8s"
+Body shape:
 
-Body shape (every type shares the outer frame):
-
-  rule "http_rule" "name-of-rule" {
-    endpoint  = some-endpoint                   # bare-name ref (no quotes)
-    # endpoints = [a, b]                         # list form for multi-endpoint
-    priority  = 100                              # optional; default 0
-    disabled  = false                            # optional
-    match     = { ... }                          # optional; absent = match-everything
-    verdict   = "allow"                          # OR  approve = [name1, name2]
-    reason    = "human-readable"                 # required when verdict = "deny"
+  rule "name-of-rule" {
+    endpoint   = some-endpoint                   # bare-name ref (no quotes)
+    # endpoints = [a, b]                          # list form for multi-endpoint
+    priority   = 100                              # optional; default 0
+    disabled   = false                            # optional
+    credential = some-credential                  # optional bare-name ref
+    condition  = "<CEL expression>"               # optional; absent/"" = match-everything
+    verdict    = "allow"                          # OR  approve = [name1, name2]
+    reason     = "human-readable"                 # required when verdict = "deny"
   }
 
 Exactly one of verdict / approve must be set.
 
-# Per-family match keys
+# Per-family CEL variables
 
-http_rule:  method, path, query, headers, body_json, body_contains, credential
-sql_rule:   verb, tables, function, statement, statement_regex, credential
-k8s_rule:   resource, verb, namespace, name, params, credential
+Each family exposes a single struct-typed variable. Fields are
+accessed via dot notation.
 
-Match values: scalar OR list ("any-of"). Strings beginning with "!" negate.
+https endpoints:  http.method, http.path,
+                  http.query (map<string,list<string>>),
+                  http.headers (map<string,list<string>>),
+                  http.body (string), http.body_json (dyn)
+sql endpoints:    sql.verb (lower-case), sql.tables (list<string>),
+                  sql.function (list<string>), sql.statement (string)
+k8s endpoints:    k8s.resource, k8s.verb (lower-case),
+                  k8s.namespace, k8s.name,
+                  k8s.params (map<string,string>)
+
+Use CEL operators / builtins: ==, !=, &&, ||, !, in, startsWith,
+endsWith, contains, matches (regex), size().
+
 Examples:
 
-  match = { method = ["POST", "DELETE"] }
-  match = { tables = ["secrets", "audit.*"] }
-  match = { verb = "drop" }
-  match = { resource = ["secrets"], verb = ["get", "list"] }
+  condition = "http.method in ['POST', 'DELETE']"
+  condition = "'secrets' in sql.tables || sql.tables.exists(t, t.startsWith('audit.'))"
+  condition = "sql.verb == 'drop'"
+  condition = "k8s.resource == 'secrets' && k8s.verb in ['get', 'list']"
+  condition = "!k8s.name.startsWith('debug-')"
+  condition = "sql.statement.matches('(?i)copy.*from program')"
+  condition = "http.body.contains('approve_reply_')"
+  condition = "http.body_json.archived == true"
 
 # References
 

@@ -1,9 +1,9 @@
 // Package k8s is the Kubernetes protocol-family facet. It owns the
-// k8s match-key set (resource/verb/namespace/name/params/credential),
-// the matcher that walks a parsed Kubernetes API request, the Meta
-// type derived from the request URL, the path parser that produces
-// that Meta, and the per-family report fields the dashboard shows
-// for a k8s call.
+// k8s CEL environment (resource / verb / namespace / name / params,
+// exposed as fields on the `k8s` variable), the matcher that walks a
+// parsed Kubernetes API request, the Meta type derived from the
+// request URL, the path parser that produces that Meta, and the
+// per-family report fields the dashboard shows for a k8s call.
 //
 // Kubernetes traffic is HTTPS at the wire level, so the gateway's
 // HTTPS handler populates match.Request.Method/URL/Headers before
@@ -13,14 +13,29 @@
 package k8s
 
 import (
+	"fmt"
 	"net/url"
+	"reflect"
 	"strings"
 
-	"github.com/denoland/clawpatrol/config"
+	"github.com/google/cel-go/cel"
+	"github.com/google/cel-go/ext"
+
 	"github.com/denoland/clawpatrol/config/facet"
 	"github.com/denoland/clawpatrol/config/match"
-	"github.com/denoland/clawpatrol/config/plugins/rules"
 )
+
+// K8sFields is the CEL-facing view of a kubernetes request. Exposed
+// as the `k8s` variable in rule conditions (`k8s.verb`,
+// `k8s.namespace`, etc.). Tag-driven field naming keeps the Go field
+// names idiomatic while preserving the on-the-wire CEL names.
+type K8sFields struct {
+	Verb      string            `cel:"verb"`
+	Resource  string            `cel:"resource"`
+	Namespace string            `cel:"namespace"`
+	Name      string            `cel:"name"`
+	Params    map[string]string `cel:"params"`
+}
 
 // Meta is the (verb, resource, namespace, name, params) tuple
 // derived from a Kubernetes API path. Empty fields when the request
@@ -42,10 +57,7 @@ type Facet struct{}
 // Name reports the family identifier this facet handles.
 func (Facet) Name() string { return "k8s" }
 
-// RuleType reports the HCL rule label that targets this facet.
-func (Facet) RuleType() string { return "k8s_rule" }
-
-// EndpointFamilies enumerates endpoint families a k8s_rule may attach
+// EndpointFamilies enumerates endpoint families a k8s rule may attach
 // to.
 func (Facet) EndpointFamilies() []string { return []string{"k8s"} }
 
@@ -62,18 +74,6 @@ func (Facet) HITLQueryLabel() string { return "Resource" }
 // apiserver address (a VIP or IP), not a label the operator would
 // recognise — the operator's endpoint name is more useful.
 func (Facet) HostIsResource() bool { return false }
-
-// MatchKeys lists every key allowed in a k8s_rule's match{} block.
-func (Facet) MatchKeys() []facet.MatchKeySpec {
-	return []facet.MatchKeySpec{
-		{Name: "resource", Kind: facet.MatchGlobList},
-		{Name: "verb", Kind: facet.MatchStringList},
-		{Name: "namespace", Kind: facet.MatchGlobList},
-		{Name: "name", Kind: facet.MatchGlobList},
-		{Name: "params", Kind: facet.MatchStringMap},
-		{Name: "credential", Kind: facet.MatchCredentialRef},
-	}
-}
 
 // ReportFields declares the per-family columns the k8s facet emits.
 func (Facet) ReportFields() []facet.ReportFieldSpec {
@@ -111,68 +111,56 @@ func (Facet) Report(req *match.Request) map[string]any {
 	}
 }
 
-// NewMatcher compiles a k8s_rule match map into a Matcher.
-func (Facet) NewMatcher(raw map[string]any) (match.Matcher, error) {
-	m := &k8sMatcher{
-		resource:   match.ParseGlobs(raw["resource"]),
-		verb:       match.LowerAll(match.StringList(raw["verb"])),
-		namespace:  match.ParseGlobs(raw["namespace"]),
-		name:       match.ParseGlobs(raw["name"]),
-		credential: match.StringValue(raw["credential"]),
+// celEnv is the k8s CEL environment. Built once at init.
+var celEnv *cel.Env
+
+func init() {
+	env, err := cel.NewEnv(
+		ext.Sets(),
+		ext.NativeTypes(
+			reflect.TypeFor[K8sFields](),
+			ext.ParseStructTags(true),
+		),
+		cel.Variable("k8s", cel.ObjectType("k8s.K8sFields")),
+	)
+	if err != nil {
+		panic(fmt.Sprintf("k8s facet: cel env: %v", err))
 	}
-	if p, ok := raw["params"].(map[string]any); ok {
-		m.params = map[string]string{}
-		for k, v := range p {
-			m.params[k] = match.StringValue(v)
-		}
-	}
-	return m, nil
+	celEnv = env
+
+	facet.Register(Facet{})
 }
 
-type k8sMatcher struct {
-	resource   []match.Glob
-	verb       []string
-	namespace  []match.Glob
-	name       []match.Glob
-	params     map[string]string
-	credential string
+// NewMatcher compiles a CEL condition into a Matcher. An empty
+// condition is the catch-all match-everything case.
+func (Facet) NewMatcher(condition string) (match.Matcher, error) {
+	if condition == "" {
+		return match.PassThrough{}, nil
+	}
+	return match.CompileCondition(celEnv, condition, buildActivation)
 }
 
-func (m *k8sMatcher) Match(req *match.Request) bool {
+func buildActivation(req *match.Request) map[string]any {
+	if req == nil {
+		return nil
+	}
 	meta, _ := req.Meta.(*Meta)
 	if meta == nil {
-		return false
+		return nil
 	}
-	if m.credential != "" && req.Credential != m.credential {
-		return false
+	params := meta.Params
+	if params == nil {
+		params = map[string]string{}
 	}
-	if len(m.resource) > 0 && !match.Any(m.resource, meta.Resource) {
-		return false
+	return map[string]any{
+		"k8s": &K8sFields{
+			Verb:      strings.ToLower(meta.Verb),
+			Resource:  meta.Resource,
+			Namespace: meta.Namespace,
+			Name:      meta.Name,
+			Params:    params,
+		},
 	}
-	if len(m.verb) > 0 {
-		ok := false
-		for _, v := range m.verb {
-			if match.EqualsIgnoreCase(meta.Verb, v) {
-				ok = true
-				break
-			}
-		}
-		if !ok {
-			return false
-		}
-	}
-	if len(m.namespace) > 0 && !match.Any(m.namespace, meta.Namespace) {
-		return false
-	}
-	if len(m.name) > 0 && !match.Any(m.name, meta.Name) {
-		return false
-	}
-	for k, want := range m.params {
-		if meta.Params[k] != want {
-			return false
-		}
-	}
-	return true
 }
 
 // parsePath best-effort decomposes a Kubernetes API request into the
@@ -261,10 +249,4 @@ func parsePath(method, rawURL string) *Meta {
 		m.Verb = "watch"
 	}
 	return m
-}
-
-func init() {
-	f := Facet{}
-	facet.Register(f)
-	config.Register(rules.PluginFor(f))
 }

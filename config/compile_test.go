@@ -115,22 +115,22 @@ endpoint "https" "ep" {
 }
 profile "p" { endpoints = [ep] }
 
-rule "http_rule" "fallback" {
-  endpoint = ep
-  priority = -100
-  match    = { method = "POST" }
-  verdict  = "deny"
+rule "fallback" {
+  endpoint  = ep
+  priority  = -100
+  condition = "http.method == 'POST'"
+  verdict   = "deny"
 }
-rule "http_rule" "specific" {
-  endpoint = ep
-  priority = 100
-  match    = { method = "POST", path = "/v1/refunds" }
-  verdict  = "deny"
+rule "specific" {
+  endpoint  = ep
+  priority  = 100
+  condition = "http.method == 'POST' && http.path == '/v1/refunds'"
+  verdict   = "deny"
 }
-rule "http_rule" "general" {
-  endpoint = ep
-  match    = { method = "POST" }
-  verdict  = "allow"
+rule "general" {
+  endpoint  = ep
+  condition = "http.method == 'POST'"
+  verdict   = "allow"
 }
 `
 	gw, diags := config.LoadBytes([]byte(src), "in.hcl")

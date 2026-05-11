@@ -1,9 +1,9 @@
 // Package facet is the registry for protocol-family plugins.
 //
-// A facet owns end-to-end per-family behaviour: which keys a rule's
-// match{} block may use, how those keys compile into a Matcher, how
-// per-request metadata is derived from the request snapshot, and which
-// fields the family contributes to the event/log reporting layer.
+// A facet owns end-to-end per-family behaviour: how a rule's CEL
+// condition compiles into a Matcher, how per-request metadata is
+// derived from the request snapshot, and which fields the family
+// contributes to the event/log reporting layer.
 //
 // Built-in facets (https, sql, k8s) live under config/plugins/facets/;
 // each registers itself at init() via facet.Register. The rules
@@ -11,12 +11,6 @@
 // by name through this registry rather than switching on family
 // strings, so adding a new protocol is a single new package — no
 // edits in match.go, rules.go, or the gateway runtime.
-//
-// The contract is deliberately serialisable (MatchKeySpec,
-// ReportFieldSpec, and Report's map[string]any output all round-trip
-// through JSON) so a later out-of-process / Terraform-style provider
-// model can wrap the same Runtime interface over RPC without
-// re-architecting the host side.
 package facet
 
 import (
@@ -38,15 +32,10 @@ type Runtime interface {
 	// `family` string carried on endpoints and rules.
 	Name() string
 
-	// RuleType is the HCL block label used for rules targeting this
-	// facet ("http_rule", "sql_rule", "k8s_rule"). The rules plugin
-	// registers one config.KindRule entry per facet using this name.
-	RuleType() string
-
 	// EndpointFamilies lists the endpoint families a rule of this
 	// facet is allowed to attach to. Almost always a single entry
-	// equal to Name(); kept as a slice because the existing
-	// RefSpec.FamilyConstraint takes a slice.
+	// equal to Name(); kept as a slice because rule family inference
+	// (the per-endpoint family check at validate time) takes a set.
 	EndpointFamilies() []string
 
 	// Transport names the gateway-side handler that owns the wire
@@ -69,21 +58,15 @@ type Runtime interface {
 	// meaningful label on its own (e.g. an HTTPS hostname like
 	// `api.anthropic.com`) or merely a wire-level address (a SQL
 	// virtual IP, a k8s cluster IP) that the dashboard should
-	// substitute with the operator-defined endpoint name. Replaces
-	// the old `Family == "https"` carve-out in HITLEndpointLabel.
+	// substitute with the operator-defined endpoint name.
 	HostIsResource() bool
 
-	// MatchKeys returns the keys a rule's match{} block may contain
-	// for this facet. The loader uses these to reject typos before
-	// the matcher ever sees the raw map.
-	MatchKeys() []MatchKeySpec
-
-	// NewMatcher compiles a raw match map (already validated against
-	// MatchKeys) into a runtime Matcher. The returned Matcher reads
-	// from match.Request — typically by type-asserting Request.Meta
-	// to the facet's own Meta type, set by PrepareRequest or by the
-	// protocol's wire-frame frontend.
-	NewMatcher(raw map[string]any) (match.Matcher, error)
+	// NewMatcher compiles a CEL condition expression into a
+	// runtime Matcher. The facet owns the *cel.Env that declares
+	// which variables the expression may reference. An empty
+	// condition means "match-everything" — the facet returns a
+	// passthrough matcher.
+	NewMatcher(condition string) (match.Matcher, error)
 
 	// PrepareRequest is called by the gateway after building the
 	// request snapshot and before any matcher runs. The facet
@@ -104,39 +87,6 @@ type Runtime interface {
 	// request, after the verdict is known, to populate the event's
 	// per-family facets payload.
 	Report(req *match.Request) map[string]any
-}
-
-// MatchValueKind tags the shape a single match-key value may take in
-// HCL. The loader uses it to provide better diagnostics; downstream
-// matchers are still free to coerce flexibly via match.stringList /
-// match.parseGlobs as they always have.
-type MatchValueKind int
-
-const (
-	// MatchString is a single bare string ("verb = \"select\"").
-	MatchString MatchValueKind = iota
-	// MatchStringList accepts a string or list-of-strings; used by
-	// list-shaped facets like SQL `tables`.
-	MatchStringList
-	// MatchGlobList is a list-of-globs with optional "!" negation
-	// (paths, k8s resource names).
-	MatchGlobList
-	// MatchStringMap is a key→value map ("query = { foo = \"bar\" }",
-	// "headers = { ... }", "params = { ... }").
-	MatchStringMap
-	// MatchRegex is a regex pattern string (sql `statement_regex`).
-	MatchRegex
-	// MatchObject is a free-form nested object (http `body_json`).
-	MatchObject
-	// MatchCredentialRef is a bare-name reference to a credential
-	// block; handled specially by the rule build path.
-	MatchCredentialRef
-)
-
-// MatchKeySpec declares one valid key inside a rule's match{} body.
-type MatchKeySpec struct {
-	Name string
-	Kind MatchValueKind
 }
 
 // ReportValueKind tags the runtime shape of a per-family report
@@ -183,9 +133,6 @@ func Register(r Runtime) {
 	if name == "" {
 		panic("facet.Register: empty Name")
 	}
-	if r.RuleType() == "" {
-		panic(fmt.Sprintf("facet.Register(%s): empty RuleType", name))
-	}
 	registry.Lock()
 	defer registry.Unlock()
 	if registry.byName == nil {
@@ -198,8 +145,7 @@ func Register(r Runtime) {
 }
 
 // Lookup returns the facet registered under name, or nil if none is.
-// The rule loader uses this both to validate match-key sets and to
-// compile match maps into Matchers.
+// The rule loader uses this to compile CEL conditions into Matchers.
 func Lookup(name string) Runtime {
 	registry.RLock()
 	defer registry.RUnlock()
@@ -232,31 +178,13 @@ func Names() []string {
 	return out
 }
 
-// NewMatcher dispatches to the named facet's NewMatcher.
-// Replaces the per-family switch in match.New. Returns an error
-// when the family is unknown so the rule loader can surface a clean
-// diagnostic against the user's HCL.
-func NewMatcher(family string, raw map[string]any) (match.Matcher, error) {
+// NewMatcher dispatches to the named facet's NewMatcher. Returns an
+// error when the family is unknown so the rule loader can surface a
+// clean diagnostic against the user's HCL.
+func NewMatcher(family, condition string) (match.Matcher, error) {
 	r := Lookup(family)
 	if r == nil {
 		return nil, fmt.Errorf("unknown family %q (known: %v)", family, Names())
 	}
-	return r.NewMatcher(raw)
-}
-
-// KnownKeys returns the match-block keys allowed for family, or nil
-// when the family isn't registered. Replaces the per-family switch
-// in match.KnownKeys; same contract — the rule loader feeds the
-// result to its typo-check pass.
-func KnownKeys(family string) []string {
-	r := Lookup(family)
-	if r == nil {
-		return nil
-	}
-	specs := r.MatchKeys()
-	out := make([]string, len(specs))
-	for i, s := range specs {
-		out[i] = s.Name
-	}
-	return out
+	return r.NewMatcher(condition)
 }

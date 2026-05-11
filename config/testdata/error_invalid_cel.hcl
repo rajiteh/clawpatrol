@@ -5,10 +5,11 @@ endpoint "https" "github" {
   credential = pat
 }
 
-# References an undeclared endpoint name.
+# Syntactically invalid CEL — unbalanced quote.
+# The compile step must surface the parse error.
 rule "broken" {
-  endpoint  = mystery
-  condition = "http.method == 'GET'"
+  endpoint  = github
+  condition = "http.method == 'GET"
   verdict   = "allow"
 }
 

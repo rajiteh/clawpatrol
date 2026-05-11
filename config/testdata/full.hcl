@@ -53,13 +53,12 @@
 #                                         kubernetes, clickhouse_https,
 #                                         clickhouse_native.
 #
-#   rule         "<type>" "<name>" {}     one policy decision targeting
-#                                         one or more endpoints. Types:
-#                                         http_rule, sql_rule, k8s_rule.
-#                                         The type's match facets are
-#                                         validated against the
-#                                         referenced endpoint's protocol
-#                                         at load time.
+#   rule         "<name>" {}              one policy decision targeting
+#                                         one or more endpoints. The
+#                                         rule's family is inferred from
+#                                         its endpoint set and pins the
+#                                         CEL variable bound in the
+#                                         `condition` expression.
 #
 #   profile      "<name>" {}              endpoint membership list — a
 #                                         user / agent identity
@@ -165,7 +164,9 @@
 #
 #   - which endpoint(s) it applies to (`endpoint = X` or
 #     `endpoints = [X, Y, ...]`),
-#   - one match block,
+#   - an optional `credential = X` bare-name reference (request
+#     must have been dispatched against that credential),
+#   - an optional CEL `condition = "..."` predicate,
 #   - one outcome: `verdict = "allow"`, `verdict = "deny"` (with
 #     `reason`), or an `approve = [...]` chain.
 #
@@ -181,20 +182,25 @@
 #     `approval_rules` table scoped per integration), so no clever
 #     compilation step is required at load.
 #
-# Type discipline. `rule "<type>" "<name>"` — the type fixes which
-# match facets are valid (an `sql_rule` cannot match `http.method`).
-# A rule's referenced endpoints must all be of a protocol family that
-# matches the rule type, or it's a load error.
+# Family inference. `rule "<name>"` — one block kind, no type
+# label. The rule's protocol family is inferred from its endpoint(s)
+# at load time and pins the CEL variables available to the condition
+# (a rule targeting a postgres endpoint sees the `sql` variable, not
+# `http`). A rule's referenced endpoints must all be of the same
+# protocol family, or it's a load error.
 #
-#   http_rule  → https endpoints
-#   sql_rule   → postgres, clickhouse_https, clickhouse_native
-#   k8s_rule   → kubernetes endpoints
+#   https endpoints  → `http` variable
+#   postgres,
+#   clickhouse_https,
+#   clickhouse_native → `sql` variable
+#   kubernetes       → `k8s` variable
 #
 # Evaluation. For each request, the runtime collects all rules that
 # (1) name the request's endpoint and (2) are not `disabled = true`.
-# It sorts by `priority` descending and walks the list; the first rule
-# whose match block matches the request decides the outcome.
-# First-match-wins.
+# It sorts by `priority` descending and walks the list; the first
+# rule whose `credential` (if set) matches and whose CEL `condition`
+# evaluates true decides the outcome. First-match-wins. An absent
+# or empty `condition` matches every request.
 #
 # Priority is a single signed integer:
 #
@@ -227,24 +233,34 @@
 # Disabled rules. `disabled = true` keeps a rule in source for audit
 # / rollback without removing it. Lowers to `enabled = 0`.
 #
-# Match-key conventions:
+# Per-family CEL variables. Each family exposes one struct-typed
+# top-level variable; fields are accessed with dot notation.
 #
-#   - Strings starting with `!` mean "negate":
-#       resource = "!*/exec"      ≡  not glob "*/exec"
-#       name     = "!debug-*"     ≡  not glob "debug-*"
+#   https → http.method, http.path, http.query, http.headers,
+#           http.body, http.body_json
+#   sql   → sql.verb, sql.tables, sql.function, sql.statement
+#   k8s   → k8s.verb, k8s.resource, k8s.namespace, k8s.name,
+#           k8s.params
 #
-#   - Lists of strings without `!` mean "any of":
-#       resource = ["pods/exec", "pods/attach"]    ≡  in [...]
+# `verb` (sql, k8s) and `method` (http) are unary strings. `tables`
+# and `function` (sql) are list[string]; `query` and `headers`
+# (http) are map[string]list[string]; `params` (k8s) is
+# map[string]string. `body` is the raw request body as string;
+# `body_json` is its parsed-JSON shape (dyn).
 #
-#   - Mixed lists (with `!` entries) compose negation per-element:
-#       resource = ["!*/exec", "!*/attach", "!*/portforward"]
-#         ≡  not (glob */exec or glob */attach or glob */portforward)
+# CEL idioms used throughout this file:
 #
-#   - `*` is a glob wildcard. `statement_regex = "..."` is anchored
-#     PCRE.
-#
-#   - `credential = <ref>` matches when the request was dispatched
-#     against that credential (replaces an earlier `account` facet).
+#   - Membership / exact-or-any-of: `sql.verb in ['select', 'show']`,
+#     `http.method == 'POST'`.
+#   - Prefix / suffix / substring: `k8s.name.startsWith('debug-')`,
+#     `k8s.resource.endsWith('/exec')`,
+#     `http.body.contains('approve_')`.
+#   - Regex (for what globs and startsWith can't express):
+#     `sql.statement.matches('(?i)\\bsecret\\b')`.
+#   - List intersection (sql `tables` / `function` against a
+#     deny-list):
+#     `sets.intersects(sql.function, ['pg_read_file', ...])`.
+#     The `sets` extension is registered on every facet env.
 #
 #
 # ╔══════════════════════════════════════════════════════════════════╗
@@ -779,10 +795,10 @@ endpoint "https" "kaju-deno-support" {
 # action IDs go through an LLM proctor that verifies the Block Kit
 # shape matches what the human reviewer will see.
 
-rule "http_rule" "slack-avocet-approve-reply-shape" {
-  endpoint = slack-avocet
-  match = { method = "POST", path = "/api/chat.postMessage", body_contains = "approve_reply_" }
-  approve = [slack-block-kit-shape-judge]
+rule "slack-avocet-approve-reply-shape" {
+  endpoint  = slack-avocet
+  condition = "http.method == 'POST' && http.path == '/api/chat.postMessage' && http.body.contains('approve_reply_')"
+  approve   = [slack-block-kit-shape-judge]
 }
 
 # ── Deno Deploy ─────────────────────────────────────
@@ -794,26 +810,26 @@ rule "http_rule" "slack-avocet-approve-reply-shape" {
 # missing salutation, abusive content) and then support-ops human
 # approval. Everything else denies via the catch-all.
 
-rule "http_rule" "deno-deploy-reads" {
-  endpoint = deno-deploy
-  match = { method = "GET" }
-  verdict = "allow"
+rule "deno-deploy-reads" {
+  endpoint  = deno-deploy
+  condition = "http.method == 'GET'"
+  verdict   = "allow"
 }
-rule "http_rule" "deno-deploy-ticket-mutations" {
-  endpoint = deno-deploy
-  match = { method = "POST", path = ["/api/trpc/admin.supportTickets.markAsSpam", "/api/trpc/admin.supportTickets.updateStatus"] }
-  approve = [support-ops]
+rule "deno-deploy-ticket-mutations" {
+  endpoint  = deno-deploy
+  condition = "http.method == 'POST' && http.path in ['/api/trpc/admin.supportTickets.markAsSpam', '/api/trpc/admin.supportTickets.updateStatus']"
+  approve   = [support-ops]
 }
-rule "http_rule" "deno-deploy-reply-on-behalf" {
-  endpoint = deno-deploy
-  match = { method = "POST", path = "/api/trpc/admin.supportTickets.replyOnBehalf" }
-  approve = [reply-content-judge, support-ops]
+rule "deno-deploy-reply-on-behalf" {
+  endpoint  = deno-deploy
+  condition = "http.method == 'POST' && http.path == '/api/trpc/admin.supportTickets.replyOnBehalf'"
+  approve   = [reply-content-judge, support-ops]
 }
-rule "http_rule" "deno-deploy-default" {
+rule "deno-deploy-default" {
   endpoint = deno-deploy
-  priority  = -100
-  verdict = "deny"
-  reason = "console.deno.com mutations require an explicit approval rule"
+  priority = -100
+  verdict  = "deny"
+  reason   = "console.deno.com mutations require an explicit approval rule"
 }
 
 # ── Stripe ──────────────────────────────────────────
@@ -828,41 +844,38 @@ rule "http_rule" "deno-deploy-default" {
 # billing-strict (require_approvers = 2). Everything else POST →
 # billing single-approver. Catch-all denies the long tail.
 
-rule "http_rule" "stripe-reads" {
-  endpoint = stripe
-  match = { method = "GET" }
-  verdict = "allow"
+rule "stripe-reads" {
+  endpoint  = stripe
+  condition = "http.method == 'GET'"
+  verdict   = "allow"
 }
-rule "http_rule" "stripe-ephemeral-keys" {
-  endpoint = stripe
-  priority = 100
-  match = { method = "POST", path = "/v1/ephemeral_keys" }
-  verdict = "allow"
+rule "stripe-ephemeral-keys" {
+  endpoint  = stripe
+  priority  = 100
+  condition = "http.method == 'POST' && http.path == '/v1/ephemeral_keys'"
+  verdict   = "allow"
 }
-rule "http_rule" "stripe-no-deletes" {
-  endpoint = stripe
-  match = { method = "DELETE" }
-  verdict = "deny"
-  reason = "Stripe deletes go through the approval flow as POST"
+rule "stripe-no-deletes" {
+  endpoint  = stripe
+  condition = "http.method == 'DELETE'"
+  verdict   = "deny"
+  reason    = "Stripe deletes go through the approval flow as POST"
 }
-rule "http_rule" "stripe-extra-scrutiny" {
-  endpoint = stripe
-  priority = 100
-  match = {
-    method = "POST"
-    path   = ["/v1/refunds", "/v1/charges/*/refund", "/v1/subscriptions", "/v1/subscriptions/*", "/v1/subscription_items", "/v1/customers/*/subscriptions", "/v1/invoices/*/void", "/v1/invoices/*/finalize", "/v1/payouts", "/v1/transfers", "/v1/coupons", "/v1/promotion_codes"]
-  }
-  approve = [billing-strict]
+rule "stripe-extra-scrutiny" {
+  endpoint  = stripe
+  priority  = 100
+  condition = "http.method == 'POST' && (http.path in ['/v1/refunds', '/v1/subscriptions', '/v1/subscription_items', '/v1/payouts', '/v1/transfers', '/v1/coupons', '/v1/promotion_codes'] || http.path.startsWith('/v1/charges/') && http.path.endsWith('/refund') || http.path.startsWith('/v1/subscriptions/') || http.path.startsWith('/v1/customers/') && http.path.endsWith('/subscriptions') || http.path.startsWith('/v1/invoices/') && (http.path.endsWith('/void') || http.path.endsWith('/finalize')))"
+  approve   = [billing-strict]
 }
-rule "http_rule" "stripe-other-writes" {
-  endpoint = stripe
-  match = { method = "POST" }
-  approve = [billing]
+rule "stripe-other-writes" {
+  endpoint  = stripe
+  condition = "http.method == 'POST'"
+  approve   = [billing]
 }
-rule "http_rule" "stripe-default" {
+rule "stripe-default" {
   endpoint = stripe
-  priority  = -100
-  verdict = "deny"
+  priority = -100
+  verdict  = "deny"
 }
 
 # ── Orb ─────────────────────────────────────────────
@@ -873,26 +886,29 @@ rule "http_rule" "stripe-default" {
 # in match blocks — the same endpoint, different rules per credential.
 # This is the case the v11→v12 placeholder relocation was driven by.
 
-rule "http_rule" "orb-test-allow-all" {
-  endpoint = orb
-  match = { credential = orb-test-key }
-  verdict = "allow"
+rule "orb-test-allow-all" {
+  endpoint   = orb
+  credential = orb-test-key
+  verdict    = "allow"
 }
-rule "http_rule" "orb-prod-reads" {
-  endpoint = orb
-  match = { credential = orb-prod-key, method = "GET" }
-  verdict = "allow"
+rule "orb-prod-reads" {
+  endpoint   = orb
+  credential = orb-prod-key
+  condition  = "http.method == 'GET'"
+  verdict    = "allow"
 }
-rule "http_rule" "orb-prod-no-deletes" {
-  endpoint = orb
-  match = { credential = orb-prod-key, method = "DELETE" }
-  verdict = "deny"
-  reason = "Orb deletes go through approval flow as POST"
+rule "orb-prod-no-deletes" {
+  endpoint   = orb
+  credential = orb-prod-key
+  condition  = "http.method == 'DELETE'"
+  verdict    = "deny"
+  reason     = "Orb deletes go through approval flow as POST"
 }
-rule "http_rule" "orb-prod-writes" {
-  endpoint = orb
-  match = { credential = orb-prod-key, method = ["POST", "PUT", "PATCH"] }
-  approve = [billing]
+rule "orb-prod-writes" {
+  endpoint   = orb
+  credential = orb-prod-key
+  condition  = "http.method in ['POST', 'PUT', 'PATCH']"
+  approve    = [billing]
 }
 
 # ── Notion ──────────────────────────────────────────
@@ -903,31 +919,31 @@ rule "http_rule" "orb-prod-writes" {
 # alongside actual DELETE. Everything else (creates, edits) is allowed
 # outright since Notion content is low-blast-radius.
 
-rule "http_rule" "notion-reads" {
-  endpoint = notion
-  match = { method = ["GET", "HEAD"] }
-  verdict = "allow"
+rule "notion-reads" {
+  endpoint  = notion
+  condition = "http.method in ['GET', 'HEAD']"
+  verdict   = "allow"
 }
-rule "http_rule" "notion-search" {
-  endpoint = notion
-  match = { method = "POST", path = "/v1/search" }
-  verdict = "allow"
+rule "notion-search" {
+  endpoint  = notion
+  condition = "http.method == 'POST' && http.path == '/v1/search'"
+  verdict   = "allow"
 }
-rule "http_rule" "notion-archive-route" {
-  endpoint = notion
-  priority = 100
-  match = { method = "PATCH", path = ["/v1/pages/*", "/v1/blocks/*", "/v1/databases/*"], body_json = { archived = true } }
-  approve = [notion-archive]
+rule "notion-archive-route" {
+  endpoint  = notion
+  priority  = 100
+  condition = "http.method == 'PATCH' && (http.path.startsWith('/v1/pages/') || http.path.startsWith('/v1/blocks/') || http.path.startsWith('/v1/databases/')) && http.body_json.archived == true"
+  approve   = [notion-archive]
 }
-rule "http_rule" "notion-deletes" {
-  endpoint = notion
-  match = { method = "DELETE" }
-  approve = [notion-archive]
+rule "notion-deletes" {
+  endpoint  = notion
+  condition = "http.method == 'DELETE'"
+  approve   = [notion-archive]
 }
-rule "http_rule" "notion-create-update" {
-  endpoint = notion
-  match = { method = ["POST", "PATCH"] }
-  verdict = "allow"
+rule "notion-create-update" {
+  endpoint  = notion
+  condition = "http.method in ['POST', 'PATCH']"
+  verdict   = "allow"
 }
 
 # ── Grafana ─────────────────────────────────────────
@@ -937,26 +953,26 @@ rule "http_rule" "notion-create-update" {
 # rules are denied — those go through a PR. Updates to those same
 # resources go through the observability approver.
 
-rule "http_rule" "grafana-reads" {
-  endpoint = grafana
-  match = { method = ["GET", "HEAD"] }
-  verdict = "allow"
+rule "grafana-reads" {
+  endpoint  = grafana
+  condition = "http.method in ['GET', 'HEAD']"
+  verdict   = "allow"
 }
-rule "http_rule" "grafana-annotations-snapshots" {
-  endpoint = grafana
-  match = { method = "POST", path = ["/api/annotations", "/api/snapshots"] }
-  verdict = "allow"
+rule "grafana-annotations-snapshots" {
+  endpoint  = grafana
+  condition = "http.method == 'POST' && http.path in ['/api/annotations', '/api/snapshots']"
+  verdict   = "allow"
 }
-rule "http_rule" "grafana-no-destructive-deletes" {
-  endpoint = grafana
-  match = { method = "DELETE", path = ["/api/dashboards/*", "/api/datasources/*", "/api/folders/*", "/api/alert-rules/*"] }
-  verdict = "deny"
-  reason = "Destructive deletes go through a PR, not the agent"
+rule "grafana-no-destructive-deletes" {
+  endpoint  = grafana
+  condition = "http.method == 'DELETE' && (http.path.startsWith('/api/dashboards/') || http.path.startsWith('/api/datasources/') || http.path.startsWith('/api/folders/') || http.path.startsWith('/api/alert-rules/'))"
+  verdict   = "deny"
+  reason    = "Destructive deletes go through a PR, not the agent"
 }
-rule "http_rule" "grafana-dashboard-writes" {
-  endpoint = grafana
-  match = { method = ["POST", "PUT", "PATCH"], path = ["/api/dashboards/*", "/api/datasources/*", "/api/folders/*", "/api/alert-rules/*"] }
-  approve = [observability]
+rule "grafana-dashboard-writes" {
+  endpoint  = grafana
+  condition = "http.method in ['POST', 'PUT', 'PATCH'] && (http.path.startsWith('/api/dashboards/') || http.path.startsWith('/api/datasources/') || http.path.startsWith('/api/folders/') || http.path.startsWith('/api/alert-rules/'))"
+  approve   = [observability]
 }
 
 # ── ClickHouse (https + native, same rules apply) ───
@@ -965,16 +981,16 @@ rule "http_rule" "grafana-dashboard-writes" {
 # protocol endpoints via `endpoints = [ch-o11y-https, ch-o11y-native]`
 # — one rule, two targets, no duplication.
 
-rule "sql_rule" "clickhouse-reads" {
+rule "clickhouse-reads" {
   endpoints = [ch-o11y-https, ch-o11y-native]
-  match = { verb = ["select", "show", "describe", "explain", "use"] }
-  verdict = "allow"
+  condition = "sql.verb in ['select', 'show', 'describe', 'explain', 'use']"
+  verdict   = "allow"
 }
-rule "sql_rule" "clickhouse-default" {
+rule "clickhouse-default" {
   endpoints = [ch-o11y-https, ch-o11y-native]
   priority  = -100
-  verdict = "deny"
-  reason = "ClickHouse access is read-only"
+  verdict   = "deny"
+  reason    = "ClickHouse access is read-only"
 }
 
 # ── Postgres — banned across all postgres endpoints ─
@@ -984,35 +1000,35 @@ rule "sql_rule" "clickhouse-default" {
 # DDL, dangerous functions, COPY ... PROGRAM, and the migrations
 # table are all blocked uniformly. Per-database rules follow.
 
-rule "sql_rule" "pg-banned-verbs" {
+rule "pg-banned-verbs" {
   endpoints = [pg-deployng, pg-scheduler]
-  match = { verb = ["drop", "truncate", "alter", "grant", "revoke", "vacuum", "create", "comment", "do"] }
-  verdict = "deny"
-  reason = "Schema changes / destructive DDL not permitted; use a migration PR"
+  condition = "sql.verb in ['drop', 'truncate', 'alter', 'grant', 'revoke', 'vacuum', 'create', 'comment', 'do']"
+  verdict   = "deny"
+  reason    = "Schema changes / destructive DDL not permitted; use a migration PR"
 }
-rule "sql_rule" "pg-banned-functions" {
+rule "pg-banned-functions" {
   endpoints = [pg-deployng, pg-scheduler]
-  match = { function = ["pg_terminate_backend", "pg_cancel_backend", "pg_read_file", "pg_read_binary_file", "lo_get", "dblink_*"] }
-  verdict = "deny"
-  reason = "Disallowed function for agent access"
+  condition = "sets.intersects(sql.function, ['pg_terminate_backend', 'pg_cancel_backend', 'pg_read_file', 'pg_read_binary_file', 'lo_get']) || sql.function.exists(f, f.startsWith('dblink_'))"
+  verdict   = "deny"
+  reason    = "Disallowed function for agent access"
 }
-rule "sql_rule" "pg-banned-copy-from" {
+rule "pg-banned-copy-from" {
   endpoints = [pg-deployng, pg-scheduler]
-  match = { statement = "*COPY*FROM PROGRAM*" }
-  verdict = "deny"
-  reason = "COPY ... FROM PROGRAM is disallowed"
+  condition = "sql.statement.matches('(?is)copy.*from program')"
+  verdict   = "deny"
+  reason    = "COPY ... FROM PROGRAM is disallowed"
 }
-rule "sql_rule" "pg-banned-copy-to" {
+rule "pg-banned-copy-to" {
   endpoints = [pg-deployng, pg-scheduler]
-  match = { statement = "*COPY*TO PROGRAM*" }
-  verdict = "deny"
-  reason = "COPY ... TO PROGRAM is disallowed"
+  condition = "sql.statement.matches('(?is)copy.*to program')"
+  verdict   = "deny"
+  reason    = "COPY ... TO PROGRAM is disallowed"
 }
-rule "sql_rule" "pg-no-migrations" {
+rule "pg-no-migrations" {
   endpoints = [pg-deployng, pg-scheduler]
-  match = { tables = "kysely_migration" }
-  verdict = "deny"
-  reason = "Migrations table is owned by the deploy pipeline"
+  condition = "'kysely_migration' in sql.tables"
+  verdict   = "deny"
+  reason    = "Migrations table is owned by the deploy pipeline"
 }
 
 # ── Postgres — pg-deployng-specific account rules ───
@@ -1024,32 +1040,34 @@ rule "sql_rule" "pg-no-migrations" {
 # columns are actually being projected — priority=100 so it overrides
 # pg-deployng-reads. Rw writes go to console-dba.
 
-rule "sql_rule" "pg-deployng-ro-no-writes" {
-  endpoint = pg-deployng
-  match = { credential = pg-deployng-ro, verb = ["insert", "update", "delete", "merge", "notify"] }
-  verdict = "deny"
-  reason = "ro account is read-only — use the rw placeholder if you need to write"
+rule "pg-deployng-ro-no-writes" {
+  endpoint   = pg-deployng
+  credential = pg-deployng-ro
+  condition  = "sql.verb in ['insert', 'update', 'delete', 'merge', 'notify']"
+  verdict    = "deny"
+  reason     = "ro account is read-only — use the rw placeholder if you need to write"
 }
-rule "sql_rule" "pg-deployng-secret-columns" {
-  endpoint = pg-deployng
-  priority = 100
-  match = { verb = "select", tables = ["github_identities", "tokens", "email_confirmations", "authorizations", "domain_certificates", "database_instances", "env_vars"] }
-  approve = [pg-secret-columns-judge]
+rule "pg-deployng-secret-columns" {
+  endpoint  = pg-deployng
+  priority  = 100
+  condition = "sql.verb == 'select' && sets.intersects(sql.tables, ['github_identities', 'tokens', 'email_confirmations', 'authorizations', 'domain_certificates', 'database_instances', 'env_vars'])"
+  approve   = [pg-secret-columns-judge]
 }
-rule "sql_rule" "pg-deployng-rw-writes" {
-  endpoint = pg-deployng
-  match = { credential = pg-deployng-rw, verb = ["insert", "update", "delete", "merge", "notify"] }
-  approve = [console-dba]
+rule "pg-deployng-rw-writes" {
+  endpoint   = pg-deployng
+  credential = pg-deployng-rw
+  condition  = "sql.verb in ['insert', 'update', 'delete', 'merge', 'notify']"
+  approve    = [console-dba]
 }
-rule "sql_rule" "pg-deployng-reads" {
-  endpoint = pg-deployng
-  match = { verb = ["select", "show", "explain"] }
-  verdict = "allow"
+rule "pg-deployng-reads" {
+  endpoint  = pg-deployng
+  condition = "sql.verb in ['select', 'show', 'explain']"
+  verdict   = "allow"
 }
-rule "sql_rule" "pg-deployng-default" {
+rule "pg-deployng-default" {
   endpoint = pg-deployng
-  priority  = -100
-  verdict = "deny"
+  priority = -100
+  verdict  = "deny"
 }
 
 # ── Postgres — pg-scheduler-specific rules ──────────
@@ -1058,26 +1076,26 @@ rule "sql_rule" "pg-deployng-default" {
 # column names go through an LLM proctor (overrides pg-scheduler-
 # reads via priority=100). Writes go to scheduler-ops.
 
-rule "sql_rule" "pg-scheduler-secret-named-defense" {
-  endpoint = pg-scheduler
-  priority = 100
-  match = { verb = "select", statement_regex = "(?i)\\b(secret|password|token|api_key|private_key|access_key|signing_secret)\\b" }
-  approve = [pg-secret-named-defense-judge]
+rule "pg-scheduler-secret-named-defense" {
+  endpoint  = pg-scheduler
+  priority  = 100
+  condition = "sql.verb == 'select' && sql.statement.matches('(?i)\\\\b(secret|password|token|api_key|private_key|access_key|signing_secret)\\\\b')"
+  approve   = [pg-secret-named-defense-judge]
 }
-rule "sql_rule" "pg-scheduler-writes" {
-  endpoint = pg-scheduler
-  match = { verb = ["insert", "update", "delete", "merge", "notify"] }
-  approve = [scheduler-ops]
+rule "pg-scheduler-writes" {
+  endpoint  = pg-scheduler
+  condition = "sql.verb in ['insert', 'update', 'delete', 'merge', 'notify']"
+  approve   = [scheduler-ops]
 }
-rule "sql_rule" "pg-scheduler-reads" {
-  endpoint = pg-scheduler
-  match = { verb = ["select", "show", "explain"] }
-  verdict = "allow"
+rule "pg-scheduler-reads" {
+  endpoint  = pg-scheduler
+  condition = "sql.verb in ['select', 'show', 'explain']"
+  verdict   = "allow"
 }
-rule "sql_rule" "pg-scheduler-default" {
+rule "pg-scheduler-default" {
   endpoint = pg-scheduler
-  priority  = -100
-  verdict = "deny"
+  priority = -100
+  verdict  = "deny"
 }
 
 # ── Kubernetes — base rules across all clusters ─────
@@ -1094,59 +1112,59 @@ rule "sql_rule" "pg-scheduler-default" {
 # for one-off debugging). exec/attach/portforward verbs are allowed
 # (the safety blocks above already restrict them appropriately).
 
-rule "k8s_rule" "k8s-no-secrets" {
+rule "k8s-no-secrets" {
   endpoints = [k8s-dev-ams, k8s-dev-ord, k8s-eks-deployng-prod]
-  priority = 1000
-  match = { resource = "secrets" }
-  verdict = "deny"
-  reason = "Secret values must not leave the cluster via the agent"
+  priority  = 1000
+  condition = "k8s.resource == 'secrets'"
+  verdict   = "deny"
+  reason    = "Secret values must not leave the cluster via the agent"
 }
-rule "k8s_rule" "k8s-no-interactive" {
+rule "k8s-no-interactive" {
   endpoints = [k8s-dev-ams, k8s-dev-ord, k8s-eks-deployng-prod]
-  priority = 1000
-  match = { resource = ["pods/exec", "pods/attach"], params = { stdin = "true" } }
-  verdict = "deny"
-  reason = "Interactive shells can't be evaluated by the rules engine"
+  priority  = 1000
+  condition = "k8s.resource in ['pods/exec', 'pods/attach'] && k8s.params.stdin == 'true'"
+  verdict   = "deny"
+  reason    = "Interactive shells can't be evaluated by the rules engine"
 }
-rule "k8s_rule" "k8s-no-disruptive" {
+rule "k8s-no-disruptive" {
   endpoints = [k8s-dev-ams, k8s-dev-ord, k8s-eks-deployng-prod]
-  match = { verb = ["drain", "cordon", "evict"] }
-  verdict = "deny"
-  reason = "Cluster-disruptive operations are not allowed"
+  condition = "k8s.verb in ['drain', 'cordon', 'evict']"
+  verdict   = "deny"
+  reason    = "Cluster-disruptive operations are not allowed"
 }
-rule "k8s_rule" "k8s-no-portforward-non-debug" {
+rule "k8s-no-portforward-non-debug" {
   endpoints = [k8s-dev-ams, k8s-dev-ord, k8s-eks-deployng-prod]
-  priority = 1000
-  match = { resource = "pods/portforward", name = "!debug-*" }
-  verdict = "deny"
-  reason = "Port-forward only allowed to debug-* pods"
+  priority  = 1000
+  condition = "k8s.resource == 'pods/portforward' && !k8s.name.startsWith('debug-')"
+  verdict   = "deny"
+  reason    = "Port-forward only allowed to debug-* pods"
 }
-rule "k8s_rule" "k8s-no-mutations" {
+rule "k8s-no-mutations" {
   endpoints = [k8s-dev-ams, k8s-dev-ord, k8s-eks-deployng-prod]
-  match = { verb = ["create", "update", "patch", "delete"], name = "!debug-*", resource = ["!*/exec", "!*/attach", "!*/portforward"] }
-  verdict = "deny"
-  reason = "Only debug-* pods may be created / modified / deleted"
+  condition = "k8s.verb in ['create', 'update', 'patch', 'delete'] && !k8s.name.startsWith('debug-') && !k8s.resource.endsWith('/exec') && !k8s.resource.endsWith('/attach') && !k8s.resource.endsWith('/portforward')"
+  verdict   = "deny"
+  reason    = "Only debug-* pods may be created / modified / deleted"
 }
-rule "k8s_rule" "k8s-exec-content-check" {
+rule "k8s-exec-content-check" {
   endpoints = [k8s-dev-ams, k8s-dev-ord, k8s-eks-deployng-prod]
-  priority = 500
-  match = { resource = "pods/exec" }
-  approve = [k8s-exec-content-judge]
+  priority  = 500
+  condition = "k8s.resource == 'pods/exec'"
+  approve   = [k8s-exec-content-judge]
 }
-rule "k8s_rule" "k8s-reads" {
+rule "k8s-reads" {
   endpoints = [k8s-dev-ams, k8s-dev-ord, k8s-eks-deployng-prod]
-  match = { verb = ["get", "list", "watch"] }
-  verdict = "allow"
+  condition = "k8s.verb in ['get', 'list', 'watch']"
+  verdict   = "allow"
 }
-rule "k8s_rule" "k8s-debug-pods" {
+rule "k8s-debug-pods" {
   endpoints = [k8s-dev-ams, k8s-dev-ord, k8s-eks-deployng-prod]
-  match = { verb = ["create", "delete"], resource = "pods", name = "debug-*" }
-  verdict = "allow"
+  condition = "k8s.verb in ['create', 'delete'] && k8s.resource == 'pods' && k8s.name.startsWith('debug-')"
+  verdict   = "allow"
 }
-rule "k8s_rule" "k8s-exec-attach" {
+rule "k8s-exec-attach" {
   endpoints = [k8s-dev-ams, k8s-dev-ord, k8s-eks-deployng-prod]
-  match = { verb = ["create", "get"], resource = ["pods/exec", "pods/attach", "pods/portforward"] }
-  verdict = "allow"
+  condition = "k8s.verb in ['create', 'get'] && k8s.resource in ['pods/exec', 'pods/attach', 'pods/portforward']"
+  verdict   = "allow"
 }
 
 # ── Kubernetes — EKS-specific extras ────────────────
@@ -1158,37 +1176,37 @@ rule "k8s_rule" "k8s-exec-attach" {
 # cleartext secrets (named *-secrets or env-*); reads of those are
 # blocked even though configmaps reads are otherwise allowed.
 
-rule "k8s_rule" "k8s-eks-no-runtime-writes" {
-  endpoint = k8s-eks-deployng-prod
-  priority = 1000
-  match = { verb = ["create", "update", "patch", "delete"], namespace = ["console", "kube-system", "cert-manager", "external-secrets", "argocd", "flux*"] }
-  verdict = "deny"
-  reason = "Writes to runtime namespaces would impact production"
+rule "k8s-eks-no-runtime-writes" {
+  endpoint  = k8s-eks-deployng-prod
+  priority  = 1000
+  condition = "k8s.verb in ['create', 'update', 'patch', 'delete'] && (k8s.namespace in ['console', 'kube-system', 'cert-manager', 'external-secrets', 'argocd'] || k8s.namespace.startsWith('flux'))"
+  verdict   = "deny"
+  reason    = "Writes to runtime namespaces would impact production"
 }
-rule "k8s_rule" "k8s-eks-no-legacy-secret-configmaps" {
-  endpoint = k8s-eks-deployng-prod
-  priority = 1000
-  match = { verb = ["get", "list"], resource = "configmaps", namespace = "console", name = ["*-secrets", "env-*"] }
-  verdict = "deny"
-  reason = "Some legacy configmaps still carry cleartext secrets"
+rule "k8s-eks-no-legacy-secret-configmaps" {
+  endpoint  = k8s-eks-deployng-prod
+  priority  = 1000
+  condition = "k8s.verb in ['get', 'list'] && k8s.resource == 'configmaps' && k8s.namespace == 'console' && (k8s.name.endsWith('-secrets') || k8s.name.startsWith('env-'))"
+  verdict   = "deny"
+  reason    = "Some legacy configmaps still carry cleartext secrets"
 }
 
 # ── Kubernetes catch-alls (per cluster) ─────────────
 
-rule "k8s_rule" "k8s-dev-ams-default" {
+rule "k8s-dev-ams-default" {
   endpoint = k8s-dev-ams
-  priority  = -100
-  verdict = "deny"
+  priority = -100
+  verdict  = "deny"
 }
-rule "k8s_rule" "k8s-dev-ord-default" {
+rule "k8s-dev-ord-default" {
   endpoint = k8s-dev-ord
-  priority  = -100
-  verdict = "deny"
+  priority = -100
+  verdict  = "deny"
 }
-rule "k8s_rule" "k8s-eks-default" {
+rule "k8s-eks-default" {
   endpoint = k8s-eks-deployng-prod
-  priority  = -100
-  verdict = "deny"
+  priority = -100
+  verdict  = "deny"
 }
 
 # ── Profiles ────────────────────────────────────────
