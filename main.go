@@ -255,6 +255,11 @@ type Gateway struct {
 	agents  *AgentRegistry
 	hitl    *HITLRegistry
 	onboard *onboardRegistry
+	// readOnlyConfig, when set via --read-only-config, rejects every
+	// dashboard write that mutates cfgPath. The dashboard reads the
+	// flag from /api/state and hides its editor affordances; the
+	// server enforces it regardless of UI state.
+	readOnlyConfig bool
 	// secrets hands credential plugins the secret bytes they inject
 	// at request time. Default env-var-backed; OAuth-flow credentials
 	// land via a follow-up bridge that delegates to OAuthRegistry.
@@ -2141,6 +2146,8 @@ func runGateway(args []string) {
 	}
 	fs := flag.NewFlagSet("gateway", flag.ExitOnError)
 	cfgPath := fs.String("config", "config.yaml", "config file")
+	readOnly := fs.Bool("read-only-config", false,
+		"reject dashboard writes to the HCL config file")
 	_ = fs.Parse(args)
 
 	startModelRefresh()
@@ -2184,16 +2191,20 @@ func runGateway(args []string) {
 		log.Fatalf("oauth: %v", err)
 	}
 	g := &Gateway{
-		cfg:     cfg,
-		cfgPath: *cfgPath,
-		db:      db,
-		certs:   certs,
-		dialer:  newUpstreamDialer(cfg.Resolver),
-		sink:    sink,
-		oauth:   oauthReg,
-		agents:  NewAgentRegistry(),
-		hitl:    newHITLRegistry(sink),
-		onboard: newOnboardRegistry(),
+		cfg:            cfg,
+		cfgPath:        *cfgPath,
+		readOnlyConfig: *readOnly,
+		db:             db,
+		certs:          certs,
+		dialer:         newUpstreamDialer(cfg.Resolver),
+		sink:           sink,
+		oauth:          oauthReg,
+		agents:         NewAgentRegistry(),
+		hitl:           newHITLRegistry(sink),
+		onboard:        newOnboardRegistry(),
+	}
+	if *readOnly {
+		log.Printf("config: read-only mode (dashboard writes rejected)")
 	}
 	g.secrets = newGatewaySecretStore(db, oauthReg)
 	g.tunnels = NewTunnelManager(g.secrets, cfg.CADir)
