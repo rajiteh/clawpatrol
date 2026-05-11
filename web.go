@@ -48,7 +48,7 @@ var errConfigRevisionConflict = errors.New("config revision conflict")
 type webMux struct {
 	g         *Gateway
 	caDir     string
-	ts        Tailscale // for onboarding key minting
+	ts        JoinConfig // for onboarding key minting
 	publicURL string
 	mu        sync.Mutex
 	sessions  map[string]*oauthSession
@@ -175,14 +175,14 @@ func isTailscaleControlMode(control string) bool {
 
 func (w *webMux) mayUseTailnetInsteadOfDashboard(path string) bool {
 	return w.authRequirementForPath(path) == authDashboardOrTailnetOperator &&
-		isTailscaleControlMode(w.g.cfg.Tailscale.Control)
+		isTailscaleControlMode(w.g.cfg.Control)
 }
 
 func (w *webMux) skipsTailnetGate(path string) bool {
 	return w.authRequirementForPath(path) == authPublic
 }
 
-func newWebMux(g *Gateway, caDir string, ts Tailscale, publicURL string) http.Handler {
+func newWebMux(g *Gateway, caDir string, ts JoinConfig, publicURL string) http.Handler {
 	w := &webMux{g: g, caDir: caDir, ts: ts, publicURL: publicURL, sessions: map[string]*oauthSession{}, onboard: g.onboard, previews: map[string]configPreviewToken{}}
 	return w.handler()
 }
@@ -383,7 +383,7 @@ func (w *webMux) tailnetGate(next http.Handler) http.Handler {
 	// In wireguard / proxy mode there is no tailnet identity to gate
 	// against. Operators put the dashboard behind their own
 	// authentication (Cloudflare Access, basic auth proxy, etc).
-	skipGate := !isTailscaleControlMode(w.g.cfg.Tailscale.Control)
+	skipGate := !isTailscaleControlMode(w.g.cfg.Control)
 
 	return http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
 		if w.skipsTailnetGate(r.URL.Path) || skipGate {
