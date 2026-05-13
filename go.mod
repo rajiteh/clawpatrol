@@ -19,6 +19,7 @@ require (
 	github.com/hashicorp/hcl/v2 v2.24.0
 	github.com/klauspost/compress v1.18.3
 	github.com/miekg/dns v1.1.72
+	github.com/pgplex/pgparser v0.2.0
 	github.com/refraction-networking/utls v1.8.2
 	github.com/zclconf/go-cty v1.16.3
 	go.opentelemetry.io/contrib/instrumentation/runtime v0.68.0
