@@ -44,7 +44,9 @@ func (e *ClickhouseHTTPSEndpoint) DispatchDatabase() string { return e.Database 
 // target database two ways: the `database` URL query parameter or
 // the `X-ClickHouse-Database` header; the query parameter takes
 // precedence when both are set, mirroring clickhouse-server's own
-// resolution order. Returns "" when neither is set.
+// resolution order. Returns "" when neither is set; the matcher
+// then sees an empty `sql.database`, which won't satisfy a
+// `sql.database == "..."` predicate.
 func ClickhouseHTTPSDatabaseFromRequest(req *http.Request) string {
 	if req == nil {
 		return ""
