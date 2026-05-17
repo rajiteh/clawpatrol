@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"crypto/tls"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -215,7 +216,15 @@ func finishJoinSetup(s *joinSetup, skipTrust bool) {
 // approval step.
 func fetchCAHTTP(gateway, dst string) (string, error) {
 	url := strings.TrimRight(gateway, "/") + "/ca.crt"
-	c := &http.Client{Timeout: 10 * time.Second}
+	// InsecureSkipVerify is intentional here: we haven't yet fetched the CA
+	// that signed the gateway's cert, so we can't verify it. The admin confirms
+	// the fingerprint out-of-band (shown in the UI at join time) — TOFU.
+	c := &http.Client{
+		Timeout: 10 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec
+		},
+	}
 	resp, err := c.Get(url)
 	if err != nil {
 		return "", err
@@ -263,6 +272,9 @@ func runLogin(args []string) {
 		} else {
 			sshPinned = true
 		}
+		if err := exemptPublicIPFromExitNode(); err != nil {
+			fmt.Fprintf(os.Stderr, "⚠ couldn't protect public IP inbound traffic: %v\n", err)
+		}
 	}
 
 	tscli, err := tailscaleBin()
@@ -298,8 +310,15 @@ func runLogin(args []string) {
 	// On Linux, `tailscale set` requires sudo unless --operator=$USER
 	// was passed to `tailscale up`. tsSet handles either case.
 	if !*skipExitNode {
-		if err := tsSet(tscli, "--exit-node="+*gwName); err != nil {
+		if err := tsSet(tscli, "--exit-node="+*gwName, "--accept-dns=false"); err != nil {
 			fail("tailscale set --exit-node=%s: %v", *gwName, err)
+		}
+		// With accept-dns=false, Tailscale stops managing /etc/resolv.conf but
+		// leaves whatever nameserver was there (often 100.100.100.100). Once the
+		// exit-node is active, that address is unreachable from the client, so
+		// DNS breaks. Write a public fallback so lookups work through the exit-node.
+		if runtime.GOOS == "linux" {
+			fixResolvConf(st.MagicDNSSuffix)
 		}
 	}
 
@@ -406,6 +425,71 @@ func exemptSSHFromExitNode(_ string) error {
 		if err := c.Run(); err != nil {
 			return fmt.Errorf("ip rule: %w", err)
 		}
+	}
+	return nil
+}
+
+// exemptPublicIPFromExitNode ensures reply traffic for this machine's public
+// IP address routes via the main table (direct interface) rather than the
+// Tailscale exit-node. Without this, inbound TCP connections (HTTPS, etc.)
+// receive SYN-ACKs from the exit-node's public IP instead of the machine's
+// own IP, breaking every server that binds to the public interface.
+//
+// The fix is a single high-priority policy-routing rule:
+//
+//	ip rule add from <public-ip> lookup main priority 100
+//
+// Idempotent. Also writes a networkd-dispatcher script so the rule survives
+// reboots (Tailscale's own routing rules are re-installed on every boot, so
+// we have to be too).
+func exemptPublicIPFromExitNode() error {
+	// Find the primary public IPv4: source addr used for the default route.
+	out, err := exec.Command("ip", "-o", "route", "get", "1.1.1.1").Output()
+	if err != nil {
+		return fmt.Errorf("ip route get: %w", err)
+	}
+	// output: "1.1.1.1 via ... dev eth0 src 203.0.113.5 ..."
+	pubIP := ""
+	fields := strings.Fields(string(out))
+	for i, f := range fields {
+		if f == "src" && i+1 < len(fields) {
+			pubIP = fields[i+1]
+			break
+		}
+	}
+	if pubIP == "" || strings.HasPrefix(pubIP, "100.") || pubIP == "127.0.0.1" {
+		return fmt.Errorf("could not determine public IP (got %q)", pubIP)
+	}
+
+	// Add ip rule idempotently.
+	existing, _ := exec.Command("ip", "rule", "show").Output()
+	if !strings.Contains(string(existing), pubIP) {
+		c := exec.Command("sudo", "ip", "rule", "add", "from", pubIP, "lookup", "main", "priority", "100")
+		c.Stderr = os.Stderr
+		if err := c.Run(); err != nil {
+			return fmt.Errorf("ip rule add: %w", err)
+		}
+	}
+
+	// Persist via networkd-dispatcher so the rule survives reboots.
+	dir := "/etc/networkd-dispatcher/routable.d"
+	_ = exec.Command("sudo", "mkdir", "-p", dir).Run()
+	script := fmt.Sprintf("#!/bin/sh\n# clawpatrol: keep public IP replies on direct path (not exit-node)\nip rule show | grep -q '%s' || ip rule add from %s lookup main priority 100\n", pubIP, pubIP)
+	tmp, err := os.CreateTemp("", "clawpatrol-routing-*")
+	if err != nil {
+		return err
+	}
+	if _, err := tmp.WriteString(script); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	_ = tmp.Close()
+	dst := dir + "/50-clawpatrol-public-ip"
+	c := exec.Command("sudo", "sh", "-c", fmt.Sprintf("mv %s %s && chmod +x %s", tmp.Name(), dst, dst))
+	c.Stderr = os.Stderr
+	if err := c.Run(); err != nil {
+		_ = os.Remove(tmp.Name())
+		return fmt.Errorf("install routing script: %w", err)
 	}
 	return nil
 }
@@ -539,9 +623,122 @@ func manualTrustHint(caPath string) string {
 	return "manually add " + caPath + " to your system trust store"
 }
 
+// fixResolvConf ensures /etc/resolv.conf has a working public nameserver after
+// Tailscale DNS management is disabled (--accept-dns=false). When exit-node is
+// active, 100.100.100.100 (the Tailscale magic DNS address) is unreachable from
+// the client, so any resolver pointing there breaks silently.
+//
+// If systemd-resolved is running, configure split DNS: public names go to 8.8.8.8
+// via the default interface, and MagicDNS names (*.ts.net, *.tailnet suffix) still
+// resolve via 100.100.100.100 on tailscale0. This preserves peer name resolution
+// while keeping public DNS working through the exit-node.
+//
+// Falls back to writing 8.8.8.8 directly into resolv.conf when systemd-resolved
+// is not available. Best-effort; logs warnings on failure.
+func fixResolvConf(magicDNSSuffix string) {
+	if fixResolvConfSplitDNS(magicDNSSuffix) {
+		return
+	}
+	// Fallback: plain resolv.conf replace.
+	const path = "/etc/resolv.conf"
+	cur, _ := os.ReadFile(path)
+	if !strings.Contains(string(cur), "100.100.100.100") {
+		return
+	}
+	writeResolv := func(content string) bool {
+		tmp, err := os.CreateTemp("/etc", ".resolv.conf.*")
+		if err != nil {
+			cmd := exec.Command("sudo", "tee", path)
+			cmd.Stdin = strings.NewReader(content)
+			out, err2 := cmd.CombinedOutput()
+			if err2 != nil {
+				fmt.Fprintf(os.Stderr, "⚠ resolv.conf: %v: %s\n", err2, out)
+				return false
+			}
+			return true
+		}
+		_, _ = tmp.WriteString(content)
+		_ = tmp.Close()
+		if err := os.Rename(tmp.Name(), path); err != nil {
+			cmd := exec.Command("sudo", "mv", tmp.Name(), path)
+			if out, err2 := cmd.CombinedOutput(); err2 != nil {
+				fmt.Fprintf(os.Stderr, "⚠ resolv.conf: %v: %s\n", err2, out)
+				_ = os.Remove(tmp.Name())
+				return false
+			}
+		}
+		return true
+	}
+	if writeResolv("nameserver 8.8.8.8\nnameserver 8.8.4.4\n") {
+		fmt.Println("Updated /etc/resolv.conf → 8.8.8.8 (Tailscale DNS disabled)")
+	}
+}
+
+// fixResolvConfSplitDNS configures systemd-resolved for split DNS: public names
+// via 8.8.8.8 on the default interface, Tailscale MagicDNS names via
+// 100.100.100.100 on tailscale0. Returns true on success.
+func fixResolvConfSplitDNS(magicDNSSuffix string) bool {
+	if exec.Command("systemctl", "is-active", "--quiet", "systemd-resolved").Run() != nil {
+		return false
+	}
+	domains := "ts.net"
+	if magicDNSSuffix != "" && magicDNSSuffix != "ts.net" {
+		domains = magicDNSSuffix + " ts.net"
+	}
+	// Detect the primary public interface from the default route.
+	primaryIface := "enp1s0"
+	if out, err := exec.Command("ip", "-o", "route", "get", "1.1.1.1").Output(); err == nil {
+		for i, f := range strings.Fields(string(out)) {
+			if f == "dev" && i+1 < len(strings.Fields(string(out))) {
+				primaryIface = strings.Fields(string(out))[i+1]
+				break
+			}
+		}
+	}
+	cmds := [][]string{
+		{"resolvectl", "dns", "tailscale0", "100.100.100.100"},
+		{"resolvectl", "domain", "tailscale0", domains},
+		{"resolvectl", "dns", primaryIface, "8.8.8.8", "8.8.4.4"},
+		{"ln", "-sf", "/run/systemd/resolve/stub-resolv.conf", "/etc/resolv.conf"},
+	}
+	for _, args := range cmds {
+		c := exec.Command("sudo", args...)
+		c.Stderr = os.Stderr
+		if err := c.Run(); err != nil {
+			fmt.Fprintf(os.Stderr, "⚠ split DNS: %v: %v\n", args[0], err)
+			return false
+		}
+	}
+	// Persist via networkd-dispatcher.
+	script := fmt.Sprintf("#!/bin/sh\n# clawpatrol: split DNS for Tailscale exit-node\n"+
+		"resolvectl dns tailscale0 100.100.100.100 2>/dev/null\n"+
+		"resolvectl domain tailscale0 %s 2>/dev/null\n"+
+		"resolvectl dns %s 8.8.8.8 8.8.4.4 2>/dev/null\n", domains, primaryIface)
+	const dst = "/etc/networkd-dispatcher/routable.d/51-clawpatrol-dns"
+	tmp, err := os.CreateTemp("", "clawpatrol-dns-*")
+	if err == nil {
+		_, _ = tmp.WriteString(script)
+		_ = tmp.Close()
+		_ = exec.Command("sudo", "sh", "-c",
+			fmt.Sprintf("mv %s %s && chmod +x %s", tmp.Name(), dst, dst)).Run()
+	}
+	fmt.Printf("Configured split DNS: %s → 100.100.100.100, public → 8.8.8.8\n", domains)
+	return true
+}
+
 func defaultClawpatrolDir() string {
 	home, _ := os.UserHomeDir()
 	return filepath.Join(home, ".clawpatrol")
+}
+
+// readFileSilent reads a file and returns its contents as a string,
+// or empty on any error.
+func readFileSilent(path string) string {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	return string(b)
 }
 
 func fail(format string, a ...any) {
@@ -668,7 +865,14 @@ func wgAddressFromConf(conf string) string {
 // during the unauthenticated /ca.crt fetch.
 func onboardViaDeviceFlow(gateway string, wholeMachine bool, profile, hostname string, setup *joinSetup, skipTrust bool) (bool, error) {
 	gateway = strings.TrimRight(gateway, "/")
-	cli := &http.Client{Timeout: 30 * time.Second}
+	// CA is unverified until the admin confirms the fingerprint at approval time
+	// (TOFU). Use InsecureSkipVerify throughout the join handshake.
+	cli := &http.Client{
+		Timeout: 30 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec
+		},
+	}
 
 	hn := hostname
 	if hn == "" {
@@ -744,6 +948,7 @@ func onboardViaDeviceFlow(gateway string, wholeMachine bool, profile, hostname s
 
 	stopSpin := startSpinner("Waiting for approval")
 	authKey, loginServer, apiToken := "", "", ""
+	var tailnetGWHost, tailnetControlURL string
 	for time.Now().Before(deadline) {
 		time.Sleep(interval)
 		pr, err := cli.Post(gateway+"/api/onboard/poll?device_code="+start.DeviceCode, "application/json", nil)
@@ -757,6 +962,8 @@ func onboardViaDeviceFlow(gateway string, wholeMachine bool, profile, hostname s
 			authKey = k
 			loginServer = pv["login_server"]
 			apiToken = pv["api_token"]
+			tailnetGWHost = pv["gateway_host"]
+			tailnetControlURL = pv["control_url"]
 			break
 		}
 		if e := pv["error"]; e != "" && e != "authorization_pending" && e != "slow_down" {
@@ -879,7 +1086,7 @@ func onboardViaDeviceFlow(gateway string, wholeMachine bool, profile, hostname s
 
 	// 4b. tailscale up — set --operator on linux so future
 	// `tailscale set/serve/funnel` calls don't need sudo.
-	upArgs := []string{tscli, "up", "--authkey=" + authKey, "--accept-routes", "--accept-dns=false"}
+	upArgs := []string{tscli, "up", "--reset", "--authkey=" + authKey, "--accept-routes", "--accept-dns=false"}
 	if runtime.GOOS == "linux" {
 		if u := os.Getenv("USER"); u != "" {
 			upArgs = append(upArgs, "--operator="+u)
@@ -915,11 +1122,29 @@ func onboardViaDeviceFlow(gateway string, wholeMachine bool, profile, hostname s
 		fmt.Fprintf(os.Stderr, "⚠ onboard claim %d: %s\n", cr.StatusCode, string(body))
 		return false, nil
 	}
+	var claimResp map[string]string
+	if err := json.NewDecoder(cr.Body).Decode(&claimResp); err == nil {
+		if tok := claimResp["api_token"]; tok != "" {
+			_ = os.WriteFile(filepath.Join(filepath.Dir(setup.caPath), "api-token"),
+				[]byte(tok+"\n"), 0o600)
+		}
+	}
 	items := []string{"Joined tailnet as " + tailIP}
 	items = append(items, setupSummaryItems(*setup)...)
 	printTreeItems(items)
 	fmt.Println()
 	fmt.Println("Installed! Try: claude")
+
+	// Write mode marker files so `clawpatrol run` can detect Tailscale mode.
+	clawDir := filepath.Dir(setup.caPath)
+	_ = os.WriteFile(filepath.Join(clawDir, "mode"), []byte("tailscale\n"), 0o600)
+	if tailnetGWHost != "" {
+		_ = os.WriteFile(filepath.Join(clawDir, "tailnet-gateway"), []byte(tailnetGWHost+"\n"), 0o600)
+	}
+	if tailnetControlURL != "" {
+		_ = os.WriteFile(filepath.Join(clawDir, "control-url"), []byte(tailnetControlURL+"\n"), 0o600)
+	}
+
 	return false, nil
 }
 

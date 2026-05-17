@@ -1620,6 +1620,45 @@ func (g *Gateway) splice(c net.Conn, host string) {
 	g.emit(Event{Mode: "splice", Host: host, AgentIP: agentAddr, Action: "allow", In: in, Out: out, Ms: time.Since(start).Milliseconds()})
 }
 
+// serveTSNetDirect handles a direct (non-PROXY) TLS connection in tsnet mode.
+// These come from admins opening the dashboard, clawpatrol join, etc. We
+// terminate TLS using our CA (minting a cert for whatever SNI the client
+// sends) and then serve the dashboard HTTP mux over the decrypted connection.
+func (g *Gateway) serveTSNetDirect(c net.Conn, mux http.Handler) {
+	defer func() { _ = c.Close() }()
+	host, prefix, err := peekSNI(c)
+	conn := wrapPeek(c, prefix)
+	if err != nil {
+		// No SNI — client connected via IP literal (common during `clawpatrol join`
+		// before the CA is trusted). Fall back to the server-side IP so mint() can
+		// produce a cert with an IP SAN that Go's TLS stack will accept.
+		if local := c.LocalAddr().String(); local != "" {
+			if h, _, splitErr := net.SplitHostPort(local); splitErr == nil {
+				host = h
+			}
+		}
+		if host == "" {
+			log.Printf("tsnet-direct: sni: %v (no fallback)", err)
+			return
+		}
+	}
+	cert, err := g.certs.mint(host)
+	if err != nil {
+		log.Printf("tsnet-direct: mint %s: %v", host, err)
+		return
+	}
+	tc := tls.Server(conn, &tls.Config{
+		Certificates: []tls.Certificate{*cert},
+		NextProtos:   []string{"http/1.1"},
+	})
+	if err := tc.Handshake(); err != nil {
+		log.Printf("tsnet-direct: tls %s: %v", host, err)
+		return
+	}
+	defer func() { _ = tc.Close() }()
+	_ = http.Serve(&oneShotListener{c: tc}, mux)
+}
+
 func pipeProgress(a, b net.Conn, onTick func(rx, tx int64)) (rx, tx int64) {
 	var rxC, txC atomic.Int64
 	done := make(chan struct{}, 2)
@@ -2752,15 +2791,98 @@ func runGateway(args []string) {
 	log.Printf("gateway listening on %s, %d endpoints across %d profiles",
 		ln.Addr(), len(policy.Endpoints), len(policy.Profiles))
 
+	// In Tailscale mode, `clawpatrol run` clients prepend a HAProxy PROXY v1
+	// header carrying the original 4-tuple so we can dispatch by dst port/IP
+	// exactly like the WG promiscuous forwarder. Peek the first bytes: if the
+	// connection starts with "PROXY " use full dispatch; otherwise check
+	// SO_ORIGINAL_DST (set by iptables REDIRECT for exit-node traffic); if
+	// neither is present it is a direct admin/dashboard connection.
+	tsnetDashMux := newWebMux(g, cfg.Join(), cfg.PublicURL)
+	tsnetDashPort := portOf(cfg.InfoListen)
+	listenPort := portOf(ln.Addr().String())
+	if isTailscaleControlMode(cfg.Control) {
+		installExitNodeRedirect(listenPort, g.connIdx.Load().ConnPorts())
+	}
 	for {
 		c, err := ln.Accept()
 		if err != nil {
 			log.Printf("accept: %v", err)
 			continue
 		}
-		go g.handle(c, "")
+		go func(c net.Conn) {
+			// Capture SO_ORIGINAL_DST before any buffering (iptables REDIRECT path).
+			origIP, origPort, hasOrigDst := originalDst(c)
+
+			dstIP, dstPort, conn, err := readProxyHeader(c)
+			if err != nil {
+				_ = c.Close()
+				return
+			}
+			if dstPort == 0 {
+				// No PROXY header. Check SO_ORIGINAL_DST: if the connection was
+				// iptables-redirected (exit-node MITM), origPort != listenPort.
+				if hasOrigDst && listenPort != 0 && int(origPort) != listenPort {
+					dstIP, dstPort = origIP, origPort
+				} else {
+					// Direct connection: admin dashboard, curl, clawpatrol join, etc.
+					g.serveTSNetDirect(conn, tsnetDashMux)
+					return
+				}
+			}
+			switch {
+			case dstPort == 443:
+				g.handle(conn, dstIP)
+			case dstPort == 5432:
+				g.handlePostgresConn(conn, dstIP)
+			case dstPort == 53:
+				g.handleDNSTCPConn(conn, dstIP)
+			case g.dnsvip.IsVIP(dstIP):
+				g.handleVIPConn(conn, dstIP, dstPort)
+			case tsnetDashPort != 0 && int(dstPort) == tsnetDashPort:
+				_ = http.Serve(&oneShotListener{c: conn}, tsnetDashMux)
+			default:
+				if g.tryDirectIPConn(conn, dstIP, dstPort) {
+					return
+				}
+				g.wgRelay(conn, dstIP, int(dstPort))
+			}
+		}(c)
 	}
 }
+
+// readProxyHeader peeks at c for a HAProxy PROXY v1 line.
+// If "PROXY TCP4 srcIP dstIP srcPort dstPort\r\n" is present it is consumed
+// and the original dst IP/port returned. If absent, dstPort==0 and the conn
+// is returned with all peeked bytes still readable.
+func readProxyHeader(c net.Conn) (dstIP string, dstPort uint16, conn net.Conn, _ error) {
+	br := bufio.NewReaderSize(c, 128)
+	hdr, err := br.Peek(5)
+	bc := &bufferedConn{Reader: br, Conn: c}
+	if err != nil || string(hdr) != "PROXY" {
+		return "", 0, bc, nil
+	}
+	line, err := br.ReadString('\n')
+	if err != nil {
+		return "", 0, nil, fmt.Errorf("proxy header read: %w", err)
+	}
+	// "PROXY TCP4 srcIP dstIP srcPort dstPort\r\n"
+	fields := strings.Fields(strings.TrimRight(line, "\r\n"))
+	if len(fields) != 6 {
+		return "", 0, nil, fmt.Errorf("malformed proxy header: %q", line)
+	}
+	port, err := strconv.ParseUint(fields[5], 10, 16)
+	if err != nil {
+		return "", 0, nil, fmt.Errorf("proxy header port: %w", err)
+	}
+	return fields[3], uint16(port), bc, nil
+}
+
+type bufferedConn struct {
+	*bufio.Reader
+	net.Conn
+}
+
+func (b *bufferedConn) Read(p []byte) (int, error) { return b.Reader.Read(p) }
 
 func serveHTTPLogged(name, addr string, handler http.Handler) {
 	if err := http.ListenAndServe(addr, handler); err != nil {

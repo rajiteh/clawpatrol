@@ -171,7 +171,11 @@ func (w *webMux) mayUseTailnetInsteadOfDashboard(path string) bool {
 }
 
 func (w *webMux) skipsTailnetGate(path string) bool {
-	return w.authRequirementForPath(path) == authPublic
+	req := w.authRequirementForPath(path)
+	// authPublic needs no gate. authSelfAuthenticating routes carry their
+	// own proof (Bearer token, webhook signature) — the tailnet gate would
+	// block tag:client devices that have no Tailscale user identity.
+	return req == authPublic || req == authSelfAuthenticating
 }
 
 func newWebMux(g *Gateway, ts JoinConfig, publicURL string) http.Handler {
@@ -235,6 +239,7 @@ func (w *webMux) routes() []webRoute {
 		{Method: http.MethodPost, Path: "/api/onboard/claim", Auth: authPublic, Handler: w.apiOnboardClaim},
 		{Method: http.MethodGet, Path: "/api/env-pushdown", Auth: authSelfAuthenticating, Handler: w.apiEnvPushdown},
 		{Method: http.MethodPost, Path: "/api/peer/ephemeral", Auth: authSelfAuthenticating, Handler: w.apiEphemeralPeer},
+		{Method: http.MethodPost, Path: "/api/peer/ephemeral/tsnet", Auth: authSelfAuthenticating, Handler: w.apiEphemeralTsnetPeer},
 		{Method: http.MethodGet, Path: "/__login", Auth: authTailnetOperator, Handler: w.apiDashboardLogin},
 	}
 }
