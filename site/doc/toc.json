@@ -1,6 +1,7 @@
 [
   "introduction",
   "getting-started",
+  "configure-gateway",
   "rules",
   "clawpatrol-test",
   "plugins",
