@@ -24,8 +24,8 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strings"
 	"sync"
@@ -488,12 +488,13 @@ func newOnboarder(ts JoinConfig) Onboarder {
 
 type tailscaleOnboarder struct{ ts JoinConfig }
 
-func (t *tailscaleOnboarder) MintKey(ctx context.Context, _ string, wholeMachine bool) (string, string, string, error) {
-	// Per-process tsnet (default): ephemeral=true so each `clawpatrol run`
-	// gets a fresh node that auto-cleans on exit (matches macOS NE +
-	// WG-mode ephemeralPeer). Whole-machine: ephemeral=false so the
-	// system tailscale node persists across reboots.
-	k, err := mintTailscaleAuthKey(ctx, t.ts, !wholeMachine)
+func (t *tailscaleOnboarder) MintKey(ctx context.Context, _ string, _ bool) (string, string, string, error) {
+	// One persistent (non-ephemeral) auth key per device. The Linux
+	// daemon (cmd/clawpatrol daemon_linux.go) holds one stable tsnet identity
+	// shared across every `clawpatrol run` on the host, so the
+	// per-process ephemeral model is gone. Whole-machine joins on
+	// Linux also want a persistent node so the host survives reboots.
+	k, err := mintTailscaleAuthKey(ctx, t.ts, false)
 	return k, "", "", err
 }
 
@@ -846,6 +847,70 @@ func (w *webMux) apiOnboardClaim(rw http.ResponseWriter, r *http.Request) {
 	writeJSON(rw, resp)
 }
 
+// apiPeerTsnetRegister is the daemon's one-shot self-registration on
+// first boot after `clawpatrol join`: the api-token minted at approve
+// time is bound to a synthetic "tsnet-<host>" placeholder; the daemon
+// now has its real tailnet IP and asks the gateway to rebind the
+// token + create the real devices row. Subsequent calls (later daemon
+// boots, gateway restarts) reach the no-op branch — the token's
+// peer_ip is already the real IP, nothing to do.
+//
+// Auth: bearer api-token in the Authorization header. The path is
+// /api/peer/tsnet/register — no "ephemeral" in the name because the
+// daemon model has one persistent peer per host, not a pool of
+// short-lived ones.
+func (w *webMux) apiPeerTsnetRegister(rw http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(rw, "POST", http.StatusMethodNotAllowed)
+		return
+	}
+	token := bearerFromAuthHeader(r.Header.Get("Authorization"))
+	parentIP := peerIPForAPIToken(w.g.db, token)
+	if parentIP == "" {
+		http.Error(rw, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	tsnetIP := strings.TrimSpace(r.URL.Query().Get("ip"))
+	if tsnetIP == "" {
+		http.Error(rw, "missing ip", http.StatusBadRequest)
+		return
+	}
+	if ip, err := netip.ParseAddr(tsnetIP); err != nil || !ip.IsValid() {
+		http.Error(rw, "invalid ip", http.StatusBadRequest)
+		return
+	}
+	if w.g.onboard == nil {
+		rw.WriteHeader(http.StatusNoContent)
+		return
+	}
+	hostname := strings.TrimSpace(r.URL.Query().Get("hostname"))
+	if strings.HasPrefix(parentIP, "tsnet-") {
+		// First call — promote the synthetic placeholder to a real
+		// devices row keyed on the tailnet IP. Rebind the api-token,
+		// drop the placeholder from in-memory state, copy across the
+		// profile picked at approve time.
+		profile := w.g.onboard.ProfileForIP(parentIP)
+		_, _ = w.g.db.Exec("UPDATE peer_api_tokens SET peer_ip=? WHERE peer_ip=?", tsnetIP, parentIP)
+		w.g.onboard.ForgetIP(parentIP)
+		if w.g.agents != nil {
+			w.g.agents.Delete(parentIP)
+		}
+		if profile != "" {
+			w.g.onboard.AssignProfile(tsnetIP, profile)
+		}
+		if hostname != "" {
+			w.g.onboard.SetHostname(tsnetIP, hostname)
+		}
+		if w.g.agents != nil {
+			w.g.agents.Seed(tsnetIP)
+		}
+	}
+	// Map the daemon's IPv6 ULA too — tsnet traffic from this peer
+	// frequently arrives on fd7a:115c:a1e0::/48 rather than the 100.x.
+	w.g.seedTsnetIPv6Alias(tsnetIP)
+	rw.WriteHeader(http.StatusNoContent)
+}
+
 // apiOnboardPoll is hit by the CLI to retrieve the auth key once
 // approved. Uses standard device-flow status codes via JSON.
 func (w *webMux) apiOnboardPoll(rw http.ResponseWriter, r *http.Request) {
@@ -898,16 +963,6 @@ func (w *webMux) apiOnboardPoll(rw http.ResponseWriter, r *http.Request) {
 		resp["control_url"] = w.ts.ControlURL
 		if w.g != nil && w.g.tailscaleIP != "" {
 			resp["gateway_ip"] = w.g.tailscaleIP
-		}
-		// Tailscale Funnel owns :443 on the tsnet node, so cfg.Listen
-		// for the agent listener is usually :8443. Communicate it so
-		// `clawpatrol run` dials the right port.
-		if w.g != nil {
-			_, port, _ := net.SplitHostPort(w.g.cfg.Listen)
-			if port == "" {
-				port = "443"
-			}
-			resp["gateway_port"] = port
 		}
 		// CA cert delivered over the approved Funnel/onboard channel —
 		// the gateway's /ca.crt is intentionally not exposed publicly

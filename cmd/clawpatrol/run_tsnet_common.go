@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"tailscale.com/ipn"
 	"tailscale.com/tsnet"
 )
 
@@ -60,6 +61,28 @@ func tsnetHTTPClient(ts *tsnet.Server, caPath string) *http.Client {
 	}
 }
 
+// setGatewayExitNode points this tsnet node at the gateway as its exit
+// node. Once set, every outbound dial on s (tcp + udp) is routed via
+// the gateway, where it lands in the gateway's RegisterFallbackTCPHandler
+// / DNS UDP listener — same dispatch as whole-machine clients. The
+// gateway-side already auto-advertises 0.0.0.0/0 + ::/0 (see
+// advertiseExitRoutes), so this only needs the operator's tailnet
+// ACL to auto-approve exit-node usage for the client's tag.
+func setGatewayExitNode(s *tsnet.Server, gatewayIP netip.Addr) error {
+	if !gatewayIP.IsValid() {
+		return fmt.Errorf("setGatewayExitNode: invalid gateway IP")
+	}
+	lc, err := s.LocalClient()
+	if err != nil {
+		return err
+	}
+	_, err = lc.EditPrefs(context.Background(), &ipn.MaskedPrefs{
+		ExitNodeIPSet: true,
+		Prefs:         ipn.Prefs{ExitNodeIP: gatewayIP},
+	})
+	return err
+}
+
 // waitTsnetUp starts the tsnet.Server and blocks until the node is Running
 // and has a 100.x.x.x IP. Returns the IPv4 tailnet address.
 func waitTsnetUp(s *tsnet.Server) (netip.Addr, error) {
@@ -93,11 +116,13 @@ func waitTsnetUp(s *tsnet.Server) (netip.Addr, error) {
 	return netip.Addr{}, fmt.Errorf("no tailnet IPs assigned")
 }
 
-// registerEphemeralTsnetIP tells the gateway which 100.x.x.x tailnet IP this
-// `clawpatrol run` invocation got, so the gateway maps it to the parent
-// device's profile for credential dispatch and seeds a real device row
-// (one per machine, not per run). Called over tsnet (tailnet-only endpoint).
-func registerEphemeralTsnetIP(client *http.Client, gwURL, token, tsIP string) error {
+// registerTsnetPeer tells the gateway which 100.x.x.x tailnet IP this
+// daemon is using, so it can promote the synthetic "tsnet-<host>"
+// placeholder bound to the api-token at approve time into a real
+// devices row keyed on the tailnet IP. Idempotent: subsequent calls
+// (later daemon boots) see the token already pointing at a real IP
+// and hit the gateway's no-op branch.
+func registerTsnetPeer(client *http.Client, gwURL, token, tsIP string) error {
 	// Prefer the operator-supplied --hostname from `clawpatrol join`
 	// (persisted to <ca-dir>/hostname). Fall back to os.Hostname() for
 	// older joins that didn't write the file.
@@ -105,7 +130,7 @@ func registerEphemeralTsnetIP(client *http.Client, gwURL, token, tsIP string) er
 	if hn == "" {
 		hn, _ = os.Hostname()
 	}
-	u := gwURL + "/api/peer/ephemeral/tsnet/register?ip=" + tsIP
+	u := gwURL + "/api/peer/tsnet/register?ip=" + tsIP
 	if hn != "" {
 		u += "&hostname=" + hn
 	}

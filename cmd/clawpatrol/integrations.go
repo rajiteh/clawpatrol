@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -55,6 +56,15 @@ type pushdownEnvVar struct {
 	PluginType  string
 }
 
+// envPushdownGatewayFetcher resolves the gateway's declared
+// push-down vars. Defaults to dialing /api/env-pushdown directly
+// (works on Linux per-process tsnet, where the parent CLI hosts
+// the tsnet.Server itself via gatewayDialOverride). Platform-
+// specific run modes that have no tailnet route from the parent
+// process — macOS NE most notably — override this with a fetcher
+// that asks the network extension to make the call instead.
+var envPushdownGatewayFetcher = fetchEnvPushdownFromGateway
+
 // envPushdownVars returns every var the operator's CLI environment
 // needs: CA-bundle vars (which point at a path on the *client's*
 // disk so the client owns them) plus the gateway's declared
@@ -68,8 +78,26 @@ type pushdownEnvVar struct {
 // callers surface the error so the operator knows their agents
 // won't get the placeholder tokens.
 func envPushdownVars(caPath string) ([]pushdownEnvVar, error) {
-	var out []pushdownEnvVar
-	for _, k := range []string{
+	out := caPathPushdownVars(caPath)
+	vars, err := envPushdownGatewayFetcher(filepath.Dir(caPath))
+	if err != nil {
+		return out, err
+	}
+	return append(out, vars...), nil
+}
+
+// caPathPushdownVars returns the CA-bundle env vars every wrapped
+// agent needs (SSL_CERT_FILE, NODE_EXTRA_CA_CERTS, etc.), each
+// pointing at caPath. These are client-side — the gateway doesn't
+// know the client's filesystem layout, so they are never returned
+// by /api/env-pushdown.
+//
+// Exposed within the package so the Linux daemon-routed path
+// (`clawpatrol run` → daemon control socket) can combine these
+// with the gateway-fetched vars the daemon ships back, instead
+// of re-implementing the list.
+func caPathPushdownVars(caPath string) []pushdownEnvVar {
+	keys := []string{
 		"SSL_CERT_FILE",
 		"NODE_EXTRA_CA_CERTS",
 		"REQUESTS_CA_BUNDLE",
@@ -77,14 +105,12 @@ func envPushdownVars(caPath string) ([]pushdownEnvVar, error) {
 		"GIT_SSL_CAINFO",
 		"DENO_CERT",
 		"PIP_CERT",
-	} {
+	}
+	out := make([]pushdownEnvVar, 0, len(keys))
+	for _, k := range keys {
 		out = append(out, pushdownEnvVar{Name: k, Value: caPath})
 	}
-	vars, err := fetchEnvPushdownFromGateway(filepath.Dir(caPath))
-	if err != nil {
-		return out, err
-	}
-	return append(out, vars...), nil
+	return out
 }
 
 // gatewayDialOverride lets callers (e.g. clawpatrol run in tsnet mode)
@@ -152,6 +178,22 @@ func fetchEnvPushdownFromGateway(caDir string) ([]pushdownEnvVar, error) {
 	if resp.StatusCode != 200 {
 		return nil, fmt.Errorf("fetch %s: status %d", url, resp.StatusCode)
 	}
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", url, err)
+	}
+	vars, err := parseEnvPushdownJSON(raw)
+	if err != nil {
+		return nil, fmt.Errorf("decode %s: %w", url, err)
+	}
+	return vars, nil
+}
+
+// parseEnvPushdownJSON decodes the wire format returned by
+// /api/env-pushdown into the CLI's internal pushdownEnvVar shape.
+// Shared between the direct HTTP fetcher and the macOS variant
+// that hops through the NE's session socket.
+func parseEnvPushdownJSON(raw []byte) ([]pushdownEnvVar, error) {
 	var body struct {
 		Vars []struct {
 			Name        string `json:"name"`
@@ -160,8 +202,8 @@ func fetchEnvPushdownFromGateway(caDir string) ([]pushdownEnvVar, error) {
 			PluginType  string `json:"plugin_type"`
 		} `json:"vars"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		return nil, fmt.Errorf("decode %s: %w", url, err)
+	if err := json.Unmarshal(raw, &body); err != nil {
+		return nil, err
 	}
 	out := make([]pushdownEnvVar, 0, len(body.Vars))
 	for _, v := range body.Vars {
@@ -272,8 +314,19 @@ func applyEnvPushdown(caDir string) {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "clawpatrol: %v — agent will run without placeholder push-down\n", err)
 	}
+	applyEnvPushdownVars(vars)
+}
+
+// applyEnvPushdownVars sets env vars from an already-fetched list,
+// honoring CLAWPATROL_NO_ENV and never clobbering values the operator
+// set deliberately. Used by `clawpatrol run` which now receives the
+// vars from the daemon over its control socket instead of dialing the
+// gateway directly.
+func applyEnvPushdownVars(vars []pushdownEnvVar) {
+	if os.Getenv("CLAWPATROL_NO_ENV") == "1" {
+		return
+	}
 	for _, ev := range vars {
-		// Don't clobber values the operator already set deliberately.
 		if os.Getenv(ev.Name) != "" {
 			continue
 		}

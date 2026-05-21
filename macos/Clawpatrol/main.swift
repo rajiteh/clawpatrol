@@ -41,14 +41,14 @@ case "start":
     guard CommandLine.arguments.count >= 3 else { usage() }
     startProxy(confPath: CommandLine.arguments[2])
 case "start-tsnet":
-    // args: authKey controlURL gwHost gwPort [token hostname]
+    // args: authKey controlURL gwHost gwIP [token hostname]
     guard CommandLine.arguments.count >= 6 else { usage() }
     let token = CommandLine.arguments.count >= 7 ? CommandLine.arguments[6] : ""
     let hostname = CommandLine.arguments.count >= 8 ? CommandLine.arguments[7] : ""
     startTsnetProxy(authKey: CommandLine.arguments[2],
                     controlURL: CommandLine.arguments[3],
                     gwHost: CommandLine.arguments[4],
-                    gwPort: CommandLine.arguments[5],
+                    gwIP: CommandLine.arguments[5],
                     token: token,
                     hostname: hostname)
 case "stop": stopProxy()
@@ -182,16 +182,21 @@ func saveProxyProfileAndExit(wholeMachine: Bool, explicit: Bool) {
         let proto = NETunnelProviderProtocol()
         proto.providerBundleIdentifier = extBundleID
         proto.serverAddress = "clawpatrol-gateway"
-        // Preserve any wg-conf already saved on the existing profile.
-        var wgConf = ""
+        // Carry forward every key from the existing providerConfiguration —
+        // wg-conf for WG mode, plus tsnet-auth-key / tsnet-control-url /
+        // tsnet-gateway-host / tsnet-gateway-ip / tsnet-api-token /
+        // tsnet-hostname for tailscale mode. `install` only owns `mode`;
+        // every other key flows in from `start` / `start-tsnet` and must
+        // survive a re-run of `install` (which `clawpatrol run` issues on
+        // every invocation to make sure the sysext is loaded).
+        var cfg: [String: Any] = [:]
         if let existingProto = existing?.protocolConfiguration as? NETunnelProviderProtocol,
-           let prevConf = existingProto.providerConfiguration?["wg-conf"] as? String {
-            wgConf = prevConf
+           let existingCfg = existingProto.providerConfiguration {
+            for (k, v) in existingCfg { cfg[k] = v }
         }
-        proto.providerConfiguration = [
-            "wg-conf": wgConf,
-            "mode": resolvedMode,
-        ]
+        if cfg["wg-conf"] == nil { cfg["wg-conf"] = "" }
+        cfg["mode"] = resolvedMode
+        proto.providerConfiguration = cfg
         manager.protocolConfiguration = proto
         manager.localizedDescription = proxyProfileName
         manager.isEnabled = true
@@ -207,7 +212,8 @@ func saveProxyProfileAndExit(wholeMachine: Bool, explicit: Bool) {
             let modeChanged = (prevMode ?? "") != resolvedMode
             let running = manager.connection.status == .connected
                 || manager.connection.status == .connecting
-            if modeChanged && running && !wgConf.isEmpty {
+            let hasWGConf = !((cfg["wg-conf"] as? String) ?? "").isEmpty
+            if modeChanged && running && hasWGConf {
                 reloadTunnelAndExit(manager: manager, label: resolvedMode)
             } else {
                 exit(0)
@@ -290,7 +296,7 @@ func startProxy(confPath: String) {
     }
 }
 
-func startTsnetProxy(authKey: String, controlURL: String, gwHost: String, gwPort: String, token: String, hostname: String) {
+func startTsnetProxy(authKey: String, controlURL: String, gwHost: String, gwIP: String, token: String, hostname: String) {
     NETransparentProxyManager.loadAllFromPreferences { managers, err in
         if let err = err { fail("loadAll: \(err)") }
         let existing = managers?.first(where: { $0.localizedDescription == proxyProfileName })
@@ -320,7 +326,7 @@ func startTsnetProxy(authKey: String, controlURL: String, gwHost: String, gwPort
             "tsnet-auth-key": resolvedAuthKey,
             "tsnet-control-url": controlURL,
             "tsnet-gateway-host": gwHost,
-            "tsnet-gateway-port": gwPort,
+            "tsnet-gateway-ip": gwIP,
             "tsnet-api-token": token,
             "tsnet-hostname": hostname,
         ]

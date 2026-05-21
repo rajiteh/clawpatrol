@@ -2,32 +2,31 @@
 
 package main
 
-// `clawpatrol run` in Tailscale mode. Spins up an ephemeral tsnet.Server
-// per invocation — fresh node identity each time, auto-removed on
-// disconnect by Tailscale (ephemeral=true). Mirrors macOS NE
-// (macos/netstack/wgnetstack.go) + WG-mode ephemeralPeer flow so
-// concurrent `clawpatrol run` invocations on one machine don't fight
-// over a shared state lock.
-//
-// The auth key persisted at join is reusable + ephemeral=true, so each
-// run consumes the same key but spawns a distinct tailnet node.
+// `clawpatrol run` in Tailscale mode. The parent process is a thin
+// client to the per-host `clawpatrol daemon` (see daemon_linux.go),
+// which owns one tsnet.Server shared across every concurrent run.
 //
 // Flow:
-//  1. Read persisted reusable+ephemeral auth_key from ~/.clawpatrol/.
-//  2. tsnet.Server{Ephemeral: true, Dir: MkdirTemp(...)} joins the
-//     gateway's tailnet under a fresh hostname.
-//  3. Register the new tailnet IP with the gateway — register handler
-//     attributes traffic back to the parent device via
-//     ephemeralParentByIP so the dashboard shows ONE row per machine.
-//  4. Child in a new user+net+mnt ns creates the TUN, sends fd via
-//     SCM_RIGHTS.
-//  5. gVisor TCP forwarder dials gateway via tsnet + HAProxy PROXY v1
-//     header carrying original src/dst/ports.
-//  6. Gateway recovers original dst from the PROXY header and
-//     dispatches like WireGuard / exit-node paths.
+//  1. Connect to (or spawn) the daemon via its Unix control socket.
+//  2. Ask it to START a session — the daemon replies with its tsnet
+//     IP and the env-pushdown JSON. Both are applied locally before
+//     the child execs.
+//  3. Child in a new user+net+mnt ns creates the TUN, sends fd via
+//     SCM_RIGHTS to the parent.
+//  4. Parent forwards that TUN fd to the daemon (again via
+//     SCM_RIGHTS) on the same control conn.
+//  5. Daemon attaches the TUN to a per-session gVisor stack and TCP
+//     forwarder; replies ATTACHED.
+//  6. Parent signals the child; child brings up its tun + execs the
+//     agent. The agent's outbound traffic flows TUN → daemon's
+//     gVisor → daemon's tsnet (exit-node-routed through the gateway).
+//  7. On child exit the parent closes the control conn; the daemon
+//     tears down the session.
 
 import (
+	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -81,79 +80,43 @@ func runRunTsnet(args []string) {
 
 	checkUserNS()
 
-	dir := defaultClawpatrolDir()
-	// applyEnvPushdown moved to after tsnet join — env-pushdown is
-	// tailnet-only, can't be fetched until we're on the tailnet.
-
-	gwURL := strings.TrimSpace(readFileSilent(filepath.Join(dir, "gateway")))
-	gwHost := strings.TrimSpace(readFileSilent(filepath.Join(dir, "tailnet-gateway")))
-	controlURL := strings.TrimSpace(readFileSilent(filepath.Join(dir, "control-url")))
-	token := strings.TrimSpace(readFileSilent(filepath.Join(dir, "api-token")))
-	authKey := strings.TrimSpace(readFileSilent(filepath.Join(dir, "tsnet-auth-key")))
-	if gwHost == "" {
-		gwHost = "clawpatrol-gateway"
-	}
-	if gwURL == "" || token == "" {
-		fail("tsnet run: missing gateway url or api-token in %s", dir)
-	}
-	if authKey == "" {
-		fail("tsnet run: missing tsnet-auth-key in %s (re-run `clawpatrol join`)", dir)
-	}
-	// Gateway agent port (where the MITM listener lives). Tsnet Funnel
-	// owns :443, so the listener is typically :8443. Persisted at join.
-	gwPort := strings.TrimSpace(readFileSilent(filepath.Join(dir, "gateway-port")))
-	if gwPort == "" {
-		gwPort = "443"
-	}
-
-	// 2. Spin up an ephemeral tsnet.Server per invocation. tmpdir state
-	// + Ephemeral:true means each run is a fresh tailnet node, freed
-	// automatically when this process exits. Concurrent runs on the same
-	// host don't collide on tsnet's exclusive state lock.
-	stateDir, err := os.MkdirTemp("", "clawpatrol-tsnet-*")
+	// 1. Open a control conn to the per-host daemon, spawning one if
+	// none is alive. Hello handshake happens inside daemonConnect.
+	ctrl, err := daemonConnect()
 	if err != nil {
-		fail("tsnet state dir: %v", err)
+		fail("daemon connect: %v", err)
 	}
-	defer func() { _ = os.RemoveAll(stateDir) }()
-	hn := fmt.Sprintf("clawpatrol-run-%d", os.Getpid())
-	tsServer := &tsnet.Server{
-		Hostname:   hn,
-		AuthKey:    authKey,
-		ControlURL: controlURL,
-		Dir:        stateDir,
-		Ephemeral:  true,
-		Logf:       func(string, ...any) {},
-	}
-	defer func() { _ = tsServer.Close() }()
+	defer func() { _ = ctrl.Close() }()
 
-	// Wait for tsnet Running — get our 100.x.x.x address.
-	fmt.Fprintln(os.Stderr, "clawpatrol: joining tailnet...")
-	tsIP, err := waitTsnetUp(tsServer)
+	// 2. Ask for a session. Daemon replies with its tsnet IP, the
+	// cached env-pushdown JSON, and (when applicable) a one-line
+	// boot warning the smoke-probe generated — surface that on
+	// stderr so operators see the message without tailing the
+	// daemon log.
+	br, tsIP, envVars, daemonWarn, err := daemonClientStartSession(ctrl)
 	if err != nil {
-		fail("tsnet join: %v", err)
+		fail("daemon START: %v", err)
+	}
+	if daemonWarn != "" {
+		fmt.Fprintf(os.Stderr, "clawpatrol: daemon: %s\n", daemonWarn)
 	}
 	_ = os.Setenv("CLAWPATROL_TS_ADDR", tsIP.String())
 
-	// Peer-API calls (register, env-pushdown) are tailnet-only — dial via
-	// tsnet so requests reach the gateway's 100.x address from the parent
-	// process (which is on host network, not tailnet).
-	tailnetAPI := strings.TrimSpace(readFileSilent(filepath.Join(dir, "tailnet-url")))
-	if tailnetAPI == "" {
-		tailnetAPI = gwURL
-	}
-	tsClient := tsnetHTTPClient(tsServer, filepath.Join(dir, "ca.crt"))
-	gatewayDialOverride = tsServer.Dial
+	// envVars from the daemon are only the gateway-fetched
+	// push-down vars — the daemon doesn't know the client's
+	// filesystem layout, so the CA-bundle vars (SSL_CERT_FILE,
+	// NODE_EXTRA_CA_CERTS, REQUESTS_CA_BUNDLE, CURL_CA_BUNDLE,
+	// GIT_SSL_CAINFO, DENO_CERT, PIP_CERT) have to be added here.
+	// Without these, the wrapped agent's HTTPS client (python
+	// requests, node fetch, etc.) skips our MITM CA, sees the
+	// gateway's mint as untrusted, and either fails the handshake
+	// or falls back to its own bundle (which doesn't have our CA).
+	caPath := filepath.Join(defaultClawpatrolDir(), "ca.crt")
+	allVars := append(caPathPushdownVars(caPath), envVars...)
+	applyEnvPushdownVars(allVars)
 
-	// Register ephemeral tsnet IP with gateway so profile dispatch uses
-	// the right credentials (same as ephemeral WG peer registration).
-	if rerr := registerEphemeralTsnetIP(tsClient, tailnetAPI, token, tsIP.String()); rerr != nil {
-		fmt.Fprintf(os.Stderr, "warning: tsnet profile registration: %v (will use default profile)\n", rerr)
-	}
-
-	// Fetch env-pushdown now that we're on the tailnet.
-	applyEnvPushdown(dir)
-
-	// 3. IPC channels: TUN fd handoff + wg-up pipe (same plumbing as WG mode).
+	// 3. IPC channels for the child: TUN fd handoff + wg-up pipe
+	// (same plumbing as WG mode).
 	sp, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
 	if err != nil {
 		fail("socketpair: %v", err)
@@ -212,21 +175,29 @@ func runRunTsnet(args []string) {
 		_ = child.Process.Kill()
 		fail("recv tun fd: %v", err)
 	}
-	tunFile := os.NewFile(uintptr(tunFd), tunIfName)
 
-	// 6. Build gVisor stack on the TUN fd.
-	gvStack, gvEp, err := newTsnetRunStack(tsIP)
-	if err != nil {
+	// 6. Hand the TUN fd off to the daemon over the control conn via
+	// WriteMsgUnix. Going through .File() + unix.Sendmsg would dup
+	// the fd, and on Linux that clears O_NONBLOCK on the underlying
+	// file description (shared across dups) — leaving the conn in
+	// blocking mode and stranding the runtime poller on the next
+	// read. WriteMsgUnix handles SCM_RIGHTS natively, no dup.
+	uc, ok := ctrl.(*net.UnixConn)
+	if !ok {
 		_ = child.Process.Kill()
-		fail("gvisor stack: %v", err)
+		fail("control conn: unexpected type %T", ctrl)
 	}
-	defer gvStack.Close()
-	startTunBridge(tunFile, gvEp, tsServer)
+	if err := sendFDUnixConn(uc, tunFd); err != nil {
+		_ = child.Process.Kill()
+		fail("send tun fd to daemon: %v", err)
+	}
+	_ = unix.Close(tunFd)
 
-	// 7. TCP forwarder: every connection → tsnet → gateway.
-	// We forward to gwHost:originalPort so the gateway can route by port
-	// (port 443 → HTTPS MITM; other ports forwarded if gateway listens).
-	enableTsnetTCPForwarder(gvStack, tsServer, gwHost, gwPort)
+	// 7. Wait for ATTACHED.
+	if err := daemonClientWaitAttached(ctrl, br); err != nil {
+		_ = child.Process.Kill()
+		fail("daemon ATTACHED: %v", err)
+	}
 
 	// 8. Signal child: bridge is up.
 	_, _ = wgUpW.Write([]byte{1})
@@ -265,6 +236,9 @@ func runRunTsnet(args []string) {
 		_, _ = relaySup.Process.Wait()
 	}
 
+	// Closing ctrl (via the deferred Close) tears the session down on
+	// the daemon side.
+
 	if waitErr != nil {
 		var ee *exec.ExitError
 		if errors.As(waitErr, &ee) {
@@ -272,6 +246,93 @@ func runRunTsnet(args []string) {
 		}
 		fail("wait: %v", waitErr)
 	}
+}
+
+// daemonClientStartSession sends "START\n" on ctrl and parses the
+// daemon's reply: TSIP line, ENV length + JSON body, WARN length +
+// optional text. The single bufio.Reader is returned to the caller
+// so subsequent reads (e.g. ATTACHED) share the same buffer — using
+// a fresh bufio.Reader for later reads would lose any bytes that
+// got pulled into this one's buffer during the WARN read.
+func daemonClientStartSession(ctrl net.Conn) (*bufio.Reader, netip.Addr, []pushdownEnvVar, string, error) {
+	if _, err := io.WriteString(ctrl, "START\n"); err != nil {
+		return nil, netip.Addr{}, nil, "", err
+	}
+	br := bufio.NewReader(ctrl)
+	tsipLine, err := br.ReadString('\n')
+	if err != nil {
+		return nil, netip.Addr{}, nil, "", fmt.Errorf("read TSIP: %w", err)
+	}
+	tsipLine = strings.TrimRight(tsipLine, "\r\n")
+	if !strings.HasPrefix(tsipLine, "TSIP ") {
+		return nil, netip.Addr{}, nil, "", fmt.Errorf("expected TSIP, got %q", tsipLine)
+	}
+	tsIP, err := netip.ParseAddr(strings.TrimSpace(tsipLine[len("TSIP "):]))
+	if err != nil {
+		return nil, netip.Addr{}, nil, "", fmt.Errorf("parse TSIP: %w", err)
+	}
+	envLen, err := readLenPrefixed(br, "ENV", 1<<20)
+	if err != nil {
+		return nil, netip.Addr{}, nil, "", err
+	}
+	envBody := make([]byte, envLen)
+	if _, err := io.ReadFull(br, envBody); err != nil {
+		return nil, netip.Addr{}, nil, "", fmt.Errorf("read ENV body: %w", err)
+	}
+	var vars []pushdownEnvVar
+	if envLen > 0 {
+		if err := json.Unmarshal(envBody, &vars); err != nil {
+			return nil, netip.Addr{}, nil, "", fmt.Errorf("decode ENV body: %w", err)
+		}
+	}
+	warnLen, err := readLenPrefixed(br, "WARN", 4096)
+	if err != nil {
+		return nil, netip.Addr{}, nil, "", err
+	}
+	var warning string
+	if warnLen > 0 {
+		buf := make([]byte, warnLen)
+		if _, err := io.ReadFull(br, buf); err != nil {
+			return nil, netip.Addr{}, nil, "", fmt.Errorf("read WARN body: %w", err)
+		}
+		warning = string(buf)
+	}
+	return br, tsIP, vars, warning, nil
+}
+
+// readLenPrefixed reads a "<tag> <n>\n" line and returns n. Errors
+// when the tag doesn't match or n is outside [0, maxLen].
+func readLenPrefixed(br *bufio.Reader, tag string, maxLen int) (int, error) {
+	line, err := br.ReadString('\n')
+	if err != nil {
+		return 0, fmt.Errorf("read %s: %w", tag, err)
+	}
+	line = strings.TrimRight(line, "\r\n")
+	prefix := tag + " "
+	if !strings.HasPrefix(line, prefix) {
+		return 0, fmt.Errorf("expected %s, got %q", tag, line)
+	}
+	var n int
+	if _, err := fmt.Sscanf(line[len(prefix):], "%d", &n); err != nil {
+		return 0, fmt.Errorf("parse %s length: %w", tag, err)
+	}
+	if n < 0 || n > maxLen {
+		return 0, fmt.Errorf("%s length %d out of range", tag, n)
+	}
+	return n, nil
+}
+
+func daemonClientWaitAttached(ctrl net.Conn, br *bufio.Reader) error {
+	_ = ctrl.SetReadDeadline(time.Now().Add(5 * time.Second))
+	defer func() { _ = ctrl.SetReadDeadline(time.Time{}) }()
+	line, err := br.ReadString('\n')
+	if err != nil {
+		return err
+	}
+	if strings.TrimRight(line, "\r\n") != "ATTACHED" {
+		return fmt.Errorf("expected ATTACHED, got %q", line)
+	}
+	return nil
 }
 
 // runRunTsnetChild runs inside the new user+net+mnt namespace.
@@ -324,30 +385,12 @@ func runRunTsnetChild() {
 		_ = bindResolv("nameserver 1.1.1.1\nnameserver 8.8.8.8\n")
 	}
 
-	// Mask ~/.clawpatrol/ from the agent's view. The dir holds two
-	// parent-only bearer secrets — tsnet-auth-key (lets any process
-	// join the tailnet under tag:client) and api-token (gates the
-	// gateway peer API). The agent never needs either: parent already
-	// fetched env-pushdown and registered the ephemeral peer before
-	// fork. Only ca.crt is required downstream (NODE_EXTRA_CA_CERTS /
-	// REQUESTS_CA_BUNDLE / SSL_CERT_FILE all point at it), so we
-	// re-create it inside an empty tmpfs that overlays the real dir
-	// for this mnt ns only — the parent's view is untouched.
-	//
-	// Effect: an agent inside `clawpatrol run` can read its own env
-	// vars and ca.crt but cannot exfiltrate the tsnet auth key to
-	// another machine. The host-side bearer is bound to "code running
-	// on this physical machine," not "anyone who copies the file."
-	clawDir := defaultClawpatrolDir()
-	caBytes, _ := os.ReadFile(filepath.Join(clawDir, "ca.crt"))
-	if err := unix.Mount("tmpfs", clawDir, "tmpfs", 0, "mode=0755"); err != nil {
-		fail("mask clawpatrol dir: %v", err)
-	}
-	if len(caBytes) > 0 {
-		if err := os.WriteFile(filepath.Join(clawDir, "ca.crt"), caBytes, 0o644); err != nil {
-			fail("rewrite ca.crt in masked dir: %v", err)
-		}
-	}
+	// The agent runs as the same uid as the parent and can therefore
+	// read anything the parent can; the daemon owns the tsnet auth
+	// key (stored under $XDG_STATE_HOME/clawpatrol/) and never hands
+	// it back. PR_SET_DUMPABLE in the parent still closes the
+	// ptrace_scope=0 /proc memory bypass; nothing else is hidden from
+	// the agent at this layer.
 
 	autoExpose := os.Getenv(runNoAutoExposeEnv) != "1"
 	if autoExpose {
@@ -594,26 +637,15 @@ func ipv4Checksum(b []byte) uint16 {
 }
 
 // enableTsnetTCPForwarder installs a promiscuous TCP forwarder on s.
-// Every connection dials the gateway via tsnet and prepends a HAProxy
-// PROXY v1 header carrying the original 4-tuple. The gateway recovers
-// the original dst from the PROXY header and dispatches via the same
-// path as WireGuard and whole-machine exit-node clients.
-//
-// Why PROXY (vs. relying on tsnet exit-node routing): using the gateway
-// as a tsnet exit node would work but requires the operator to enable
-// the gateway's advertised exit-route in the Tailscale admin console
-// for every client tag — extra config we don't want to require.
-// Peer-to-peer dial + PROXY header keeps the setup self-contained.
-func enableTsnetTCPForwarder(s *stack.Stack, ts *tsnet.Server, gwHost, gwPort string) {
-	gwAddr := net.JoinHostPort(gwHost, gwPort)
+// Every connection dials the original destination via tsnet. The
+// tsnet node has been configured with ExitNodeIP=<gateway> upstream,
+// so this dial transparently routes through the gateway, where it
+// lands in RegisterFallbackTCPHandler with the original dst intact.
+func enableTsnetTCPForwarder(s *stack.Stack, ts *tsnet.Server) {
 	fwd := tcp.NewForwarder(s, 1<<20, 16384, func(req *tcp.ForwarderRequest) {
 		id := req.ID()
-		// Format IPs via .String() — tcpip.Address used with %s prints
-		// the raw bytes (binary garbage), making the PROXY header
-		// unparseable. String() returns dotted-decimal for IPv4.
-		proxyHdr := fmt.Sprintf("PROXY TCP4 %s %s %d %d\r\n",
-			id.RemoteAddress.String(), id.LocalAddress.String(),
-			id.RemotePort, id.LocalPort)
+		dstAddr := net.JoinHostPort(id.LocalAddress.String(),
+			fmt.Sprintf("%d", id.LocalPort))
 
 		var wq waiter.Queue
 		ep, err := req.CreateEndpoint(&wq)
@@ -626,14 +658,11 @@ func enableTsnetTCPForwarder(s *stack.Stack, ts *tsnet.Server, gwHost, gwPort st
 		go func() {
 			defer func() { _ = local.Close() }()
 			ctx := context.Background()
-			remote, err := ts.Dial(ctx, "tcp", gwAddr)
+			remote, err := ts.Dial(ctx, "tcp", dstAddr)
 			if err != nil {
 				return
 			}
 			defer func() { _ = remote.Close() }()
-			if _, err := io.WriteString(remote, proxyHdr); err != nil {
-				return
-			}
 			tsnetBiRelay(local, remote)
 		}()
 	})
