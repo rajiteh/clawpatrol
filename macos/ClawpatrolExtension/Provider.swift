@@ -37,6 +37,16 @@ private let parentBundleID = "dev.clawpatrol.app"
 class TransparentProxyProvider: NETransparentProxyProvider {
     private var wholeMachine = false
     private var tsnetMode = false
+    // Cached tsnet gateway IP. UDP/53 datagrams the child app would
+    // otherwise send straight to 1.1.1.1 / 8.8.8.8 / any public
+    // resolver get rewritten to <gateway>:53, which IS handled by the
+    // gateway's serveTsnetDNSUDP listener. Without the rewrite the
+    // packet rides the tsnet exit-node path → gateway has no UDP
+    // fallback handler → silent black hole → c-ares / Node DNS hang
+    // until their client-side timeout. Apps using mDNSResponder
+    // (curl 8 system, getaddrinfo) bypass NE entirely and aren't
+    // affected; apps with their own UDP/53 resolver are.
+    private var tsnetGatewayIP = ""
 
     override func startProxy(options: [String: Any]?,
                              completionHandler: @escaping (Error?) -> Void) {
@@ -62,7 +72,14 @@ class TransparentProxyProvider: NETransparentProxyProvider {
             }
             let token = (cfg["tsnet-api-token"] as? String) ?? ""
             let hostname = (cfg["tsnet-hostname"] as? String) ?? ""
-            os_log("startProxy: tsnet mode — joining tailnet", log: log, type: .info)
+            // Per-extension Application Support container is sandbox-
+            // writable and persists across NE restarts — exactly what
+            // tsnet needs to reuse its machine + node keys instead of
+            // re-registering on every startProxy. Without persistence
+            // each restart re-consumes the single-use auth key minted
+            // by the gateway (#519) and tsnet.Server.Up hangs 90s.
+            let stateDir = tsnetStateDir()
+            os_log("startProxy: tsnet mode — joining tailnet (state=%{public}@)", log: log, type: .info, stateDir)
             DispatchQueue.global(qos: .userInitiated).async {
                 var errBuf = [CChar](repeating: 0, count: 512)
                 let rc = authKey.withCString { akC in
@@ -71,14 +88,17 @@ class TransparentProxyProvider: NETransparentProxyProvider {
                             gwIP.withCString { gipC in
                                 token.withCString { tkC in
                                     hostname.withCString { hnC in
-                                        errBuf.withUnsafeMutableBufferPointer { ebuf in
-                                            ts_netstack_init(UnsafeMutablePointer(mutating: akC),
-                                                             UnsafeMutablePointer(mutating: cuC),
-                                                             UnsafeMutablePointer(mutating: ghC),
-                                                             UnsafeMutablePointer(mutating: gipC),
-                                                             UnsafeMutablePointer(mutating: tkC),
-                                                             UnsafeMutablePointer(mutating: hnC),
-                                                             ebuf.baseAddress, Int32(ebuf.count))
+                                        stateDir.withCString { sdC in
+                                            errBuf.withUnsafeMutableBufferPointer { ebuf in
+                                                ts_netstack_init(UnsafeMutablePointer(mutating: akC),
+                                                                 UnsafeMutablePointer(mutating: cuC),
+                                                                 UnsafeMutablePointer(mutating: ghC),
+                                                                 UnsafeMutablePointer(mutating: gipC),
+                                                                 UnsafeMutablePointer(mutating: tkC),
+                                                                 UnsafeMutablePointer(mutating: hnC),
+                                                                 UnsafeMutablePointer(mutating: sdC),
+                                                                 ebuf.baseAddress, Int32(ebuf.count))
+                                            }
                                         }
                                     }
                                 }
@@ -95,6 +115,7 @@ class TransparentProxyProvider: NETransparentProxyProvider {
                         return
                     }
                     setTsnetIPCConfig(gwHost: gwHost, token: token)
+                    self.tsnetGatewayIP = gwIP
                     startSessionListener()
                     startSessionReaper()
                     self.applyNetworkSettings(completionHandler: completionHandler)
@@ -414,7 +435,17 @@ class TransparentProxyProvider: NETransparentProxyProvider {
             for (data, ep) in zip(datagrams!, endpoints ?? []) {
                 guard let host = ep as? NWHostEndpoint,
                       let port = Int32(host.port),
-                      let ip = self.resolveIPv4(host.hostname) else { continue }
+                      let resolved = self.resolveIPv4(host.hostname) else { continue }
+                // DNS rewrite: tsnet mode has no UDP exit-node handler
+                // on the gateway side, so a UDP/53 packet aimed at a
+                // public resolver (1.1.1.1, 8.8.8.8, …) gets swallowed.
+                // Redirect to the gateway's tsnet IP, where
+                // serveTsnetDNSUDP both allocates VIPs for intercepted
+                // hostnames and relays everything else upstream.
+                var ip = resolved
+                if self.tsnetMode && port == 53 && !self.tsnetGatewayIP.isEmpty {
+                    ip = self.tsnetGatewayIP
+                }
                 var errBuf = [CChar](repeating: 0, count: 256)
                 let cid = ip.withCString { hostC in
                     errBuf.withUnsafeMutableBufferPointer { ebuf in
@@ -507,6 +538,49 @@ private func pidFromAuditToken(_ data: Data) -> pid_t? {
 // clawpatrol PID just means the ext might tunnel that PID's flows,
 // a local authz concern only the host's user controls anyway.
 let sessionSockPath = "/tmp/clawpatrol.sock"
+
+// tsnetStateDir is the persistent dir tsnet.Server uses for its
+// machine + node keys + DERP cache. NE's per-extension Application
+// Support container survives reinstalls of the .app and is
+// sandbox-writable; sticking to a stable path keeps the same
+// tsnet identity across NE restarts so the single-use gateway
+// auth key only gets consumed on the very first init. Mirrors
+// the Linux daemon's $XDG_STATE_HOME/clawpatrol/tsnet layout.
+func tsnetStateDir() -> String {
+    let fm = FileManager.default
+    // 0o700: tsnet writes machine + node keys here in plaintext.
+    // Default createDirectory permissions on macOS leave the path
+    // world-readable, which would let any local user copy the
+    // identity and impersonate this Mac on the tailnet.
+    let restrictedAttrs: [FileAttributeKey: Any] = [.posixPermissions: 0o700]
+    if let base = try? fm.url(for: .applicationSupportDirectory,
+                              in: .userDomainMask,
+                              appropriateFor: nil,
+                              create: true) {
+        let dir = base.appendingPathComponent("clawpatrol/tsnet", isDirectory: true)
+        try? fm.createDirectory(at: dir,
+                                withIntermediateDirectories: true,
+                                attributes: restrictedAttrs)
+        // Tighten in case the directory pre-existed (created
+        // earlier with default perms) — setAttributes always
+        // applies regardless of whether createDirectory was a no-op.
+        try? fm.setAttributes(restrictedAttrs, ofItemAtPath: dir.path)
+        // Also tighten the intermediate <appsupport>/clawpatrol so
+        // a future sibling tsnet/ peer can't be created world-readable.
+        let parent = dir.deletingLastPathComponent().path
+        try? fm.setAttributes(restrictedAttrs, ofItemAtPath: parent)
+        return dir.path
+    }
+    // Fall back to /var/root/clawpatrol-tsnet-ne. NE runs as root
+    // so /var/root is writable; /tmp would be world-writable (symlink
+    // attack window). Lost across reboots but safer.
+    let fallback = "/var/root/clawpatrol-tsnet-ne"
+    try? fm.createDirectory(atPath: fallback,
+                            withIntermediateDirectories: true,
+                            attributes: restrictedAttrs)
+    try? fm.setAttributes(restrictedAttrs, ofItemAtPath: fallback)
+    return fallback
+}
 
 // tsnet-mode gateway hostname + per-peer api token. Mirror of the
 // providerConfiguration values, captured at startProxy time so the
