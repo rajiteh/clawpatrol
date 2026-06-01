@@ -2699,6 +2699,8 @@ func (r *HITLRegistry) DecideWithResult(id string, d runtime.HITLDecision) runti
 		r.mu.Unlock()
 		return result
 	}
+	refs := append([]string(nil), e.messageRefs...)
+	pend := e.p
 	e.decision <- d
 	delete(r.pending, id)
 	r.terminal[id] = terminalHITLEntry{
@@ -2706,7 +2708,9 @@ func (r *HITLRegistry) DecideWithResult(id string, d runtime.HITLDecision) runti
 		expiresAt: now.Add(hitlTerminalTTL),
 	}
 	r.mu.Unlock()
-	return runtime.HITLResolveResult{OK: true, State: state, Reason: reason}
+	result := runtime.HITLResolveResult{OK: true, State: state, Reason: reason}
+	r.updateRecordedMessageRefs(context.Background(), pend, refs, result)
+	return result
 }
 
 func staleHITLResolveResult(result runtime.HITLResolveResult) runtime.HITLResolveResult {
