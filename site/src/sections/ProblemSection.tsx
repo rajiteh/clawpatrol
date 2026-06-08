@@ -123,11 +123,16 @@ export function ProblemSection() {
               You can’t see <span class="text-rust">what happened</span>
             </ProblemHeading>
             <ProblemBody>
-              An agent’s work fans out across multiple services. Reconstructing
-              what actually happened means stitching together logs from each
-              one.
+              Reconstructing what actually happened means stitching together
+              logs from multiple services.
             </ProblemBody>
           </Problem>
+        </div>
+        <SectionLabel class="mt-32 ml-0">The solution</SectionLabel>
+        <div className="text-5xl font-display mb-16 text-balance leading-[1.1]">
+          <span className="text-rust">Claw Patrol</span> is an agent proxy that
+          intercepts all traffic, evaluates actions against custom rules,
+          safeguards credentials, and logs everything that happens.
         </div>
       </div>
     </section>
