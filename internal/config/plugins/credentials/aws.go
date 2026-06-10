@@ -1,24 +1,37 @@
 package credentials
 
 // aws_credential: static AWS API credentials (access key + secret +
-// optional session token) used to mint an EKS-style bearer token for
-// the kubernetes endpoint. At inject time the gateway calls STS
-// GetCallerIdentity via aws-sdk-go-v2's presigner with the
-// `x-k8s-aws-id` header carrying the cluster name; the presigned URL
-// is base64url-encoded as `k8s-aws-v1.<url>` and stamped as the
-// upstream Authorization. The agent never sees real credentials.
+// optional session token). Two jobs:
 //
-// Only the kubernetes endpoint consumes this credential today. Generic
-// SigV4-signed API calls (DynamoDB, S3, etc.) are out of scope.
+//  1. EKS bearer: when bound to a kubernetes endpoint the gateway calls
+//     STS GetCallerIdentity via aws-sdk-go-v2's presigner with the
+//     `x-k8s-aws-id` header carrying the cluster name; the presigned URL
+//     is base64url-encoded as `k8s-aws-v1.<url>` and stamped as the
+//     upstream Authorization.
+//
+//  2. SigV4 re-signing: when bound to a plain `("https" "aws")` endpoint
+//     the agent's aws-cli signs the request with injected placeholder
+//     creds (see EnvVars); the gateway strips that signature and re-signs
+//     with the operator's real stored creds (see reSignProxiedRequest).
+//
+// Either way the agent never sees real credentials.
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
+	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	awscreds "github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
 	smithymiddleware "github.com/aws/smithy-go/middleware"
@@ -28,6 +41,16 @@ import (
 	"github.com/denoland/clawpatrol/internal/config"
 	"github.com/denoland/clawpatrol/internal/config/runtime"
 )
+
+// emptyPayloadHash is the SHA-256 of the empty string — the SigV4
+// payload hash for a request with no body.
+const emptyPayloadHash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+// unsignedPayload is the SigV4 sentinel that omits the body from the
+// canonical request's payload hash. S3 emits it as a literal
+// X-Amz-Content-Sha256 header for streaming / chunked uploads; we also
+// fall back to it for non-S3 bodies too large to buffer for hashing.
+const unsignedPayload = "UNSIGNED-PAYLOAD"
 
 // AWSCredential is part of the clawpatrol plugin API.
 //
@@ -49,7 +72,10 @@ type awsEKSParams interface {
 func (c *AWSCredential) SignHTTPRequest(ctx context.Context, req *http.Request, sec runtime.Secret, endpoint any) error {
 	params, ok := endpoint.(awsEKSParams)
 	if !ok {
-		return errors.New("aws_credential: endpoint does not declare EKS auth params (use `endpoint \"kubernetes\"` with cluster_name + region)")
+		// Non-EKS endpoint (a plain `("https" "aws")` upstream): the
+		// agent already produced a SigV4 signature with placeholder
+		// creds — replace it with one minted from the real stored creds.
+		return c.reSignProxiedRequest(ctx, req, sec)
 	}
 	cluster, region := params.AWSEKSAuthParams()
 	if cluster == "" || region == "" {
@@ -76,6 +102,146 @@ func (*AWSCredential) MintEKSBearer(ctx context.Context, sec runtime.Secret, reg
 		return "", err
 	}
 	return mintEKSBearerToken(ctx, akid, secret, token, region, cluster)
+}
+
+// reSignProxiedRequest replaces the agent's placeholder-cred SigV4
+// signature with one minted from the operator's real stored creds. The
+// agent's aws-cli already canonicalized the request (host, x-amz-date,
+// x-amz-content-sha256, …); we strip its auth headers and re-sign in
+// place so the upstream sees a request signed by real credentials.
+func (c *AWSCredential) reSignProxiedRequest(ctx context.Context, req *http.Request, sec runtime.Secret) error {
+	akid, secret, token, err := awsCredentialMaterial(sec)
+	if err != nil {
+		return err
+	}
+
+	service, region := awsServiceRegion(req.Header.Get("Authorization"), req.URL.Host)
+	if service == "" || region == "" {
+		return fmt.Errorf("aws_credential: cannot derive service/region for %q (no SigV4 credential scope and unrecognized host)", req.URL.Host)
+	}
+
+	// Determine the SigV4 payload hash the agent signed over.
+	//
+	// botocore only puts X-Amz-Content-Sha256 on the wire for S3
+	// (S3SigV4Auth); every other service still signs over SHA256(body)
+	// in its canonical request but sends no such header. So:
+	//   header present → reuse it verbatim. It's the value the client
+	//     signed over and may be one we cannot recompute from the body
+	//     (S3 UNSIGNED-PAYLOAD, a streaming-chunked literal, …).
+	//   header absent  → the client signed over SHA256(body); recompute
+	//     it from the actual body so the canonical requests agree. The
+	//     old empty-string fallback broke every non-S3 service with a
+	//     body (STS, IAM, DynamoDB, …) with SignatureDoesNotMatch.
+	payloadHash := req.Header.Get("X-Amz-Content-Sha256")
+	if payloadHash == "" {
+		payloadHash, err = hashRequestBody(req)
+		if err != nil {
+			return fmt.Errorf("aws_credential: hash %s request body: %w", service, err)
+		}
+	}
+
+	// Drop the agent's placeholder signature + any session token it
+	// carried; SignHTTP re-stamps Authorization (and X-Amz-Security-Token
+	// when our creds are STS-issued).
+	req.Header.Del("Authorization")
+	req.Header.Del("X-Amz-Security-Token")
+
+	creds := aws.Credentials{AccessKeyID: akid, SecretAccessKey: secret, SessionToken: token}
+	if err := v4.NewSigner().SignHTTP(ctx, creds, req, payloadHash, service, region, time.Now()); err != nil {
+		return fmt.Errorf("aws_credential: re-sign %s request: %w", service, err)
+	}
+	return nil
+}
+
+// hashRequestBody computes the SigV4 payload hash over req.Body — what
+// botocore's base SigV4Auth signs over for non-S3 services — and
+// restores the body so the upstream send is unchanged. A nil/empty body
+// hashes to SHA256(""). Bodies over the buffer cap return
+// UNSIGNED-PAYLOAD rather than buffering unbounded memory; the gateway
+// terminates TLS, so transport integrity still covers the streamed body.
+func hashRequestBody(req *http.Request) (string, error) {
+	if req.Body == nil || req.Body == http.NoBody {
+		return emptyPayloadHash, nil
+	}
+	// The gateway already buffers POST/PUT/PATCH bodies up to this cap
+	// for the rules engine before we sign, so for the path that needs a
+	// recomputed hash (non-S3 bodies) the bytes are typically in memory
+	// already — reading here is cheap.
+	const limit = config.DefaultBodyBufferLimit
+	orig := req.Body
+	buf, err := io.ReadAll(io.LimitReader(orig, limit+1))
+	if err != nil {
+		return "", err
+	}
+	if int64(len(buf)) > limit {
+		// Over the cap: don't buffer the rest. Stitch the bytes we
+		// peeked back ahead of the untouched remainder and sign
+		// UNSIGNED-PAYLOAD.
+		req.Body = struct {
+			io.Reader
+			io.Closer
+		}{io.MultiReader(bytes.NewReader(buf), orig), orig}
+		return unsignedPayload, nil
+	}
+	sum := sha256.Sum256(buf)
+	req.Body = io.NopCloser(bytes.NewReader(buf))
+	req.ContentLength = int64(len(buf))
+	return hex.EncodeToString(sum[:]), nil
+}
+
+// awsServiceRegion derives the SigV4 service + region for re-signing. It
+// prefers the credential scope the agent baked into the incoming
+// Authorization header (Credential=AKID/<date>/<region>/<service>/aws4_request)
+// — exactly what aws-cli computed for this request — and falls back to
+// the upstream hostname when that header is absent or unparseable.
+func awsServiceRegion(authHeader, host string) (service, region string) {
+	if svc, reg := parseSigV4CredentialScope(authHeader); svc != "" && reg != "" {
+		return svc, reg
+	}
+	return serviceRegionFromHost(host)
+}
+
+// parseSigV4CredentialScope pulls service + region out of a SigV4
+// Authorization header's `Credential=` element. Returns empty strings
+// when the header is missing or doesn't match the expected shape.
+func parseSigV4CredentialScope(authHeader string) (service, region string) {
+	const marker = "Credential="
+	i := strings.Index(authHeader, marker)
+	if i < 0 {
+		return "", ""
+	}
+	scope := authHeader[i+len(marker):]
+	// The scope ends at the first comma or space (SignedHeaders follows).
+	if j := strings.IndexAny(scope, ", "); j >= 0 {
+		scope = scope[:j]
+	}
+	// AKID / date / region / service / aws4_request
+	parts := strings.Split(scope, "/")
+	if len(parts) != 5 || parts[4] != "aws4_request" {
+		return "", ""
+	}
+	return parts[3], parts[2]
+}
+
+// serviceRegionFromHost recovers service + region from a standard AWS
+// endpoint hostname: `service.region.amazonaws.com`, or
+// `service.amazonaws.com` for global endpoints (iam, sts, …) which AWS
+// treats as us-east-1.
+func serviceRegionFromHost(host string) (service, region string) {
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	host = strings.TrimSuffix(host, ".amazonaws.com")
+	if host == "" {
+		return "", ""
+	}
+	labels := strings.Split(host, ".")
+	service = labels[0]
+	if len(labels) >= 2 {
+		region = labels[len(labels)-1]
+		return service, region
+	}
+	return service, "us-east-1"
 }
 
 // awsCredentialMaterial reads the three secret slots. access_key_id
@@ -159,9 +325,26 @@ func (*AWSCredential) SecretSlots() []config.SecretSlot {
 	}
 }
 
+// EnvVars is part of the clawpatrol plugin API.
+//
+// Mirrors the Anthropic OAuth credential's pushdown (see
+// anthropic_oauth.go): aws-cli and the AWS SDKs read credentials out of
+// the process environment, so `clawpatrol env` exports placeholders that
+// satisfy local SigV4 signing. The gateway re-signs the proxied request
+// with the operator's real stored creds at MITM time (reSignProxiedRequest),
+// so these placeholder bytes never authenticate anything upstream.
+func (*AWSCredential) EnvVars() []config.EnvVar {
+	return []config.EnvVar{
+		{Name: "AWS_ACCESS_KEY_ID", Value: phAWSKeyID, Description: "aws-cli / AWS SDKs (placeholder; gateway re-signs)"},
+		{Name: "AWS_SECRET_ACCESS_KEY", Value: phAWSSecret, Description: "aws-cli / AWS SDKs (placeholder; gateway re-signs)"},
+		{Name: "AWS_DEFAULT_REGION", Value: "us-east-1", Description: "aws-cli default region (overridable per call)"},
+	}
+}
+
 func init() {
 	var _ runtime.HTTPRequestSigner = (*AWSCredential)(nil)
 	var _ runtime.EKSBearerMinter = (*AWSCredential)(nil)
+	var _ config.EnvPushdownProvider = (*AWSCredential)(nil)
 	config.Register(&config.Plugin{
 		Kind:    config.KindCredential,
 		Type:    "aws_credential",
