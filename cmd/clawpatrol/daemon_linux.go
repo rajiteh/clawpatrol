@@ -32,6 +32,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -55,6 +56,13 @@ const (
 	daemonHelloTimeout = 2 * time.Second
 	daemonSpawnTimeout = 30 * time.Second
 	daemonMagicLine    = "CLAWPATROL/1\n"
+	// daemonLogMaxBytes caps the persistent daemon.log: when a respawn
+	// finds the file larger than this it truncates instead of appending.
+	daemonLogMaxBytes = 2 << 20 // 2 MiB
+	// afUnixMaxPath is the AF_UNIX sun_path capacity on Linux (108
+	// bytes including the trailing NUL). The control socket path must
+	// fit; daemonRuntimeDir falls back to a short path when it wouldn't.
+	afUnixMaxPath = 108
 )
 
 // daemonTransport is the per-host network identity shared by every
@@ -88,15 +96,43 @@ type daemonTransport interface {
 	Close() error
 }
 
-// daemonRuntimeDir resolves the per-user runtime directory holding the
-// daemon's coordination state (control socket, spawn lock, log). Prefer
-// XDG_RUNTIME_DIR (tmpfs, per-user, no NFS pitfalls); fall back to
-// /tmp/clawpatrol-<uid> when unset (containers, minimal images).
+// daemonRuntimeDir resolves the directory holding the daemon's
+// coordination state (control socket, spawn lock, log). It MUST be a
+// stable, env-independent path: the whole point of the daemon is to be
+// a per-identity singleton that multiplexes every `clawpatrol run`
+// over the one tailnet key in daemonStateDir(), so the socket/lock have
+// to live at the same place no matter how the invoking process was
+// launched.
+//
+// It used to key on $XDG_RUNTIME_DIR (→ /run/user/<uid>/clawpatrol),
+// falling back to /tmp/clawpatrol-<uid> when unset. But pam_systemd
+// sets XDG_RUNTIME_DIR only for login sessions: an interactive shell
+// had it, while `ssh host cmd`, cron, and system services did not. The
+// two contexts therefore resolved different runtime dirs and spawned
+// *two* daemons that both bound the single tailnet identity and fought
+// over it — connections landed on whichever daemon a given invocation
+// happened to reach, so traffic intermittently went nowhere.
+//
+// Co-locate with the auth-key under daemonStateDir() so "one key in the
+// state dir" deterministically means "one daemon". AF_UNIX sockets work
+// fine on the persistent FS, and the existing stale-socket handling in
+// daemonConnect copes with a leftover socket after a reboot.
+//
+// Fallback for an unusually long $HOME / $XDG_STATE_HOME: the control
+// socket path must fit AF_UNIX's sun_path limit. When the state-dir
+// path would overflow it, use a short /tmp path keyed on a hash of the
+// (stable) state dir — still deterministic across invocation contexts,
+// so the one-daemon-per-identity guarantee holds, just not env-derived.
 func daemonRuntimeDir() string {
-	if d := os.Getenv("XDG_RUNTIME_DIR"); d != "" {
-		return filepath.Join(d, "clawpatrol")
+	dir := filepath.Join(daemonStateDir(), "run")
+	// +1 for the NUL terminator counted against sun_path.
+	if len(filepath.Join(dir, "control.sock"))+1 <= afUnixMaxPath {
+		return dir
 	}
-	return filepath.Join("/tmp", fmt.Sprintf("clawpatrol-%d", os.Getuid()))
+	sum := sha256.Sum256([]byte(daemonStateDir()))
+	// Hardcoded /tmp (not os.TempDir(), which honours $TMPDIR and could
+	// vary by context) keeps the fallback path env-independent too.
+	return filepath.Join("/tmp", fmt.Sprintf("clawpatrol-%d-%x", os.Getuid(), sum[:6]))
 }
 
 func daemonControlSockPath() string { return filepath.Join(daemonRuntimeDir(), "control.sock") }
@@ -214,8 +250,17 @@ func daemonSpawn(_ string) error {
 	}
 	defer func() { _ = pr.Close() }()
 
-	logf, err := os.OpenFile(daemonLogPath(),
-		os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	// Truncate when starting if the log has grown past the cap. The
+	// daemon idle-exits and respawns often, and the log now lives on
+	// the persistent state dir (not tmpfs that a reboot would clear),
+	// so plain O_APPEND would grow without bound. A start-time size
+	// check keeps recent history across a handful of restarts while
+	// bounding total size.
+	logFlags := os.O_CREATE | os.O_APPEND | os.O_WRONLY
+	if fi, err := os.Stat(daemonLogPath()); err == nil && fi.Size() > daemonLogMaxBytes {
+		logFlags = os.O_CREATE | os.O_TRUNC | os.O_WRONLY
+	}
+	logf, err := os.OpenFile(daemonLogPath(), logFlags, 0o600)
 	if err != nil {
 		_ = pw.Close()
 		return err
