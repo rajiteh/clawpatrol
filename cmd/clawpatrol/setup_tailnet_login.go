@@ -201,25 +201,37 @@ func bootstrapTailnetForJoin(ctx context.Context) (*tailnetBootstrap, error) {
 		return nil, err
 	}
 
+	// tsnet's HTTPClient() has neither a client Timeout nor a dial
+	// deadline. The gateway calls the join flow makes through it run
+	// right after the node comes up, before routes/MagicDNS have fully
+	// settled, so a dial to the gateway can stall — and with no timeout
+	// the request (and the whole join) hangs indefinitely. Cap it so a
+	// stalled request fails and surfaces an error instead.
+	hc := s.HTTPClient()
+	hc.Timeout = 30 * time.Second
+
 	return &tailnetBootstrap{
 		server: s,
 		lc:     lc,
-		client: s.HTTPClient(),
+		client: hc,
 		dir:    dir,
 	}, nil
 }
 
 // awaitTailnetAuth blocks until the tsnet node reaches Running,
-// printing the BrowseToURL exactly once when the control plane
-// surfaces it. Polls the LocalClient because StatusWithoutPeers is
-// cheap and the auth phase rarely lasts more than a few seconds in
-// the happy path — a wait of 10 minutes (the device-flow timeout
-// elsewhere in the join code) is the soft upper bound.
+// printing the BrowseToURL the control plane surfaces and re-printing
+// it if it changes (the interactive URL is short-lived). Polls the
+// LocalClient because StatusWithoutPeers is cheap and the auth phase
+// rarely lasts more than a few seconds in the happy path — a wait of
+// 10 minutes (the device-flow timeout elsewhere in the join code) is
+// the soft upper bound. Each poll is itself time-bounded so a wedged
+// localapi call can't silently eat that whole budget.
 func awaitTailnetAuth(ctx context.Context, lc *local.Client) error {
 	deadline, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer cancel()
 
 	var finish func(string)
+	shownURL := ""
 	lastState := "unknown"
 	// settle resolves the pending step (if shown) with line, else prints
 	// line on its own.
@@ -236,22 +248,43 @@ func awaitTailnetAuth(ctx context.Context, lc *local.Client) error {
 			return fmt.Errorf("tailnet bootstrap: timed out waiting for login (last state: %s)", lastState)
 		default:
 		}
-		st, err := lc.StatusWithoutPeers(deadline)
+		sctx, scancel := context.WithTimeout(deadline, 10*time.Second)
+		st, err := lc.StatusWithoutPeers(sctx)
+		scancel()
 		if err != nil {
 			// tsnet isn't ready yet during the first few hundred ms
-			// after Start(); back off briefly and retry.
+			// after Start(); a later call can also wedge mid-login. Back
+			// off briefly and retry rather than blocking on one call.
 			time.Sleep(200 * time.Millisecond)
 			continue
 		}
 		lastState = st.BackendState
-		if finish == nil && st.AuthURL != "" {
+		if st.AuthURL != "" && st.AuthURL != shownURL {
 			// The box running `clawpatrol join` is usually headless
 			// (SSH session, no browser). Show the login URL + a QR so
 			// the operator can scan from a phone — it's a public
 			// login.tailscale.com link, reachable from any device. The
 			// whole block collapses to "✓ logged in" once auth lands.
-			finish = beginStep("Log in to the tailnet to reach the gateway", linkDetail(st.AuthURL, true), true)
+			//
+			// Re-display whenever the URL changes rather than latching
+			// the first one: the interactive login URL is short-lived,
+			// so an operator slow to complete it sees the control plane
+			// expire it and tsnet re-register for a fresh URL. Latching
+			// the first link left a slow operator scanning a dead URL
+			// while the node sat in NeedsLogin until the 10-minute
+			// deadline — i.e. an apparent hang.
+			headline := "Log in to the tailnet to reach the gateway"
+			if shownURL != "" {
+				// Collapse the dead link's block before reprinting so
+				// the erase accounting stays balanced.
+				if finish != nil {
+					finish("")
+				}
+				headline = "Previous login link expired — open the refreshed link"
+			}
+			finish = beginStep(headline, linkDetail(st.AuthURL, true), true)
 			tryOpen(st.AuthURL) // best-effort local browser if one exists
+			shownURL = st.AuthURL
 		}
 		switch st.BackendState {
 		case "Running":
