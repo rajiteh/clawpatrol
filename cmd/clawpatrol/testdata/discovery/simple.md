@@ -29,6 +29,16 @@ Every other host is passed through untouched: the gateway does not
 intercept it, you get the upstream's real certificate, and you must
 still verify it against the public web PKI as usual.
 
+## Human-in-the-loop approval
+
+Some endpoints have rules that gate a matching request behind human approval (human-in-the-loop). When such a rule matches, the gateway PARKS the request pending a human decision instead of forwarding it upstream — and it may stay parked indefinitely while it waits for a person to approve or deny it. The gateway does NOT call upstream while a request is parked, so no side effect has happened yet. Do NOT treat a slow or hanging request to a gated endpoint as a failure or retry it blindly; the gateway is holding it on purpose.
+
+The gateway parks the request synchronously: it holds your connection open until a human decides and then answers on that same connection — the real upstream response once the request is approved, or a denial if it is rejected. You do not have to do anything special or re-send anything; just let the request run instead of aborting it.
+
+To see everything currently waiting on a human for your device, GET https://clawpatrol.internal/pending. It lists each parked action — its method, endpoint, and redacted target — so you can tell what is held without keeping the original connection in view.
+
+None of this profile's endpoints currently gate requests behind human approval.
+
 ## Endpoints (1)
 
 ### github  (https)

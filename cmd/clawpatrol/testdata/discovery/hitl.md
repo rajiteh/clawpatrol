@@ -1,4 +1,4 @@
-# Claw Patrol access manifest — profile: dba
+# Claw Patrol access manifest — profile: ops
 
 You are connected through the Claw Patrol gateway. It intercepts your
 connections transparently: dial the hosts below as you normally would and
@@ -37,18 +37,35 @@ The gateway parks the request synchronously: it holds your connection open until
 
 To see everything currently waiting on a human for your device, GET https://clawpatrol.internal/pending. It lists each parked action — its method, endpoint, and redacted target — so you can tell what is held without keeping the original connection in view.
 
-None of this profile's endpoints currently gate requests behind human approval.
+Endpoints below that may park a request for human approval: admin, deploy.
 
-## Endpoints (1)
+## Endpoints (4)
 
-### pg  (postgres)
+### admin  (https)
 
-- Host(s): pg.example
-- Port: 5432
-- SSL mode: require
-- Credential: postgres_credential `pg-ro` — read-only: reporting and ad-hoc queries — connect with database=app user=reader
-- Credential: postgres_credential `pg-rw` — read-write: schema migrations and data fixes — connect with database=app user=writer
-- Example: `psql "host=pg.example port=5432 user=reader dbname=app sslmode=require"`
+- Host(s): admin.example
+- Credential: bearer_token `admin` — send placeholder `PH_ADMIN`
+- Example: `curl https://admin.example/ -H "Authorization: Bearer PH_ADMIN"`
+- Human-in-the-loop: a matching request may be PARKED pending human approval and held until a person decides. Let it run instead of treating a slow request as a failure; see the human-in-the-loop section above.
+
+### deploy  (https)
+
+- Host(s): deploy.example
+- Credential: bearer_token `deploy` — send placeholder `PH_DEPLOY`
+- Example: `curl https://deploy.example/ -H "Authorization: Bearer PH_DEPLOY"`
+- Human-in-the-loop: a matching request may be PARKED pending human approval and held until a person decides. Let it run instead of treating a slow request as a failure; see the human-in-the-loop section above.
+
+### search  (https)
+
+- Host(s): search.example
+- Credential: bearer_token `search` — send placeholder `PH_SEARCH`
+- Example: `curl https://search.example/ -H "Authorization: Bearer PH_SEARCH"`
+
+### status  (https)
+
+- Host(s): status.example
+- Credential: bearer_token `status` — send placeholder `PH_STATUS`
+- Example: `curl https://status.example/ -H "Authorization: Bearer PH_STATUS"`
 
 ## Environment variables (0)
 
