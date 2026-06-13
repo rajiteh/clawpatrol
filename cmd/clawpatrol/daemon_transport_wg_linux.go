@@ -106,26 +106,17 @@ func (t *wgTransport) Close() error {
 	return nil
 }
 
-// startWGTransport reads the user wg.conf written by `clawpatrol join`
-// and brings up the transport. The device bring-up itself lives in
-// newWGTransportFromConf so it can also be driven from an in-memory
-// runConf (e.g. a dynamic-peer registration result) without a wg.conf
-// on disk.
+// startWGTransport reads the user wg.conf written by `clawpatrol join`,
+// brings up a wireguard-go device + gVisor stack, and waits for the
+// first handshake to complete so the first user flow doesn't race
+// the initial wg negotiation.
 func startWGTransport() (daemonTransport, error) {
 	confPath := defaultRunConf()
 	cfg, err := parseRunConf(confPath)
 	if err != nil {
 		return nil, fmt.Errorf("wg conf %s: %w (re-run `clawpatrol join`)", confPath, err)
 	}
-	return newWGTransportFromConf(cfg)
-}
 
-// newWGTransportFromConf brings up a wireguard-go device + gVisor stack
-// from a parsed runConf and waits for the first handshake so the first
-// user flow doesn't race the initial wg negotiation. The config source
-// (persisted wg.conf vs runtime dynamic-peer registration) is the
-// caller's concern.
-func newWGTransportFromConf(cfg *runConf) (daemonTransport, error) {
 	addrs := splitWGAddresses(cfg.Address)
 	var clientIP, clientIP6 netip.Addr
 	for _, a := range addrs {

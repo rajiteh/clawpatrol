@@ -207,11 +207,10 @@ spec:
     - name: wireguard-sidecar
       image: ghcr.io/denoland/clawpatrol:latest
       args:
-        - run
-        - --tun
+        - k8s-sidecar
         - --gateway-url=http://clawpatrol-api.clawpatrol.svc:8080
-        - --dynamic-peer-authorizer=kubernetes_token_review/agents
-        - --kubernetes-token-path=/var/run/secrets/tokens/clawpatrol-token
+        - --authorizer=agents
+        - --token-path=/var/run/secrets/tokens/clawpatrol-token
         - --env-out=/clawpatrol/env
         - --ca-out=/clawpatrol/ca.crt
         - --ready-file=/clawpatrol/ready
