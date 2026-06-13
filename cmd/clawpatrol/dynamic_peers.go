@@ -215,7 +215,11 @@ func (w *webMux) apiDynamicPeerDelete(rw http.ResponseWriter, r *http.Request) {
 	// without this guard it could revoke its own WireGuard peer and forget
 	// its device row by hitting the dynamic-peer delete path.
 	if _, err := w.g.dynamicPeerLeaseByIP(peerIP); err != nil {
-		http.NotFound(rw, r)
+		if errors.Is(err, sql.ErrNoRows) {
+			http.NotFound(rw, r)
+		} else {
+			http.Error(rw, err.Error(), http.StatusInternalServerError)
+		}
 		return
 	}
 	w.g.cleanupDynamicPeerLeaseByIPLocked(context.Background(), peerIP)
