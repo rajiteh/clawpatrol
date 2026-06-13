@@ -87,6 +87,39 @@ transport.
 | `endpoint` | `string` | no | The host:port advertised in client wg.conf as `Endpoint = ...`. Host defaults to public_url's host; port defaults to listen_port. Set only for split-host deployments (gateway sits behind a different hostname/IP for WG than for the dashboard). |
 | `interface` | `string` | no | The WireGuard interface name the gateway manages. Mostly irrelevant in userspace mode; leave unset. |
 | `server_pub` | `string` | no | The WireGuard server public key advertised to clients. Normally derived from gateway state; only set when bootstrapping from an external key. |
+| `dynamic_peers` | `block` | no | Lets workloads self-register as transient peers for this WireGuard transport. v1 supports Kubernetes TokenReview authorizers only. |
+
+**Nested block `dynamic_peers {}`:**
+
+The body of a transport's `dynamic_peers { ... }`
+block. It configures transient, self-registering peers for that
+transport.
+
+| Attribute | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `enabled` | `bool` | no |  |
+| `lease_ttl` | `string` | no | A time.ParseDuration string. Empty defaults to 2m. |
+| `authorizer` | `block` | no | Lists `authorizer "<type>" "<name>" { ... }` blocks. v1 supports type "kubernetes_token_review". |
+
+**Nested block `authorizer {}`:**
+
+A named dynamic-peer authorization
+source. Kubernetes TokenReview is the first supported type; the
+generic labels keep the config shape ready for future authorizers.
+
+| Attribute | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `audience` | `string` | no | Passed to Kubernetes TokenReview and should match the projected ServiceAccount token's audience. |
+| `profile_label` | `string` | no | Read from the live Pod object; clients do not get to submit their own profile. |
+| `allow` | `block` | no |  |
+
+**Nested block `allow {}`:**
+
+| Attribute | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `namespace` | `string` | no |  |
+| `service_account` | `string` | no |  |
+| `profiles` | `[]string` | no |  |
 
 **Nested block `tailscale {}`:**
 

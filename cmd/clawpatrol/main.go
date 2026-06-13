@@ -352,11 +352,15 @@ type Gateway struct {
 	// Used by endpoint plugins that need per-endpoint persistent
 	// bytes — SSH host keys today, future JWT signing keys.
 	// Exposed to plugins via ConnHandle.Blobs.
-	blobs   runtime.BlobStore
-	oauth   *OAuthRegistry
-	agents  *AgentRegistry
-	hitl    *HITLRegistry
-	onboard *onboardRegistry
+	blobs         runtime.BlobStore
+	oauth         *OAuthRegistry
+	agents        *AgentRegistry
+	hitl          *HITLRegistry
+	onboard       *onboardRegistry
+	dynamicPeerMu sync.Mutex
+	// k8sVerifier is nil in production until the first request, when a
+	// stdlib in-cluster Kubernetes client is built. Tests inject fakes.
+	k8sVerifier k8sRegistrationVerifier
 	// secrets hands credential plugins the secret bytes they inject
 	// at request time. gatewaySecretStore stacks the credential_secrets
 	// table (dashboard slots), OAuthRegistry (refreshed access tokens),
@@ -2763,6 +2767,8 @@ func main() {
 		runJoin(os.Args[2:])
 	case "run":
 		runRun(os.Args[2:])
+	case "k8s-sidecar":
+		runK8sSidecar(os.Args[2:])
 	case "daemon-internal":
 		// internal: re-exec'd by `clawpatrol run` (Linux only) to host
 		// the per-user tsnet daemon. Hidden from usage(); name carries
@@ -2873,6 +2879,7 @@ usage:
                                          with no public URL (creds discarded
                                          once join completes)
   clawpatrol run -- <cmd> [args...]      route one process tree through gateway
+  clawpatrol k8s-sidecar [flags]         register and route a Kubernetes agent pod
   clawpatrol status                      report install + tunnel state
   clawpatrol uninstall                   remove local join state and tunnel config
   clawpatrol env                         print shell exports for sourcing
@@ -3105,6 +3112,10 @@ func runGateway(args []string) {
 			log.Fatalf("wireguard: %v", err)
 		}
 		setWGServer(wg)
+		if cfg.IsWireGuardDynamicPeersEnabled() {
+			go g.startDynamicPeerLeaseSweeper(context.Background())
+			log.Printf("wireguard dynamic peers: enabled")
+		}
 		dashMux := newWebMux(g, cfg.Join(), cfg.PublicURL())
 		dashPort := portOf(dashListen)
 		tcpDispatch := func(c net.Conn, dstIP string, dstPort uint16) {

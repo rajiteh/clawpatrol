@@ -6,3 +6,6 @@ testing notes. The audience is people reading or changing the code.
 
 **Looking for product docs?** They live in `site/doc/` and render at
 <https://clawpatrol.dev/docs/>.
+
+- [WireGuard mode](wireguard.md)
+- [Kubernetes WireGuard dynamic peer pods](kubernetes-wireguard.md)

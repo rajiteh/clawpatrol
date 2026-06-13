@@ -1,0 +1,266 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: clawpatrol
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: agents
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: clawpatrol-gateway
+  namespace: clawpatrol
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: clawpatrol-tokenreview
+rules:
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["tokenreviews"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: clawpatrol-tokenreview
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: clawpatrol-tokenreview
+subjects:
+  - kind: ServiceAccount
+    name: clawpatrol-gateway
+    namespace: clawpatrol
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: clawpatrol-pod-reader
+  namespace: agents
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: clawpatrol-pod-reader
+  namespace: agents
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: clawpatrol-pod-reader
+subjects:
+  - kind: ServiceAccount
+    name: clawpatrol-gateway
+    namespace: clawpatrol
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: clawpatrol-config
+  namespace: clawpatrol
+data:
+  gateway.hcl: |
+    gateway {
+      dashboard_listen = "0.0.0.0:8080"
+      state_dir        = "/opt/clawpatrol"
+
+      wireguard {
+        subnet_cidr = "10.55.0.0/24"
+        listen_port = 51820
+        endpoint    = "clawpatrol-wg.clawpatrol.svc:51820"
+
+        dynamic_peers {
+          enabled   = true
+          lease_ttl = "2m"
+
+          authorizer "kubernetes_token_review" "agents" {
+            audience      = "clawpatrol"
+            profile_label = "clawpatrol.dev/profile"
+
+            allow {
+              namespace       = "agents"
+              service_account = "agent-runner"
+              profiles        = ["default"]
+            }
+          }
+        }
+      }
+    }
+
+    profile "default" {
+      credentials = []
+    }
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: clawpatrol-gateway
+  namespace: clawpatrol
+spec:
+  serviceName: clawpatrol-gateway
+  replicas: 1
+  selector:
+    matchLabels:
+      app: clawpatrol-gateway
+  template:
+    metadata:
+      labels:
+        app: clawpatrol-gateway
+    spec:
+      serviceAccountName: clawpatrol-gateway
+      containers:
+        - name: gateway
+          image: ghcr.io/denoland/clawpatrol:latest
+          args: ["gateway", "/etc/clawpatrol/gateway.hcl"]
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: wireguard
+              containerPort: 51820
+              protocol: UDP
+          volumeMounts:
+            - name: config
+              mountPath: /etc/clawpatrol
+              readOnly: true
+            - name: state
+              mountPath: /opt/clawpatrol
+      volumes:
+        - name: config
+          configMap:
+            name: clawpatrol-config
+  volumeClaimTemplates:
+    - metadata:
+        name: state
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: clawpatrol-api
+  namespace: clawpatrol
+spec:
+  selector:
+    app: clawpatrol-gateway
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: clawpatrol-wg
+  namespace: clawpatrol
+spec:
+  selector:
+    app: clawpatrol-gateway
+  ports:
+    - name: wireguard
+      port: 51820
+      protocol: UDP
+      targetPort: wireguard
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: agent-runner
+  namespace: agents
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: clawpatrol-agent-example
+  namespace: agents
+  labels:
+    clawpatrol.dev/profile: default
+spec:
+  serviceAccountName: agent-runner
+  automountServiceAccountToken: false
+  restartPolicy: Never
+  volumes:
+    - name: clawpatrol
+      emptyDir: {}
+    - name: clawpatrol-token
+      projected:
+        sources:
+          - serviceAccountToken:
+              path: clawpatrol-token
+              audience: clawpatrol
+              expirationSeconds: 600
+    - name: dev-net-tun
+      hostPath:
+        path: /dev/net/tun
+        type: CharDevice
+  containers:
+    - name: wireguard-sidecar
+      image: ghcr.io/denoland/clawpatrol:latest
+      args:
+        - k8s-sidecar
+        - --gateway-url=http://clawpatrol-api.clawpatrol.svc:8080
+        - --authorizer=agents
+        - --token-path=/var/run/secrets/tokens/clawpatrol-token
+        - --env-out=/clawpatrol/env
+        - --ca-out=/clawpatrol/ca.crt
+        - --ready-file=/clawpatrol/ready
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities:
+          add: ["NET_ADMIN"]
+      env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: POD_UID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.uid
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+      volumeMounts:
+        - name: clawpatrol
+          mountPath: /clawpatrol
+        - name: clawpatrol-token
+          mountPath: /var/run/secrets/tokens
+          readOnly: true
+        - name: dev-net-tun
+          mountPath: /dev/net/tun
+    - name: agent
+      image: debian:stable-slim
+      command: ["/bin/sh", "-lc"]
+      args:
+        - |
+          while [ ! -f /clawpatrol/ready ]; do sleep 0.2; done
+          . /clawpatrol/env
+          exec env | sort
+      securityContext:
+        allowPrivilegeEscalation: false
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        capabilities:
+          drop: ["ALL"]
+        seccompProfile:
+          type: RuntimeDefault
+      volumeMounts:
+        - name: clawpatrol
+          mountPath: /clawpatrol
+          readOnly: true
