@@ -6,7 +6,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"flag"
 	"fmt"
 	"io"
 	"net"
@@ -27,54 +26,29 @@ import (
 	wgtun "golang.zx2c4.com/wireguard/tun"
 )
 
-const k8sSidecarDefaultTokenPath = "/var/run/secrets/tokens/clawpatrol-token"
-
-type k8sSidecarOptions struct {
-	GatewayURL string
-	Authorizer string
-	TokenPath  string
-	EnvOut     string
-	CAOut      string
-	ReadyFile  string
-	Iface      string
-	MTU        int
-}
-
-func runK8sSidecar(args []string) {
-	fs := flag.NewFlagSet("k8s-sidecar", flag.ExitOnError)
-	var opt k8sSidecarOptions
-	fs.StringVar(&opt.GatewayURL, "gateway-url", "", "gateway API URL, e.g. https://clawpatrol.clawpatrol.svc:8443")
-	fs.StringVar(&opt.Authorizer, "authorizer", "agents", "dynamic peer authorizer name configured on the gateway")
-	fs.StringVar(&opt.TokenPath, "token-path", k8sSidecarDefaultTokenPath, "projected Kubernetes ServiceAccount token path")
-	fs.StringVar(&opt.EnvOut, "env-out", "/clawpatrol/env", "path to write shell exports for the agent container")
-	fs.StringVar(&opt.CAOut, "ca-out", "/clawpatrol/ca.crt", "path to write the gateway CA bundle")
-	fs.StringVar(&opt.ReadyFile, "ready-file", "/clawpatrol/ready", "path to touch after network and env setup succeed")
-	fs.StringVar(&opt.Iface, "iface", "clawpatrol0", "WireGuard TUN interface name")
-	fs.IntVar(&opt.MTU, "mtu", dynamicPeerDefaultMTU, "WireGuard TUN MTU")
-	_ = fs.Parse(args)
-	if opt.GatewayURL == "" {
-		fmt.Fprintln(os.Stderr, "clawpatrol k8s-sidecar: --gateway-url is required")
-		os.Exit(2)
+// tunModeRun is the resident, privileged data plane behind
+// `clawpatrol run --tun`. It self-registers as a dynamic peer, brings up a
+// userspace WireGuard TUN, routes the whole network namespace through the
+// gateway, writes the CA + env handoff for the sibling workload container,
+// heartbeats the lease, and deregisters on SIGTERM.
+func tunModeRun(ctx context.Context, opt tunModeOptions) error {
+	// The authorizer type selects how identity is gathered. v1 ships one
+	// provider; the switch is the seam future providers plug into.
+	var (
+		claims  json.RawMessage
+		saToken string
+		err     error
+	)
+	switch opt.AuthorizerType {
+	case dynamicPeerAuthorizerKubernetesTokenRev:
+		claims, saToken, err = kubernetesProviderClaims(opt)
+	default:
+		return fmt.Errorf("unsupported dynamic peer authorizer type %q", opt.AuthorizerType)
 	}
-	if err := runK8sSidecarMain(context.Background(), opt); err != nil {
-		fmt.Fprintf(os.Stderr, "clawpatrol k8s-sidecar: %v\n", err)
-		os.Exit(1)
-	}
-}
-
-func runK8sSidecarMain(ctx context.Context, opt k8sSidecarOptions) error {
-	podName := os.Getenv("POD_NAME")
-	podNamespace := os.Getenv("POD_NAMESPACE")
-	podUID := os.Getenv("POD_UID")
-	nodeName := os.Getenv("NODE_NAME")
-	if podName == "" || podNamespace == "" || podUID == "" {
-		return fmt.Errorf("POD_NAME, POD_NAMESPACE, and POD_UID must be supplied by the Downward API")
-	}
-	tokenBytes, err := os.ReadFile(opt.TokenPath)
 	if err != nil {
-		return fmt.Errorf("read serviceaccount token: %w", err)
+		return err
 	}
-	saToken := strings.TrimSpace(string(tokenBytes))
+
 	clientPrivB64, _, clientPubB64, err := wgGenKeypair()
 	if err != nil {
 		return fmt.Errorf("generate wireguard keypair: %w", err)
@@ -84,18 +58,9 @@ func runK8sSidecarMain(ctx context.Context, opt k8sSidecarOptions) error {
 	if err != nil {
 		return fmt.Errorf("default route: %w", err)
 	}
-	claims, err := json.Marshal(k8sDynamicPeerClaims{
-		PodName:      podName,
-		PodNamespace: podNamespace,
-		PodUID:       podUID,
-		NodeName:     nodeName,
-	})
-	if err != nil {
-		return err
-	}
-	registerResp, err := k8sSidecarRegister(ctx, opt.GatewayURL, saToken, dynamicPeerRegisterRequest{
+	registerResp, err := tunModeRegister(ctx, opt.GatewayURL, saToken, dynamicPeerRegisterRequest{
 		Transport:          dynamicPeerTransportWireGuard,
-		Authorizer:         opt.Authorizer,
+		Authorizer:         opt.AuthorizerName,
 		WireGuardPublicKey: clientPubB64,
 		Claims:             claims,
 	})
@@ -130,13 +95,13 @@ func runK8sSidecarMain(ctx context.Context, opt k8sSidecarOptions) error {
 	if err != nil {
 		return fmt.Errorf("tun name: %w", err)
 	}
-	dev := device.NewDevice(tunDev, conn.NewDefaultBind(), device.NewLogger(device.LogLevelError, "[clawpatrol k8s wg] "))
+	dev := device.NewDevice(tunDev, conn.NewDefaultBind(), device.NewLogger(device.LogLevelError, "[clawpatrol tun wg] "))
 	defer dev.Close()
 
-	if err := setupK8sSidecarTun(ifaceName, opt.MTU, registerResp.PeerIP, registerResp.PeerIPv6); err != nil {
+	if err := setupTunDevice(ifaceName, opt.MTU, registerResp.PeerIP, registerResp.PeerIPv6); err != nil {
 		return err
 	}
-	ipc, err := buildK8sSidecarWGIpc(clientPrivB64, registerResp.ServerPublicKey, endpointAddr)
+	ipc, err := buildTunWGIpc(clientPrivB64, registerResp.ServerPublicKey, endpointAddr)
 	if err != nil {
 		return err
 	}
@@ -150,24 +115,51 @@ func runK8sSidecarMain(ctx context.Context, opt k8sSidecarOptions) error {
 		return err
 	}
 
-	envVars, err := k8sSidecarFetchEnv(ctx, opt.GatewayURL, registerResp.APIToken)
+	envVars, err := tunModeFetchEnv(ctx, opt.GatewayURL, registerResp.APIToken)
 	if err != nil {
 		return err
 	}
 	envVars = append(caPathPushdownVars(opt.CAOut), envVars...)
-	if err := writeSidecarFiles(opt, envVars, registerResp.CAPEM); err != nil {
+	if err := writeTunFiles(opt, envVars, registerResp.CAPEM); err != nil {
 		return err
 	}
 
 	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	go k8sSidecarHeartbeatLoop(ctx, opt.GatewayURL, registerResp.APIToken, registerResp.LeaseTTLSeconds)
+	go tunModeHeartbeatLoop(ctx, opt.GatewayURL, registerResp.APIToken, registerResp.LeaseTTLSeconds)
 	<-ctx.Done()
-	k8sSidecarDelete(context.Background(), opt.GatewayURL, registerResp.APIToken)
+	tunModeDelete(context.Background(), opt.GatewayURL, registerResp.APIToken)
 	return nil
 }
 
-func k8sSidecarRegister(ctx context.Context, gatewayURL, token string, reqBody dynamicPeerRegisterRequest) (dynamicPeerRegisterResponse, error) {
+// kubernetesProviderClaims gathers the kubernetes_token_review identity:
+// claims from the downward-API POD_* env, credential from the projected
+// ServiceAccount token.
+func kubernetesProviderClaims(opt tunModeOptions) (json.RawMessage, string, error) {
+	podName := os.Getenv("POD_NAME")
+	podNamespace := os.Getenv("POD_NAMESPACE")
+	podUID := os.Getenv("POD_UID")
+	nodeName := os.Getenv("NODE_NAME")
+	if podName == "" || podNamespace == "" || podUID == "" {
+		return nil, "", fmt.Errorf("POD_NAME, POD_NAMESPACE, and POD_UID must be supplied by the Downward API")
+	}
+	tokenBytes, err := os.ReadFile(opt.KubeTokenPath)
+	if err != nil {
+		return nil, "", fmt.Errorf("read serviceaccount token: %w", err)
+	}
+	claims, err := json.Marshal(k8sDynamicPeerClaims{
+		PodName:      podName,
+		PodNamespace: podNamespace,
+		PodUID:       podUID,
+		NodeName:     nodeName,
+	})
+	if err != nil {
+		return nil, "", err
+	}
+	return claims, strings.TrimSpace(string(tokenBytes)), nil
+}
+
+func tunModeRegister(ctx context.Context, gatewayURL, token string, reqBody dynamicPeerRegisterRequest) (dynamicPeerRegisterResponse, error) {
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(reqBody); err != nil {
 		return dynamicPeerRegisterResponse{}, err
@@ -203,7 +195,7 @@ func k8sSidecarRegister(ctx context.Context, gatewayURL, token string, reqBody d
 	return out, nil
 }
 
-func k8sSidecarFetchEnv(ctx context.Context, gatewayURL, apiToken string) ([]pushdownEnvVar, error) {
+func tunModeFetchEnv(ctx context.Context, gatewayURL, apiToken string) ([]pushdownEnvVar, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(gatewayURL, "/")+"/api/env-pushdown", nil)
 	if err != nil {
 		return nil, err
@@ -224,7 +216,7 @@ func k8sSidecarFetchEnv(ctx context.Context, gatewayURL, apiToken string) ([]pus
 	return parseEnvPushdownJSON(raw)
 }
 
-func k8sSidecarHeartbeatLoop(ctx context.Context, gatewayURL, apiToken string, ttlSeconds int) {
+func tunModeHeartbeatLoop(ctx context.Context, gatewayURL, apiToken string, ttlSeconds int) {
 	interval := time.Duration(ttlSeconds) * time.Second / 2
 	if interval < 5*time.Second {
 		interval = 5 * time.Second
@@ -250,7 +242,7 @@ func k8sSidecarHeartbeatLoop(ctx context.Context, gatewayURL, apiToken string, t
 	}
 }
 
-func k8sSidecarDelete(ctx context.Context, gatewayURL, apiToken string) {
+func tunModeDelete(ctx context.Context, gatewayURL, apiToken string) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, strings.TrimRight(gatewayURL, "/")+dynamicPeerRegisterPath, nil)
 	if err != nil {
 		return
@@ -263,7 +255,7 @@ func k8sSidecarDelete(ctx context.Context, gatewayURL, apiToken string) {
 	}
 }
 
-func buildK8sSidecarWGIpc(privateKeyB64, serverPublicKeyB64, endpoint string) (string, error) {
+func buildTunWGIpc(privateKeyB64, serverPublicKeyB64, endpoint string) (string, error) {
 	privHex, err := base64DecodeToHex(privateKeyB64)
 	if err != nil {
 		return "", fmt.Errorf("private key: %w", err)
@@ -283,7 +275,7 @@ func buildK8sSidecarWGIpc(privateKeyB64, serverPublicKeyB64, endpoint string) (s
 	return b.String(), nil
 }
 
-func setupK8sSidecarTun(iface string, mtu int, peerIP, peerIPv6 string) error {
+func setupTunDevice(iface string, mtu int, peerIP, peerIPv6 string) error {
 	steps := [][]string{
 		{"ip", "link", "set", "dev", iface, "mtu", strconv.Itoa(mtu), "up"},
 		{"ip", "addr", "replace", peerIP + "/32", "dev", iface},
@@ -394,7 +386,7 @@ func runIP(args ...string) error {
 	return nil
 }
 
-func writeSidecarFiles(opt k8sSidecarOptions, vars []pushdownEnvVar, caPEM string) error {
+func writeTunFiles(opt tunModeOptions, vars []pushdownEnvVar, caPEM string) error {
 	if err := os.MkdirAll(filepath.Dir(opt.EnvOut), 0o755); err != nil {
 		return err
 	}

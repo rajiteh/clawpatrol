@@ -2,9 +2,30 @@
 
 Clawpatrol can run in Kubernetes with the gateway as a long-lived pod and
 agents as on-demand pods. The gateway keeps using the existing userspace
-WireGuard server. Agent pods use a dedicated `clawpatrol k8s-sidecar`
+WireGuard server. Agent pods use a `clawpatrol run --tun` sidecar
 container to create the pod-level WireGuard tunnel; the execution
 container remains unprivileged.
+
+The sidecar is a TUN-mode `run`: `--tun` realizes the data plane as a real
+TUN with netns-wide routing (privileged), and
+`--dynamic-peer-authorizer <type>/<name>` self-registers as a dynamic peer
+and renews the lease. The two flags are independent — `--dynamic-peer-authorizer`
+is just an identity mode — but the privileged whole-pod sidecar topology
+uses them together:
+
+```
+clawpatrol run --tun \
+  --gateway-url=http://clawpatrol-api.clawpatrol.svc:8080 \
+  --dynamic-peer-authorizer=kubernetes_token_review/agents \
+  --kubernetes-token-path=/var/run/secrets/tokens/clawpatrol-token \
+  --env-out=/clawpatrol/env --ca-out=/clawpatrol/ca.crt --ready-file=/clawpatrol/ready
+```
+
+The `<type>/<name>` value mirrors the gateway's
+`authorizer "<type>" "<name>"` block: the type selects the client-side
+claims provider (`kubernetes_token_review` reads the projected
+ServiceAccount token and the downward-API `POD_*` env), and the name picks
+the configured server authorizer.
 
 ## Control flow
 

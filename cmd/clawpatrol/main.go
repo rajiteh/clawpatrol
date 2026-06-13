@@ -2768,9 +2768,11 @@ func main() {
 	case "join":
 		runJoin(os.Args[2:])
 	case "run":
-		runRun(os.Args[2:])
-	case "k8s-sidecar":
-		runK8sSidecar(os.Args[2:])
+		if tunModeRequested(os.Args[2:]) {
+			runTunMode(os.Args[2:])
+		} else {
+			runRun(os.Args[2:])
+		}
 	case "daemon-internal":
 		// internal: re-exec'd by `clawpatrol run` (Linux only) to host
 		// the per-user tsnet daemon. Hidden from usage(); name carries
@@ -2881,7 +2883,9 @@ usage:
                                          with no public URL (creds discarded
                                          once join completes)
   clawpatrol run -- <cmd> [args...]      route one process tree through gateway
-  clawpatrol k8s-sidecar [flags]         register and route a Kubernetes agent pod
+  clawpatrol run --tun --dynamic-peer-authorizer <type>/<name> [flags]
+                                         resident sidecar: self-register as a
+                                         dynamic peer and route the pod netns
   clawpatrol status                      report install + tunnel state
   clawpatrol uninstall                   remove local join state and tunnel config
   clawpatrol env                         print shell exports for sourcing

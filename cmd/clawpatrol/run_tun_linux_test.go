@@ -10,7 +10,7 @@ import (
 	"testing"
 )
 
-func TestK8sSidecarRegisterRequest(t *testing.T) {
+func TestTunModeRegisterRequest(t *testing.T) {
 	var gotAuth, gotContentType string
 	var gotBody dynamicPeerRegisterRequest
 	srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
@@ -37,7 +37,7 @@ func TestK8sSidecarRegisterRequest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp, err := k8sSidecarRegister(context.Background(), srv.URL+"/", "sa-token", dynamicPeerRegisterRequest{
+	resp, err := tunModeRegister(context.Background(), srv.URL+"/", "sa-token", dynamicPeerRegisterRequest{
 		Transport:          dynamicPeerTransportWireGuard,
 		Authorizer:         "agents",
 		WireGuardPublicKey: keyA,
@@ -67,19 +67,19 @@ func TestK8sSidecarRegisterRequest(t *testing.T) {
 	}
 }
 
-func TestK8sSidecarRegisterRejectsErrorStatus(t *testing.T) {
+func TestTunModeRegisterRejectsErrorStatus(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
 		http.Error(rw, "namespace/serviceaccount/profile is not allowed", http.StatusForbidden)
 	}))
 	defer srv.Close()
-	if _, err := k8sSidecarRegister(context.Background(), srv.URL, "sa-token", dynamicPeerRegisterRequest{
+	if _, err := tunModeRegister(context.Background(), srv.URL, "sa-token", dynamicPeerRegisterRequest{
 		Transport: dynamicPeerTransportWireGuard, Authorizer: "agents", WireGuardPublicKey: keyA,
 	}); err == nil {
 		t.Fatal("expected error for non-200 status")
 	}
 }
 
-func TestK8sSidecarRegisterRejectsIncompleteResponse(t *testing.T) {
+func TestTunModeRegisterRejectsIncompleteResponse(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
 		// Valid transport but missing peer_ip / server_public_key / token.
 		_ = json.NewEncoder(rw).Encode(dynamicPeerRegisterResponse{
@@ -88,7 +88,7 @@ func TestK8sSidecarRegisterRejectsIncompleteResponse(t *testing.T) {
 		})
 	}))
 	defer srv.Close()
-	if _, err := k8sSidecarRegister(context.Background(), srv.URL, "sa-token", dynamicPeerRegisterRequest{
+	if _, err := tunModeRegister(context.Background(), srv.URL, "sa-token", dynamicPeerRegisterRequest{
 		Transport: dynamicPeerTransportWireGuard, Authorizer: "agents", WireGuardPublicKey: keyA,
 	}); err == nil {
 		t.Fatal("expected error for incomplete response")

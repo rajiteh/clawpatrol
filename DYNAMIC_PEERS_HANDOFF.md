@@ -61,13 +61,22 @@ were removed rather than aliased.
   - `POST /api/dynamic-peers/register`
   - `POST /api/dynamic-peers/heartbeat`
   - `DELETE /api/dynamic-peers/register`
-- Updated `clawpatrol k8s-sidecar` to call the generic dynamic peer API.
-  It now sends:
+- The Kubernetes sidecar is `clawpatrol run --tun`, not a dedicated
+  subcommand. `--tun` realizes the data plane as a real TUN with
+  netns-wide routing (privileged); `--dynamic-peer-authorizer <type>/<name>`
+  self-registers as a dynamic peer and renews the lease. The two flags are
+  independent identity/transport axes; the privileged sidecar uses them
+  together. The register request sends:
   - `transport = "wireguard"`
-  - `authorizer = "agents"` by default
+  - `authorizer = "<name>"` (the name half of `--dynamic-peer-authorizer`)
   - `wireguard_public_key`
   - Kubernetes pod metadata under `claims`
-- Added `--authorizer` to `clawpatrol k8s-sidecar`.
+- `--dynamic-peer-authorizer <type>/<name>` mirrors the gateway's
+  `authorizer "<type>" "<name>"` block: the type selects the client claims
+  provider (`kubernetes_token_review` today), the name is sent on the wire.
+  Provider credential is `--kubernetes-token-path` (provider-scoped, not a
+  generic flag). Future authorizers add their own `--<provider>-*` flags
+  without touching the `--dynamic-peer-*` namespace.
 - Replaced the transient lease migration with
   `cmd/clawpatrol/migrations/sqlite/0020_dynamic_peer_leases.sql`.
 - Updated docs and examples:
