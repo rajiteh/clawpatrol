@@ -148,7 +148,18 @@ For Kubernetes:
 - Tailscale behavior is unchanged. The code now has transport and authorizer
   boundaries that can support future Tailscale work, but no Tailscale dynamic
   peer transport has been implemented.
-- The gateway still assumes a single active WireGuard replica for v1.
+- Run a single active WireGuard-terminating gateway replica. This is a
+  pre-existing, gateway-wide constraint — not specific to dynamic peers.
+  The WireGuard data plane is an in-process `wireguard-go` device: peers
+  are injected into the local device and written to the shared `wg_peers`
+  table, but other replicas only read `wg_peers` at boot (`LoadPeers`),
+  with no live cross-replica peer-state propagation. Dashboard onboarding
+  has the same limitation; dynamic peers just exercise it far harder via
+  continuous self-registration and lease expiry, so a peer registered on
+  one replica is not usable through another. The server keypair is shared
+  (DB-backed), so active/active is not blocked by identity — it is blocked
+  by per-replica peer state. Load-balanced or active/active WireGuard
+  termination is unsupported in v1.
 - The sidecar still requires `NET_ADMIN` and `/dev/net/tun`; the agent
   execution container remains unprivileged.
 
