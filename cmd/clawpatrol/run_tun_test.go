@@ -35,8 +35,15 @@ func TestTunModeRequested(t *testing.T) {
 		{[]string{"--tun=true"}, true},
 		{[]string{"-tun"}, true},
 		{[]string{"--dynamic-peer-authorizer", "kubernetes_token_review/agents"}, true},
+		// Explicit false keeps run on the normal (gVisor) path.
+		{[]string{"--tun=false", "--", "bash"}, false},
+		{[]string{"-tun=0"}, false},
+		// ...but an authorizer still requests tun dispatch (where it errors
+		// "requires --tun"), even alongside --tun=false.
+		{[]string{"--tun=false", "--dynamic-peer-authorizer", "kubernetes_token_review/agents"}, true},
 		// --tun after `--` belongs to the wrapped command, not run.
 		{[]string{"--", "agent", "--tun"}, false},
+		{[]string{"--", "agent", "--tun=false"}, false},
 	}
 	for _, c := range cases {
 		if got := tunModeRequested(c.args); got != c.want {

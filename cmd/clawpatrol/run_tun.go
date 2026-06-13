@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/netip"
 	"os"
+	"strconv"
 	"strings"
 )
 
@@ -55,9 +56,22 @@ func tunModeRequested(args []string) bool {
 		if !strings.HasPrefix(a, "-") {
 			continue
 		}
-		name := strings.TrimLeft(a, "-")
-		name, _, _ = strings.Cut(name, "=")
-		if name == "tun" || name == "dynamic-peer-authorizer" {
+		name, value, hasValue := strings.Cut(strings.TrimLeft(a, "-"), "=")
+		switch name {
+		case "tun":
+			// Honor an explicit boolean value so `run --tun=false -- <cmd>`
+			// stays on the normal (gVisor) path instead of dispatching here
+			// and erroring. A bare `--tun` means true; an unparseable value
+			// is left for the flag parser to reject.
+			if !hasValue {
+				return true
+			}
+			b, err := strconv.ParseBool(value)
+			if err != nil || b {
+				return true
+			}
+			// explicit false → not requested
+		case "dynamic-peer-authorizer":
 			return true
 		}
 	}

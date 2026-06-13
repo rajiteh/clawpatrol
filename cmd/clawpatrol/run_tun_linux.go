@@ -128,7 +128,11 @@ func tunModeRun(ctx context.Context, opt tunModeOptions) error {
 	defer stop()
 	go dynamicPeerHeartbeatLoop(ctx, opt.GatewayURL, registerResp.APIToken, registerResp.LeaseTTLSeconds)
 	<-ctx.Done()
-	dynamicPeerDeregister(context.Background(), opt.GatewayURL, registerResp.APIToken)
+	// Best-effort deregister, bounded so a hung gateway/DNS call can't delay
+	// pod termination past the grace period (the lease still TTL-expires).
+	delCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	dynamicPeerDeregister(delCtx, opt.GatewayURL, registerResp.APIToken)
 	return nil
 }
 
