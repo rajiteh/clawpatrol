@@ -67,7 +67,13 @@ func tunModeRun(ctx context.Context, opt tunModeOptions) error {
 	if err != nil {
 		return fmt.Errorf("gateway-url: %w", err)
 	}
-	apiIPs, _ := lookupHostIPs(apiURL.Hostname())
+	// Fail fast rather than silently skip pinning the API host routes —
+	// consistent with the fatal pin stance below; an unpinned API after the
+	// default-route swap would blackhole heartbeats.
+	apiIPs, err := lookupHostIPs(apiURL.Hostname())
+	if err != nil {
+		return fmt.Errorf("resolve gateway api host %q: %w", apiURL.Hostname(), err)
+	}
 	endpointIP, endpointAddr, err := resolveWGEndpoint(registerResp.Endpoint)
 	if err != nil {
 		return err
@@ -270,7 +276,7 @@ func pinHostRoute(ip netip.Addr, route4, route6 linuxDefaultRoute, have6 bool) e
 func resolveWGEndpoint(endpoint string) (netip.Addr, string, error) {
 	host, port, err := net.SplitHostPort(endpoint)
 	if err != nil {
-		return netip.Addr{}, "", err
+		return netip.Addr{}, "", fmt.Errorf("endpoint %q: %w", endpoint, err)
 	}
 	ips, err := lookupHostIPs(host)
 	if err != nil {
