@@ -5,11 +5,8 @@ package main
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
 	"net"
-	"net/http"
 	"net/netip"
 	"net/url"
 	"os"
@@ -30,21 +27,12 @@ import (
 // `clawpatrol run --tun`. It self-registers as a dynamic peer, brings up a
 // userspace WireGuard TUN, routes the whole network namespace through the
 // gateway, writes the CA + env handoff for the sibling workload container,
-// heartbeats the lease, and deregisters on SIGTERM.
+// heartbeats the lease, and deregisters on SIGTERM. The register /
+// heartbeat / deregister / claims logic is the transport-agnostic
+// dynamic-peer client core (dynamic_peer_client.go); everything here is
+// the TUN-specific bring-up.
 func tunModeRun(ctx context.Context, opt tunModeOptions) error {
-	// The authorizer type selects how identity is gathered. v1 ships one
-	// provider; the switch is the seam future providers plug into.
-	var (
-		claims  json.RawMessage
-		saToken string
-		err     error
-	)
-	switch opt.AuthorizerType {
-	case dynamicPeerAuthorizerKubernetesTokenRev:
-		claims, saToken, err = kubernetesProviderClaims(opt)
-	default:
-		return fmt.Errorf("unsupported dynamic peer authorizer type %q", opt.AuthorizerType)
-	}
+	claims, credential, err := gatherDynamicPeerClaims(opt.AuthorizerType, opt.KubeTokenPath)
 	if err != nil {
 		return err
 	}
@@ -58,7 +46,7 @@ func tunModeRun(ctx context.Context, opt tunModeOptions) error {
 	if err != nil {
 		return fmt.Errorf("default route: %w", err)
 	}
-	registerResp, err := tunModeRegister(ctx, opt.GatewayURL, saToken, dynamicPeerRegisterRequest{
+	registerResp, err := dynamicPeerRegister(ctx, opt.GatewayURL, credential, dynamicPeerRegisterRequest{
 		Transport:          dynamicPeerTransportWireGuard,
 		Authorizer:         opt.AuthorizerName,
 		WireGuardPublicKey: clientPubB64,
@@ -115,7 +103,7 @@ func tunModeRun(ctx context.Context, opt tunModeOptions) error {
 		return err
 	}
 
-	envVars, err := tunModeFetchEnv(ctx, opt.GatewayURL, registerResp.APIToken)
+	envVars, err := dynamicPeerFetchEnv(ctx, opt.GatewayURL, registerResp.APIToken)
 	if err != nil {
 		return err
 	}
@@ -126,133 +114,10 @@ func tunModeRun(ctx context.Context, opt tunModeOptions) error {
 
 	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	go tunModeHeartbeatLoop(ctx, opt.GatewayURL, registerResp.APIToken, registerResp.LeaseTTLSeconds)
+	go dynamicPeerHeartbeatLoop(ctx, opt.GatewayURL, registerResp.APIToken, registerResp.LeaseTTLSeconds)
 	<-ctx.Done()
-	tunModeDelete(context.Background(), opt.GatewayURL, registerResp.APIToken)
+	dynamicPeerDeregister(context.Background(), opt.GatewayURL, registerResp.APIToken)
 	return nil
-}
-
-// kubernetesProviderClaims gathers the kubernetes_token_review identity:
-// claims from the downward-API POD_* env, credential from the projected
-// ServiceAccount token.
-func kubernetesProviderClaims(opt tunModeOptions) (json.RawMessage, string, error) {
-	podName := os.Getenv("POD_NAME")
-	podNamespace := os.Getenv("POD_NAMESPACE")
-	podUID := os.Getenv("POD_UID")
-	nodeName := os.Getenv("NODE_NAME")
-	if podName == "" || podNamespace == "" || podUID == "" {
-		return nil, "", fmt.Errorf("POD_NAME, POD_NAMESPACE, and POD_UID must be supplied by the Downward API")
-	}
-	tokenBytes, err := os.ReadFile(opt.KubeTokenPath)
-	if err != nil {
-		return nil, "", fmt.Errorf("read serviceaccount token: %w", err)
-	}
-	claims, err := json.Marshal(k8sDynamicPeerClaims{
-		PodName:      podName,
-		PodNamespace: podNamespace,
-		PodUID:       podUID,
-		NodeName:     nodeName,
-	})
-	if err != nil {
-		return nil, "", err
-	}
-	return claims, strings.TrimSpace(string(tokenBytes)), nil
-}
-
-func tunModeRegister(ctx context.Context, gatewayURL, token string, reqBody dynamicPeerRegisterRequest) (dynamicPeerRegisterResponse, error) {
-	var buf bytes.Buffer
-	if err := json.NewEncoder(&buf).Encode(reqBody); err != nil {
-		return dynamicPeerRegisterResponse{}, err
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(gatewayURL, "/")+dynamicPeerRegisterPath, &buf)
-	if err != nil {
-		return dynamicPeerRegisterResponse{}, err
-	}
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return dynamicPeerRegisterResponse{}, fmt.Errorf("register: %w", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return dynamicPeerRegisterResponse{}, fmt.Errorf("register status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
-	}
-	var out dynamicPeerRegisterResponse
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&out); err != nil {
-		return dynamicPeerRegisterResponse{}, fmt.Errorf("register decode: %w", err)
-	}
-	if out.Transport != dynamicPeerTransportWireGuard {
-		return dynamicPeerRegisterResponse{}, fmt.Errorf("register response has unsupported transport %q", out.Transport)
-	}
-	if out.PeerIP == "" || out.ServerPublicKey == "" || out.Endpoint == "" || out.APIToken == "" {
-		return dynamicPeerRegisterResponse{}, fmt.Errorf("register response missing peer_ip, server_public_key, endpoint, or api_token")
-	}
-	if out.LeaseTTLSeconds <= 0 {
-		return dynamicPeerRegisterResponse{}, fmt.Errorf("register response has invalid lease_ttl_seconds")
-	}
-	return out, nil
-}
-
-func tunModeFetchEnv(ctx context.Context, gatewayURL, apiToken string) ([]pushdownEnvVar, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(gatewayURL, "/")+"/api/env-pushdown", nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Authorization", "Bearer "+apiToken)
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("fetch env-pushdown: %w", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("fetch env-pushdown status %d", resp.StatusCode)
-	}
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		return nil, err
-	}
-	return parseEnvPushdownJSON(raw)
-}
-
-func tunModeHeartbeatLoop(ctx context.Context, gatewayURL, apiToken string, ttlSeconds int) {
-	interval := time.Duration(ttlSeconds) * time.Second / 2
-	if interval < 5*time.Second {
-		interval = 5 * time.Second
-	}
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(gatewayURL, "/")+dynamicPeerHeartbeatPath, nil)
-			if err != nil {
-				continue
-			}
-			req.Header.Set("Authorization", "Bearer "+apiToken)
-			resp, err := http.DefaultClient.Do(req)
-			if err == nil {
-				_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-				_ = resp.Body.Close()
-			}
-		}
-	}
-}
-
-func tunModeDelete(ctx context.Context, gatewayURL, apiToken string) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, strings.TrimRight(gatewayURL, "/")+dynamicPeerRegisterPath, nil)
-	if err != nil {
-		return
-	}
-	req.Header.Set("Authorization", "Bearer "+apiToken)
-	resp, err := http.DefaultClient.Do(req)
-	if err == nil {
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-		_ = resp.Body.Close()
-	}
 }
 
 func buildTunWGIpc(privateKeyB64, serverPublicKeyB64, endpoint string) (string, error) {

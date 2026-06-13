@@ -1,5 +1,3 @@
-//go:build linux
-
 package main
 
 import (
@@ -7,10 +5,12 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
 )
 
-func TestTunModeRegisterRequest(t *testing.T) {
+func TestDynamicPeerRegisterRequest(t *testing.T) {
 	var gotAuth, gotContentType string
 	var gotBody dynamicPeerRegisterRequest
 	srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
@@ -37,7 +37,7 @@ func TestTunModeRegisterRequest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp, err := tunModeRegister(context.Background(), srv.URL+"/", "sa-token", dynamicPeerRegisterRequest{
+	resp, err := dynamicPeerRegister(context.Background(), srv.URL+"/", "sa-token", dynamicPeerRegisterRequest{
 		Transport:          dynamicPeerTransportWireGuard,
 		Authorizer:         "agents",
 		WireGuardPublicKey: keyA,
@@ -67,19 +67,19 @@ func TestTunModeRegisterRequest(t *testing.T) {
 	}
 }
 
-func TestTunModeRegisterRejectsErrorStatus(t *testing.T) {
+func TestDynamicPeerRegisterRejectsErrorStatus(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
 		http.Error(rw, "namespace/serviceaccount/profile is not allowed", http.StatusForbidden)
 	}))
 	defer srv.Close()
-	if _, err := tunModeRegister(context.Background(), srv.URL, "sa-token", dynamicPeerRegisterRequest{
+	if _, err := dynamicPeerRegister(context.Background(), srv.URL, "sa-token", dynamicPeerRegisterRequest{
 		Transport: dynamicPeerTransportWireGuard, Authorizer: "agents", WireGuardPublicKey: keyA,
 	}); err == nil {
 		t.Fatal("expected error for non-200 status")
 	}
 }
 
-func TestTunModeRegisterRejectsIncompleteResponse(t *testing.T) {
+func TestDynamicPeerRegisterRejectsIncompleteResponse(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
 		// Valid transport but missing peer_ip / server_public_key / token.
 		_ = json.NewEncoder(rw).Encode(dynamicPeerRegisterResponse{
@@ -88,9 +88,39 @@ func TestTunModeRegisterRejectsIncompleteResponse(t *testing.T) {
 		})
 	}))
 	defer srv.Close()
-	if _, err := tunModeRegister(context.Background(), srv.URL, "sa-token", dynamicPeerRegisterRequest{
+	if _, err := dynamicPeerRegister(context.Background(), srv.URL, "sa-token", dynamicPeerRegisterRequest{
 		Transport: dynamicPeerTransportWireGuard, Authorizer: "agents", WireGuardPublicKey: keyA,
 	}); err == nil {
 		t.Fatal("expected error for incomplete response")
+	}
+}
+
+func TestGatherDynamicPeerClaimsKubernetes(t *testing.T) {
+	tokenPath := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(tokenPath, []byte("  sa-token-value\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("POD_NAME", "agent-1")
+	t.Setenv("POD_NAMESPACE", "agents")
+	t.Setenv("POD_UID", "uid-1")
+	t.Setenv("NODE_NAME", "kind-worker")
+
+	claims, cred, err := gatherDynamicPeerClaims(dynamicPeerAuthorizerKubernetesTokenRev, tokenPath)
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	if cred != "sa-token-value" {
+		t.Fatalf("credential = %q, want trimmed token", cred)
+	}
+	var got k8sDynamicPeerClaims
+	if err := json.Unmarshal(claims, &got); err != nil {
+		t.Fatalf("claims decode: %v", err)
+	}
+	if got.PodName != "agent-1" || got.PodNamespace != "agents" || got.PodUID != "uid-1" || got.NodeName != "kind-worker" {
+		t.Fatalf("claims = %+v", got)
+	}
+
+	if _, _, err := gatherDynamicPeerClaims("oidc", tokenPath); err == nil {
+		t.Fatal("expected error for unsupported authorizer type")
 	}
 }
