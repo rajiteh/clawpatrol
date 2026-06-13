@@ -1,6 +1,0 @@
-apiVersion: v1
-kind: Pod
-metadata:
-  name: clawpatrol-agent-example
-  namespace: agents
-$patch: delete

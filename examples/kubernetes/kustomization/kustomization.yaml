@@ -4,7 +4,19 @@ kind: Kustomization
 resources:
   - namespaces.yaml
   - gateway-rbac.yaml
-  - gateway-config.yaml
   - gateway-statefulset.yaml
   - gateway-services.yaml
   - agent.yaml
+
+# The gateway ConfigMap is generated from gateway.hcl so the example HCL is
+# the single source of truth — what `clawpatrol validate` checks is exactly
+# what deploys. Stable name (no hash suffix) keeps references + overlay
+# patches simple; the gateway is restarted explicitly on config changes.
+generatorOptions:
+  disableNameSuffixHash: true
+
+configMapGenerator:
+  - name: clawpatrol-config
+    namespace: clawpatrol
+    files:
+      - gateway.hcl

@@ -76,9 +76,12 @@ spec:
       command: ["/bin/sh", "-lc"]
       args:
         - |
+          # Wait for the sidecar to bring up the tunnel + write the handoff,
+          # source the gateway CA + credential env, then run your workload.
           while [ ! -f /clawpatrol/ready ]; do sleep 0.2; done
           . /clawpatrol/env
-          exec env | sort
+          echo "clawpatrol: tunnel ready; replace this with your agent command"
+          exec sleep infinity
       securityContext:
         allowPrivilegeEscalation: false
         runAsNonRoot: true

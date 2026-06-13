@@ -1,113 +1,73 @@
 #!/usr/bin/env bash
+# Kubernetes WireGuard dynamic-peer e2e against a local kind cluster.
+#
+# Builds the workspace into a kind-loaded image, applies the e2e kustomize
+# overlay (examples base + *-e2e isolation), and drives the full lifecycle:
+# register -> handoff -> restricted-agent contract -> tunnel data path ->
+# lease/peer tables -> heartbeat -> deregister/expiry -> peer revocation.
+#
+# The manifests are the source of truth (examples/kubernetes/kustomization +
+# e2e/kubernetes-wireguard-e2e-overlay); this script only builds the image,
+# applies the overlay, and asserts. It does not template YAML.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+OVERLAY="${ROOT}/e2e/kubernetes-wireguard-e2e-overlay"
+DOCKERFILE="${ROOT}/Dockerfile"
 
 CLUSTER_NAME="${CLAWPATROL_E2E_CLUSTER:-kind}"
 KUBE_CONTEXT="${CLAWPATROL_E2E_CONTEXT:-kind-${CLUSTER_NAME}}"
-DEFAULT_IMAGE="clawpatrol-kind-e2e:dev"
-DEFAULT_LEASE_TTL="30s"
-DEFAULT_GATEWAY_NS="clawpatrol-e2e"
-DEFAULT_AGENTS_NS="agents-e2e"
-DEFAULT_CLUSTER_ROLE_NAME="clawpatrol-tokenreview-e2e"
-IMAGE="${CLAWPATROL_E2E_IMAGE:-${DEFAULT_IMAGE}}"
-DOCKERFILE="${CLAWPATROL_E2E_DOCKERFILE:-Dockerfile}"
-E2E_OVERLAY="${CLAWPATROL_E2E_OVERLAY:-e2e/kubernetes-wireguard-e2e-overlay}"
 TIMEOUT="${CLAWPATROL_E2E_TIMEOUT:-180s}"
-LEASE_TTL="${CLAWPATROL_E2E_LEASE_TTL:-${DEFAULT_LEASE_TTL}}"
 SKIP_BUILD="${CLAWPATROL_E2E_SKIP_BUILD:-0}"
 KEEP_RESOURCES="${CLAWPATROL_E2E_KEEP_RESOURCES:-0}"
 CHECK_HEARTBEAT="${CLAWPATROL_E2E_CHECK_HEARTBEAT:-1}"
 CHECK_EXPIRY="${CLAWPATROL_E2E_CHECK_EXPIRY:-0}"
 GOARCH_OVERRIDE="${CLAWPATROL_E2E_GOARCH:-}"
-NAMESPACE_SUFFIX="${CLAWPATROL_E2E_NAMESPACE_SUFFIX:--e2e}"
-GATEWAY_NS="${CLAWPATROL_E2E_GATEWAY_NAMESPACE:-clawpatrol${NAMESPACE_SUFFIX}}"
-AGENTS_NS="${CLAWPATROL_E2E_AGENTS_NAMESPACE:-agents${NAMESPACE_SUFFIX}}"
-if [[ -n "${CLAWPATROL_E2E_CLUSTER_RESOURCE_SUFFIX+x}" ]]; then
-  CLUSTER_RESOURCE_SUFFIX="${CLAWPATROL_E2E_CLUSTER_RESOURCE_SUFFIX}"
-else
-  CLUSTER_RESOURCE_SUFFIX="${NAMESPACE_SUFFIX#-}"
-  [[ -n "${CLUSTER_RESOURCE_SUFFIX}" ]] || CLUSTER_RESOURCE_SUFFIX="e2e"
-fi
-if [[ -n "${CLUSTER_RESOURCE_SUFFIX}" ]]; then
-  CLUSTER_ROLE_NAME="clawpatrol-tokenreview-${CLUSTER_RESOURCE_SUFFIX}"
-else
-  CLUSTER_ROLE_NAME="clawpatrol-tokenreview"
-fi
 
-E2E_POD="clawpatrol-agent-e2e"
+# These are fixed by the overlay (images: transformer, namespaces, RBAC
+# names, gateway.hcl). Keep them in sync with the overlay if you change it.
+IMAGE="clawpatrol-kind-e2e:dev"
+GATEWAY_NS="clawpatrol-e2e"
+AGENTS_NS="agents-e2e"
+CLUSTER_ROLE_NAME="clawpatrol-tokenreview-e2e"
+E2E_POD="clawpatrol-agent-example"
 E2E_HTTP="clawpatrol-e2e-http"
-TMP_ROOT="${TMPDIR:-/tmp}"
-WORKDIR="$(mktemp -d "${TMP_ROOT%/}/clawpatrol-k8s-e2e.XXXXXX")"
-OVERLAY_DIR=""
 
 KUBECTL=(kubectl --context "${KUBE_CONTEXT}")
+WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/clawpatrol-k8s-e2e.XXXXXX")"
+
+# Lease TTL is read from the overlay config so the heartbeat wait stays in
+# sync with what the gateway actually enforces.
+LEASE_TTL="$(sed -n 's/.*lease_ttl[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "${OVERLAY}/gateway.hcl" | head -1)"
+LEASE_TTL="${LEASE_TTL:-30s}"
 
 usage() {
   cat <<'USAGE'
-Run the Kubernetes WireGuard dynamic-peer e2e flow against a local kind cluster.
+Run the Kubernetes WireGuard dynamic-peer e2e against a local kind cluster.
 
-Default invocation:
   ./e2e/kubernetes-wireguard-e2e.sh
 
 Environment knobs:
-  CLAWPATROL_E2E_CLUSTER        kind cluster name, default: kind
-  CLAWPATROL_E2E_CONTEXT        kubectl context, default: kind-${cluster}
-  CLAWPATROL_E2E_IMAGE          local image tag to build/load, default: clawpatrol-kind-e2e:dev
-  CLAWPATROL_E2E_DOCKERFILE     image Dockerfile, default: Dockerfile
-  CLAWPATROL_E2E_OVERLAY        e2e overlay, default: e2e/kubernetes-wireguard-e2e-overlay
-  CLAWPATROL_E2E_TIMEOUT        kubectl wait timeout, default: 180s
-  CLAWPATROL_E2E_LEASE_TTL      rendered gateway lease TTL, default: 30s
-  CLAWPATROL_E2E_NAMESPACE_SUFFIX namespace suffix, default: -e2e
-  CLAWPATROL_E2E_GATEWAY_NAMESPACE override gateway namespace, default: clawpatrol-e2e
-  CLAWPATROL_E2E_AGENTS_NAMESPACE override agent namespace, default: agents-e2e
-  CLAWPATROL_E2E_CLUSTER_RESOURCE_SUFFIX cluster role/binding suffix, default: e2e
-  CLAWPATROL_E2E_SKIP_BUILD     set 1 to skip go/docker build and kind load
-  CLAWPATROL_E2E_KEEP_RESOURCES set 1 to skip final namespace cleanup for debugging
-  CLAWPATROL_E2E_CHECK_HEARTBEAT set 0 to skip heartbeat advancement check
-  CLAWPATROL_E2E_CHECK_EXPIRY   set 1 to test TTL cleanup after deleting the sidecar forcefully
-  CLAWPATROL_E2E_GOARCH         override node architecture for the Linux build
+  CLAWPATROL_E2E_CLUSTER         kind cluster name, default: kind
+  CLAWPATROL_E2E_CONTEXT         kubectl context, default: kind-${cluster}
+  CLAWPATROL_E2E_TIMEOUT         kubectl wait timeout, default: 180s
+  CLAWPATROL_E2E_SKIP_BUILD      set 1 to skip go/docker build + kind load
+  CLAWPATROL_E2E_KEEP_RESOURCES  set 1 to skip final namespace cleanup
+  CLAWPATROL_E2E_CHECK_HEARTBEAT set 0 to skip the heartbeat advancement check
+  CLAWPATROL_E2E_CHECK_EXPIRY    set 1 to test TTL cleanup (force-delete sidecar)
+  CLAWPATROL_E2E_GOARCH          override node arch for the Linux build
+
+Image tag, namespaces, lease TTL, and RBAC names live in the overlay
+(e2e/kubernetes-wireguard-e2e-overlay); edit there, not here.
 USAGE
 }
 
-log() {
-  printf '[e2e] %s\n' "$*"
-}
-
+log() { printf '[e2e] %s\n' "$*"; }
 fail() {
   printf '[e2e] error: %s\n' "$*" >&2
   exit 1
 }
-
-need() {
-  command -v "$1" >/dev/null 2>&1 || fail "missing required command: $1"
-}
-
-sed_replacement_escape() {
-  printf '%s' "$1" | sed -e 's/[&|\\]/\\&/g'
-}
-
-render_overlay() {
-  local image gateway_ns agents_ns cluster_role_name lease_ttl
-  image="$(sed_replacement_escape "${IMAGE}")"
-  gateway_ns="$(sed_replacement_escape "${GATEWAY_NS}")"
-  agents_ns="$(sed_replacement_escape "${AGENTS_NS}")"
-  cluster_role_name="$(sed_replacement_escape "${CLUSTER_ROLE_NAME}")"
-  lease_ttl="$(sed_replacement_escape "${LEASE_TTL}")"
-
-  local file tmp
-  while IFS= read -r -d '' file; do
-    tmp="${file}.tmp"
-    sed \
-      -e "s|${DEFAULT_IMAGE}|${image}|g" \
-      -e "s|${DEFAULT_GATEWAY_NS}|${gateway_ns}|g" \
-      -e "s|${DEFAULT_AGENTS_NS}|${agents_ns}|g" \
-      -e "s|${DEFAULT_CLUSTER_ROLE_NAME}|${cluster_role_name}|g" \
-      -e "s|lease_ttl = \"${DEFAULT_LEASE_TTL}\"|lease_ttl = \"${lease_ttl}\"|g" \
-      "${file}" >"${tmp}"
-    mv "${tmp}" "${file}"
-  done < <(find "${OVERLAY_DIR}" -type f \( -name '*.yaml' -o -name '*.yml' \) -print0)
-}
+need() { command -v "$1" >/dev/null 2>&1 || fail "missing required command: $1"; }
 
 seconds_from_duration() {
   case "$1" in
@@ -119,10 +79,8 @@ seconds_from_duration() {
 }
 
 wait_until() {
-  local desc="$1"
-  local timeout_s="$2"
+  local desc="$1" timeout_s="$2"
   shift 2
-
   local deadline=$((SECONDS + timeout_s))
   until "$@"; do
     if (( SECONDS >= deadline )); then
@@ -141,15 +99,8 @@ cleanup_cluster() {
 
 on_exit() {
   local status=$?
-
-  if [[ "${KEEP_RESOURCES}" != "1" ]]; then
-    cleanup_cluster
-  fi
+  [[ "${KEEP_RESOURCES}" == "1" ]] || cleanup_cluster
   rm -rf "${WORKDIR}"
-  if [[ -n "${OVERLAY_DIR}" ]]; then
-    rm -rf "${OVERLAY_DIR}"
-  fi
-
   exit "${status}"
 }
 trap on_exit EXIT
@@ -168,24 +119,8 @@ if [[ "${SKIP_BUILD}" != "1" ]]; then
   need go
   need docker
 fi
-
-if [[ "${E2E_OVERLAY}" = /* ]]; then
-  E2E_OVERLAY_PATH="${E2E_OVERLAY}"
-else
-  E2E_OVERLAY_PATH="${ROOT}/${E2E_OVERLAY}"
-fi
-[[ -f "${E2E_OVERLAY_PATH}/kustomization.yaml" ]] || fail "e2e overlay not found: ${E2E_OVERLAY}"
-OVERLAY_PARENT="$(dirname "${E2E_OVERLAY_PATH}")"
-OVERLAY_DIR="$(mktemp -d "${OVERLAY_PARENT}/.e2e-runtime.XXXXXX")"
-cp -R "${E2E_OVERLAY_PATH}/." "${OVERLAY_DIR}/"
-render_overlay
-
-if [[ "${DOCKERFILE}" = /* ]]; then
-  DOCKERFILE_PATH="${DOCKERFILE}"
-else
-  DOCKERFILE_PATH="${ROOT}/${DOCKERFILE}"
-fi
-[[ -f "${DOCKERFILE_PATH}" ]] || fail "Dockerfile not found: ${DOCKERFILE}"
+[[ -f "${OVERLAY}/kustomization.yaml" ]] || fail "e2e overlay not found: ${OVERLAY}"
+[[ -f "${DOCKERFILE}" ]] || fail "Dockerfile not found: ${DOCKERFILE}"
 
 if ! kind get clusters | grep -Fxq "${CLUSTER_NAME}"; then
   fail "kind cluster ${CLUSTER_NAME} not found"
@@ -210,7 +145,7 @@ if [[ "${SKIP_BUILD}" != "1" ]]; then
   cp "${ROOT}/clawpatrol" "${WORKDIR}/clawpatrol"
 
   log "building image ${IMAGE}"
-  DOCKER_BUILDKIT=0 docker build --platform "linux/${GOARCH}" -f "${DOCKERFILE_PATH}" -t "${IMAGE}" "${WORKDIR}"
+  DOCKER_BUILDKIT=0 docker build --platform "linux/${GOARCH}" -f "${DOCKERFILE}" -t "${IMAGE}" "${WORKDIR}"
 
   log "loading image ${IMAGE} into kind cluster ${CLUSTER_NAME}"
   kind load docker-image "${IMAGE}" --name "${CLUSTER_NAME}"
@@ -218,196 +153,32 @@ else
   log "skipping image build/load; expecting ${IMAGE} to exist in kind"
 fi
 
-log "applying kustomization overlay into ${GATEWAY_NS}/${AGENTS_NS}"
-"${KUBECTL[@]}" apply -k "${OVERLAY_DIR}"
+log "applying e2e overlay into ${GATEWAY_NS}/${AGENTS_NS}"
+"${KUBECTL[@]}" apply -k "${OVERLAY}"
 "${KUBECTL[@]}" -n "${GATEWAY_NS}" rollout restart statefulset/clawpatrol-gateway
 
 log "waiting for gateway rollout"
 "${KUBECTL[@]}" -n "${GATEWAY_NS}" rollout status statefulset/clawpatrol-gateway --timeout="${TIMEOUT}"
 "${KUBECTL[@]}" -n "${GATEWAY_NS}" wait --for=condition=Ready pod -l app=clawpatrol-gateway --timeout="${TIMEOUT}"
 
-GATEWAY_POD="$("${KUBECTL[@]}" -n "${GATEWAY_NS}" get pod -l app=clawpatrol-gateway -o jsonpath='{.items[0].metadata.name}')"
-API_CLUSTER_IP="$("${KUBECTL[@]}" -n "${GATEWAY_NS}" get svc clawpatrol-api -o jsonpath='{.spec.clusterIP}')"
-GATEWAY_URL="http://${API_CLUSTER_IP}:8080"
+# The agent's sidecar registers once; recreate it now that the gateway is
+# ready so its first (and only) register attempt can't lose a startup race.
+log "recreating agent pod against the ready gateway"
+"${KUBECTL[@]}" -n "${AGENTS_NS}" delete pod "${E2E_POD}" --ignore-not-found --wait=true >/dev/null
+"${KUBECTL[@]}" apply -k "${OVERLAY}"
 
-cat >"${WORKDIR}/http-echo.yaml" <<EOF
-apiVersion: v1
-kind: Pod
-metadata:
-  name: ${E2E_HTTP}
-  namespace: ${AGENTS_NS}
-  labels:
-    app: ${E2E_HTTP}
-spec:
-  automountServiceAccountToken: false
-  restartPolicy: Never
-  containers:
-    - name: http
-      image: ${IMAGE}
-      imagePullPolicy: IfNotPresent
-      command: ["/bin/sh", "-lc"]
-      args:
-        - |
-          set -eu
-          while true; do
-            printf 'HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nok\n' | nc -l -p 8081 -q 1
-          done
-      ports:
-        - name: http
-          containerPort: 8081
-      securityContext:
-        allowPrivilegeEscalation: false
-        runAsNonRoot: true
-        runAsUser: 1000
-        runAsGroup: 1000
-        capabilities:
-          drop: ["ALL"]
-        seccompProfile:
-          type: RuntimeDefault
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: ${E2E_HTTP}
-  namespace: ${AGENTS_NS}
-spec:
-  selector:
-    app: ${E2E_HTTP}
-  ports:
-    - name: http
-      port: 8081
-      targetPort: http
-EOF
-
-log "creating e2e HTTP relay target"
-"${KUBECTL[@]}" -n "${AGENTS_NS}" delete pod "${E2E_HTTP}" --ignore-not-found --wait=true >/dev/null
-"${KUBECTL[@]}" -n "${AGENTS_NS}" delete service "${E2E_HTTP}" --ignore-not-found >/dev/null
-"${KUBECTL[@]}" apply -f "${WORKDIR}/http-echo.yaml"
 "${KUBECTL[@]}" -n "${AGENTS_NS}" wait --for=condition=Ready "pod/${E2E_HTTP}" --timeout="${TIMEOUT}"
+
+GATEWAY_POD="$("${KUBECTL[@]}" -n "${GATEWAY_NS}" get pod -l app=clawpatrol-gateway -o jsonpath='{.items[0].metadata.name}')"
 HTTP_CLUSTER_IP="$("${KUBECTL[@]}" -n "${AGENTS_NS}" get svc "${E2E_HTTP}" -o jsonpath='{.spec.clusterIP}')"
 
-cat >"${WORKDIR}/agent-e2e.yaml" <<EOF
-apiVersion: v1
-kind: Pod
-metadata:
-  name: ${E2E_POD}
-  namespace: ${AGENTS_NS}
-  labels:
-    clawpatrol.dev/profile: default
-spec:
-  serviceAccountName: agent-runner
-  automountServiceAccountToken: false
-  restartPolicy: Never
-  terminationGracePeriodSeconds: 20
-  volumes:
-    - name: clawpatrol
-      emptyDir: {}
-    - name: clawpatrol-token
-      projected:
-        sources:
-          - serviceAccountToken:
-              path: clawpatrol-token
-              audience: clawpatrol
-              expirationSeconds: 600
-    - name: dev-net-tun
-      hostPath:
-        path: /dev/net/tun
-        type: CharDevice
-  containers:
-    - name: wireguard-sidecar
-      image: ${IMAGE}
-      imagePullPolicy: IfNotPresent
-      args:
-        - run
-        - --tun
-        - --gateway-url=${GATEWAY_URL}
-        - --dynamic-peer-authorizer=kubernetes_token_review/agents
-        - --kubernetes-token-path=/var/run/secrets/tokens/clawpatrol-token
-        - --env-out=/clawpatrol/env
-        - --ca-out=/clawpatrol/ca.crt
-        - --ready-file=/clawpatrol/ready
-      securityContext:
-        allowPrivilegeEscalation: false
-        capabilities:
-          add: ["NET_ADMIN"]
-      env:
-        - name: POD_NAME
-          valueFrom:
-            fieldRef:
-              fieldPath: metadata.name
-        - name: POD_NAMESPACE
-          valueFrom:
-            fieldRef:
-              fieldPath: metadata.namespace
-        - name: POD_UID
-          valueFrom:
-            fieldRef:
-              fieldPath: metadata.uid
-        - name: NODE_NAME
-          valueFrom:
-            fieldRef:
-              fieldPath: spec.nodeName
-      volumeMounts:
-        - name: clawpatrol
-          mountPath: /clawpatrol
-        - name: clawpatrol-token
-          mountPath: /var/run/secrets/tokens
-          readOnly: true
-        - name: dev-net-tun
-          mountPath: /dev/net/tun
-    - name: agent
-      image: ${IMAGE}
-      imagePullPolicy: IfNotPresent
-      command: ["/bin/sh", "-lc"]
-      args:
-        - |
-          set -eu
-          while [ ! -f /clawpatrol/ready ]; do sleep 0.2; done
-          . /clawpatrol/env
-          env | sort | grep -E '^(AWS_CA_BUNDLE|CLAWPATROL|CURL_CA_BUNDLE|DENO_CERT|GIT_SSL_CAINFO|NODE_EXTRA_CA_CERTS|PIP_CERT|REQUESTS_CA_BUNDLE|SSL_CERT_FILE)=' || true
-          sleep 3600
-      securityContext:
-        allowPrivilegeEscalation: false
-        runAsNonRoot: true
-        runAsUser: 1000
-        runAsGroup: 1000
-        capabilities:
-          drop: ["ALL"]
-        seccompProfile:
-          type: RuntimeDefault
-      volumeMounts:
-        - name: clawpatrol
-          mountPath: /clawpatrol
-          readOnly: true
-EOF
+agent_exec() { "${KUBECTL[@]}" -n "${AGENTS_NS}" exec "${E2E_POD}" -c agent -- "$@"; }
+gateway_exec() { "${KUBECTL[@]}" -n "${GATEWAY_NS}" exec "${GATEWAY_POD}" -c gateway -- "$@"; }
+sqlite_query() { gateway_exec sqlite3 -cmd '.timeout 5000' /opt/clawpatrol/clawpatrol.db "$1"; }
 
-log "creating e2e agent pod"
-"${KUBECTL[@]}" -n "${AGENTS_NS}" delete pod "${E2E_POD}" --ignore-not-found --wait=true >/dev/null
-"${KUBECTL[@]}" apply -f "${WORKDIR}/agent-e2e.yaml"
-
-agent_exec() {
-  "${KUBECTL[@]}" -n "${AGENTS_NS}" exec "${E2E_POD}" -c agent -- "$@"
-}
-
-gateway_exec() {
-  "${KUBECTL[@]}" -n "${GATEWAY_NS}" exec "${GATEWAY_POD}" -c gateway -- "$@"
-}
-
-sqlite_query() {
-  gateway_exec sqlite3 -cmd '.timeout 5000' /opt/clawpatrol/clawpatrol.db "$1"
-}
-
-lease_count() {
-  sqlite_query "SELECT count(*) FROM dynamic_peer_leases WHERE display_name = '${AGENTS_NS}/${E2E_POD}';" 2>/dev/null
-}
-
-lease_present() {
-  [[ "$(lease_count || printf '0')" -ge 1 ]]
-}
-
-lease_absent() {
-  [[ "$(lease_count || printf '1')" -eq 0 ]]
-}
+lease_count() { sqlite_query "SELECT count(*) FROM dynamic_peer_leases WHERE display_name = '${AGENTS_NS}/${E2E_POD}';" 2>/dev/null; }
+lease_present() { [[ "$(lease_count || printf '0')" -ge 1 ]]; }
+lease_absent() { [[ "$(lease_count || printf '1')" -eq 0 ]]; }
 
 log "waiting for sidecar handoff files"
 wait_until "sidecar wrote ready/env/ca files" 120 \
@@ -438,9 +209,7 @@ log "registered peer ${PEER_IP}"
 if [[ "${CHECK_HEARTBEAT}" == "1" ]]; then
   TTL_SECONDS="$(seconds_from_duration "${LEASE_TTL}")"
   SLEEP_SECONDS=$(( TTL_SECONDS / 2 + 7 ))
-  if (( SLEEP_SECONDS < 8 )); then
-    SLEEP_SECONDS=8
-  fi
+  (( SLEEP_SECONDS >= 8 )) || SLEEP_SECONDS=8
   BEFORE_HEARTBEAT="$(sqlite_query "SELECT last_heartbeat_ns FROM dynamic_peer_leases WHERE peer_ip = '${PEER_IP}';")"
   log "waiting ${SLEEP_SECONDS}s for heartbeat"
   sleep "${SLEEP_SECONDS}"
