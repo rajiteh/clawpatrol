@@ -1,9 +1,10 @@
-# Canonical dynamic-peer gateway config — the maintained example for the
-# Kubernetes WireGuard setup. The base kustomization mounts this verbatim as
-# the clawpatrol-config ConfigMap (configMapGenerator), so this file is the
-# single source of truth: what CI validates (`clawpatrol validate`) is what
-# gets deployed. It is also a complete, standalone config you can run with
-# `clawpatrol gateway examples/kubernetes/kustomization/gateway.hcl`.
+# WireGuard dynamic peers for Kubernetes agent pods.
+#
+# The gateway runs the userspace WireGuard server. Agent pods run a
+# privileged `clawpatrol run --tun` sidecar that self-registers with
+# the `kubernetes_token_review` authorizer while the execution
+# container stays restricted.
+
 gateway {
   dashboard_listen = "0.0.0.0:8080"
   state_dir        = "/opt/clawpatrol"
