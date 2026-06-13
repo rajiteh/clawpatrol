@@ -257,6 +257,51 @@ func TestRegisterDynamicPeerRollbackOnPersistFailure(t *testing.T) {
 	}
 }
 
+func TestApiDynamicPeerList(t *testing.T) {
+	g := newDynamicPeerTestGateway(t)
+	w := &webMux{g: g}
+
+	seedLease(t, g, "10.55.0.2", "kubernetes:agents:uid-1", "kubernetes:agents:agent-1", keyA, time.Now().Add(time.Minute))
+	seedLease(t, g, "10.55.0.3", "kubernetes:agents:uid-2", "kubernetes:agents:agent-2", keyB, time.Now().Add(-time.Minute))
+
+	postRec := httptest.NewRecorder()
+	w.apiDynamicPeerList(postRec, httptest.NewRequest(http.MethodPost, "/api/dynamic-peers", nil))
+	if postRec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("POST -> %d, want 405", postRec.Code)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/dynamic-peers", nil)
+	rec := httptest.NewRecorder()
+	w.apiDynamicPeerList(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET -> %d, want 200", rec.Code)
+	}
+	var views []dynamicPeerLeaseView
+	if err := json.NewDecoder(rec.Body).Decode(&views); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(views) != 2 {
+		t.Fatalf("want 2 leases, got %d", len(views))
+	}
+	byIP := map[string]dynamicPeerLeaseView{}
+	for _, v := range views {
+		byIP[v.PeerIP] = v
+	}
+	live := byIP["10.55.0.2"]
+	if live.Profile != "default" || live.Expired || live.PublicKey != keyA {
+		t.Fatalf("unexpected live lease view %+v", live)
+	}
+	if live.DisplayName != "agents/x" || live.AuthorizerType != dynamicPeerAuthorizerKubernetesTokenRev {
+		t.Fatalf("unexpected lease metadata %+v", live)
+	}
+	if live.ExpiresAt == 0 || live.CreatedAt == "" || live.LastHeartbeat == "" {
+		t.Fatalf("missing timestamps %+v", live)
+	}
+	if !byIP["10.55.0.3"].Expired {
+		t.Fatal("expected expired flag for 10.55.0.3")
+	}
+}
+
 func enabledDynamicPeersCfg() *config.Gateway {
 	return &config.Gateway{Settings: &config.GatewaySettings{
 		WireGuard: &config.WireGuardBlock{

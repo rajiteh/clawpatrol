@@ -98,6 +98,27 @@ type dynamicPeerLease struct {
 	LastHeartbeatNS    int64
 }
 
+// dynamicPeerLeaseView is the dashboard-facing shape of a lease. Times
+// are rendered for the UI's format helpers: ExpiresAt is Unix seconds
+// (fmtExpiry), LastHeartbeat and CreatedAt are RFC3339 strings (fmtAge /
+// fmtDateTime).
+type dynamicPeerLeaseView struct {
+	PeerIP         string            `json:"peer_ip"`
+	Transport      string            `json:"transport"`
+	AuthorizerType string            `json:"authorizer_type"`
+	AuthorizerName string            `json:"authorizer_name"`
+	SubjectKey     string            `json:"subject_key"`
+	DisplayName    string            `json:"display_name"`
+	Owner          string            `json:"owner"`
+	Profile        string            `json:"profile"`
+	PublicKey      string            `json:"public_key,omitempty"`
+	Metadata       map[string]string `json:"metadata,omitempty"`
+	ExpiresAt      int64             `json:"expires_at"`
+	LastHeartbeat  string            `json:"last_heartbeat"`
+	CreatedAt      string            `json:"created_at"`
+	Expired        bool              `json:"expired"`
+}
+
 var (
 	dynamicPeerLeaseSweepInterval = 30 * time.Second
 	errDynamicPeerConflict        = errors.New("dynamic peer conflict")
@@ -224,6 +245,65 @@ func (w *webMux) apiDynamicPeerDelete(rw http.ResponseWriter, r *http.Request) {
 	}
 	w.g.cleanupDynamicPeerLeaseByIPLocked(context.Background(), peerIP)
 	rw.WriteHeader(http.StatusNoContent)
+}
+
+// apiDynamicPeerList is the dashboard read endpoint: it lists every
+// dynamic-peer lease (live and not-yet-swept expired) for operator
+// observability. Unlike register/heartbeat it is not gated on the
+// feature flag — leases can still be draining after the feature is
+// turned off, and an empty list is a fine answer when it's never been on.
+func (w *webMux) apiDynamicPeerList(rw http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(rw, http.MethodGet, http.StatusMethodNotAllowed)
+		return
+	}
+	views, err := w.g.listDynamicPeerLeaseViews()
+	if err != nil {
+		http.Error(rw, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(rw, views)
+}
+
+func (g *Gateway) listDynamicPeerLeaseViews() ([]dynamicPeerLeaseView, error) {
+	rows, err := g.db.Query(`
+		SELECT peer_ip, transport, authorizer_type, authorizer_name, subject_key,
+		       display_name, owner, profile, wireguard_public_key, metadata_json,
+		       expires_ns, last_heartbeat_ns, created_ns
+		FROM dynamic_peer_leases
+		ORDER BY created_ns DESC
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	nowNS := time.Now().UTC().UnixNano()
+	views := []dynamicPeerLeaseView{}
+	for rows.Next() {
+		var (
+			v           dynamicPeerLeaseView
+			pubKey      sql.NullString
+			metaJSON    string
+			expiresNS   int64
+			heartbeatNS int64
+			createdNS   int64
+		)
+		if err := rows.Scan(&v.PeerIP, &v.Transport, &v.AuthorizerType, &v.AuthorizerName,
+			&v.SubjectKey, &v.DisplayName, &v.Owner, &v.Profile, &pubKey, &metaJSON,
+			&expiresNS, &heartbeatNS, &createdNS); err != nil {
+			return nil, err
+		}
+		v.PublicKey = pubKey.String
+		if metaJSON != "" && metaJSON != "{}" {
+			_ = json.Unmarshal([]byte(metaJSON), &v.Metadata)
+		}
+		v.ExpiresAt = expiresNS / int64(time.Second)
+		v.LastHeartbeat = time.Unix(0, heartbeatNS).UTC().Format(time.RFC3339Nano)
+		v.CreatedAt = time.Unix(0, createdNS).UTC().Format(time.RFC3339Nano)
+		v.Expired = expiresNS <= nowNS
+		views = append(views, v)
+	}
+	return views, rows.Err()
 }
 
 func (g *Gateway) dynamicPeerAuthorizerFor(cfg *config.Gateway, transport, name string) (dynamicPeerAuthorizer, error) {
