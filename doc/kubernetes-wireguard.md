@@ -132,6 +132,31 @@ projected:
 The agent entrypoint should wait for `/clawpatrol/ready`, then source
 `/clawpatrol/env` before starting the actual workload.
 
+## Example Deployment
+
+The Kubernetes example is a Kustomize base:
+
+```bash
+kubectl apply -k examples/kubernetes/kustomization
+```
+
+The example creates the `clawpatrol` gateway namespace and the `agents`
+workload namespace, plus the minimal TokenReview and pod-read RBAC.
+
+The local e2e overlay is checked in separately and patches the base to use
+isolated `*-e2e` namespaces, the local kind image tag, and a shorter lease:
+
+```bash
+kubectl kustomize e2e/kubernetes-wireguard-e2e-overlay
+```
+
+For a local kind validation run that builds the current workspace image,
+uses that e2e overlay, and cleans up after itself:
+
+```bash
+./e2e/kubernetes-wireguard-e2e.sh
+```
+
 ## Cleanup
 
 Kubernetes pod peers are transient. The sidecar sends

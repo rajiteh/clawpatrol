@@ -1,4 +1,14 @@
+# WireGuard dynamic peers for Kubernetes agent pods.
+#
+# The gateway runs the userspace WireGuard server. Agent pods run a
+# privileged `clawpatrol run --tun` sidecar that self-registers with
+# the `kubernetes_token_review` authorizer while the execution
+# container stays restricted.
+
 gateway {
+  dashboard_listen = "0.0.0.0:8080"
+  state_dir        = "/opt/clawpatrol"
+
   wireguard {
     subnet_cidr = "10.55.0.0/24"
     listen_port = 51820
@@ -20,4 +30,8 @@ gateway {
       }
     }
   }
+}
+
+profile "default" {
+  credentials = []
 }

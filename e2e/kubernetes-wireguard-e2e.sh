@@ -5,11 +5,16 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 CLUSTER_NAME="${CLAWPATROL_E2E_CLUSTER:-kind}"
 KUBE_CONTEXT="${CLAWPATROL_E2E_CONTEXT:-kind-${CLUSTER_NAME}}"
-IMAGE="${CLAWPATROL_E2E_IMAGE:-clawpatrol-kind-e2e:dev}"
+DEFAULT_IMAGE="clawpatrol-kind-e2e:dev"
+DEFAULT_LEASE_TTL="30s"
+DEFAULT_GATEWAY_NS="clawpatrol-e2e"
+DEFAULT_AGENTS_NS="agents-e2e"
+DEFAULT_CLUSTER_ROLE_NAME="clawpatrol-tokenreview-e2e"
+IMAGE="${CLAWPATROL_E2E_IMAGE:-${DEFAULT_IMAGE}}"
 DOCKERFILE="${CLAWPATROL_E2E_DOCKERFILE:-Dockerfile}"
-MANIFEST="${CLAWPATROL_E2E_MANIFEST:-examples/kubernetes-wireguard.yaml}"
+E2E_OVERLAY="${CLAWPATROL_E2E_OVERLAY:-e2e/kubernetes-wireguard-e2e-overlay}"
 TIMEOUT="${CLAWPATROL_E2E_TIMEOUT:-180s}"
-LEASE_TTL="${CLAWPATROL_E2E_LEASE_TTL:-30s}"
+LEASE_TTL="${CLAWPATROL_E2E_LEASE_TTL:-${DEFAULT_LEASE_TTL}}"
 SKIP_BUILD="${CLAWPATROL_E2E_SKIP_BUILD:-0}"
 KEEP_RESOURCES="${CLAWPATROL_E2E_KEEP_RESOURCES:-0}"
 CHECK_HEARTBEAT="${CLAWPATROL_E2E_CHECK_HEARTBEAT:-1}"
@@ -34,6 +39,7 @@ E2E_POD="clawpatrol-agent-e2e"
 E2E_HTTP="clawpatrol-e2e-http"
 TMP_ROOT="${TMPDIR:-/tmp}"
 WORKDIR="$(mktemp -d "${TMP_ROOT%/}/clawpatrol-k8s-e2e.XXXXXX")"
+OVERLAY_DIR=""
 
 KUBECTL=(kubectl --context "${KUBE_CONTEXT}")
 
@@ -42,14 +48,14 @@ usage() {
 Run the Kubernetes WireGuard dynamic-peer e2e flow against a local kind cluster.
 
 Default invocation:
-  ./examples/kubernetes-wireguard-e2e.sh
+  ./e2e/kubernetes-wireguard-e2e.sh
 
 Environment knobs:
   CLAWPATROL_E2E_CLUSTER        kind cluster name, default: kind
   CLAWPATROL_E2E_CONTEXT        kubectl context, default: kind-${cluster}
   CLAWPATROL_E2E_IMAGE          local image tag to build/load, default: clawpatrol-kind-e2e:dev
   CLAWPATROL_E2E_DOCKERFILE     image Dockerfile, default: Dockerfile
-  CLAWPATROL_E2E_MANIFEST       base manifest, default: examples/kubernetes-wireguard.yaml
+  CLAWPATROL_E2E_OVERLAY        e2e overlay, default: e2e/kubernetes-wireguard-e2e-overlay
   CLAWPATROL_E2E_TIMEOUT        kubectl wait timeout, default: 180s
   CLAWPATROL_E2E_LEASE_TTL      rendered gateway lease TTL, default: 30s
   CLAWPATROL_E2E_NAMESPACE_SUFFIX namespace suffix, default: -e2e
@@ -77,6 +83,32 @@ need() {
   command -v "$1" >/dev/null 2>&1 || fail "missing required command: $1"
 }
 
+sed_replacement_escape() {
+  printf '%s' "$1" | sed -e 's/[&|\\]/\\&/g'
+}
+
+render_overlay() {
+  local image gateway_ns agents_ns cluster_role_name lease_ttl
+  image="$(sed_replacement_escape "${IMAGE}")"
+  gateway_ns="$(sed_replacement_escape "${GATEWAY_NS}")"
+  agents_ns="$(sed_replacement_escape "${AGENTS_NS}")"
+  cluster_role_name="$(sed_replacement_escape "${CLUSTER_ROLE_NAME}")"
+  lease_ttl="$(sed_replacement_escape "${LEASE_TTL}")"
+
+  local file tmp
+  while IFS= read -r -d '' file; do
+    tmp="${file}.tmp"
+    sed \
+      -e "s|${DEFAULT_IMAGE}|${image}|g" \
+      -e "s|${DEFAULT_GATEWAY_NS}|${gateway_ns}|g" \
+      -e "s|${DEFAULT_AGENTS_NS}|${agents_ns}|g" \
+      -e "s|${DEFAULT_CLUSTER_ROLE_NAME}|${cluster_role_name}|g" \
+      -e "s|lease_ttl = \"${DEFAULT_LEASE_TTL}\"|lease_ttl = \"${lease_ttl}\"|g" \
+      "${file}" >"${tmp}"
+    mv "${tmp}" "${file}"
+  done < <(find "${OVERLAY_DIR}" -type f \( -name '*.yaml' -o -name '*.yml' \) -print0)
+}
+
 seconds_from_duration() {
   case "$1" in
     *s) printf '%s\n' "${1%s}" ;;
@@ -84,10 +116,6 @@ seconds_from_duration() {
     *h) printf '%s\n' "$(( ${1%h} * 3600 ))" ;;
     *) printf '30\n' ;;
   esac
-}
-
-sed_replacement_escape() {
-  printf '%s' "$1" | sed -e 's/[&|]/\\&/g'
 }
 
 wait_until() {
@@ -118,6 +146,9 @@ on_exit() {
     cleanup_cluster
   fi
   rm -rf "${WORKDIR}"
+  if [[ -n "${OVERLAY_DIR}" ]]; then
+    rm -rf "${OVERLAY_DIR}"
+  fi
 
   exit "${status}"
 }
@@ -138,7 +169,17 @@ if [[ "${SKIP_BUILD}" != "1" ]]; then
   need docker
 fi
 
-[[ -f "${MANIFEST}" ]] || fail "manifest not found: ${MANIFEST}"
+if [[ "${E2E_OVERLAY}" = /* ]]; then
+  E2E_OVERLAY_PATH="${E2E_OVERLAY}"
+else
+  E2E_OVERLAY_PATH="${ROOT}/${E2E_OVERLAY}"
+fi
+[[ -f "${E2E_OVERLAY_PATH}/kustomization.yaml" ]] || fail "e2e overlay not found: ${E2E_OVERLAY}"
+OVERLAY_PARENT="$(dirname "${E2E_OVERLAY_PATH}")"
+OVERLAY_DIR="$(mktemp -d "${OVERLAY_PARENT}/.e2e-runtime.XXXXXX")"
+cp -R "${E2E_OVERLAY_PATH}/." "${OVERLAY_DIR}/"
+render_overlay
+
 if [[ "${DOCKERFILE}" = /* ]]; then
   DOCKERFILE_PATH="${DOCKERFILE}"
 else
@@ -177,31 +218,9 @@ else
   log "skipping image build/load; expecting ${IMAGE} to exist in kind"
 fi
 
-IMAGE_ESCAPED="$(sed_replacement_escape "${IMAGE}")"
-LEASE_TTL_ESCAPED="$(sed_replacement_escape "${LEASE_TTL}")"
-GATEWAY_NS_ESCAPED="$(sed_replacement_escape "${GATEWAY_NS}")"
-AGENTS_NS_ESCAPED="$(sed_replacement_escape "${AGENTS_NS}")"
-CLUSTER_ROLE_NAME_ESCAPED="$(sed_replacement_escape "${CLUSTER_ROLE_NAME}")"
-sed \
-  -e "s|image: ghcr.io/denoland/clawpatrol:latest|image: ${IMAGE_ESCAPED}|g" \
-  -e "s|image: debian:stable-slim|image: ${IMAGE_ESCAPED}|g" \
-  -e "s|lease_ttl = \"2m\"|lease_ttl = \"${LEASE_TTL_ESCAPED}\"|g" \
-  -e "s|name: clawpatrol-tokenreview|name: ${CLUSTER_ROLE_NAME_ESCAPED}|g" \
-  -e "s|name: clawpatrol$|name: ${GATEWAY_NS_ESCAPED}|g" \
-  -e "s|name: agents$|name: ${AGENTS_NS_ESCAPED}|g" \
-  -e "s|namespace: clawpatrol$|namespace: ${GATEWAY_NS_ESCAPED}|g" \
-  -e "s|namespace: agents$|namespace: ${AGENTS_NS_ESCAPED}|g" \
-  -e "s|namespace       = \"agents\"|namespace       = \"${AGENTS_NS_ESCAPED}\"|g" \
-  -e "s|clawpatrol-wg.clawpatrol.svc|clawpatrol-wg.${GATEWAY_NS_ESCAPED}.svc|g" \
-  -e "s|clawpatrol-api.clawpatrol.svc|clawpatrol-api.${GATEWAY_NS_ESCAPED}.svc|g" \
-  "${MANIFEST}" >"${WORKDIR}/base.yaml"
-
-log "applying base manifest into ${GATEWAY_NS}/${AGENTS_NS}"
-"${KUBECTL[@]}" apply -f "${WORKDIR}/base.yaml"
+log "applying kustomization overlay into ${GATEWAY_NS}/${AGENTS_NS}"
+"${KUBECTL[@]}" apply -k "${OVERLAY_DIR}"
 "${KUBECTL[@]}" -n "${GATEWAY_NS}" rollout restart statefulset/clawpatrol-gateway
-
-log "removing sample agent pod so the e2e pod is the only dynamic peer"
-"${KUBECTL[@]}" -n "${AGENTS_NS}" delete pod clawpatrol-agent-example --ignore-not-found --wait=false >/dev/null
 
 log "waiting for gateway rollout"
 "${KUBECTL[@]}" -n "${GATEWAY_NS}" rollout status statefulset/clawpatrol-gateway --timeout="${TIMEOUT}"

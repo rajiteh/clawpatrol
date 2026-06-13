@@ -1,0 +1,154 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../examples/kubernetes/kustomization
+
+patches:
+  - path: delete-sample-agent.yaml
+  - target:
+      version: v1
+      kind: Namespace
+      name: clawpatrol
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: clawpatrol-e2e
+  - target:
+      version: v1
+      kind: Namespace
+      name: agents
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: agents-e2e
+  - target:
+      version: v1
+      kind: ServiceAccount
+      name: clawpatrol-gateway
+    patch: |-
+      - op: replace
+        path: /metadata/namespace
+        value: clawpatrol-e2e
+  - target:
+      version: v1
+      kind: ConfigMap
+      name: clawpatrol-config
+    patch: |-
+      - op: replace
+        path: /metadata/namespace
+        value: clawpatrol-e2e
+      - op: replace
+        path: /data/gateway.hcl
+        value: |
+          gateway {
+            dashboard_listen = "0.0.0.0:8080"
+            state_dir        = "/opt/clawpatrol"
+
+            wireguard {
+              subnet_cidr = "10.55.0.0/24"
+              listen_port = 51820
+              endpoint    = "clawpatrol-wg.clawpatrol-e2e.svc:51820"
+
+              dynamic_peers {
+                enabled   = true
+                lease_ttl = "30s"
+
+                authorizer "kubernetes_token_review" "agents" {
+                  audience      = "clawpatrol"
+                  profile_label = "clawpatrol.dev/profile"
+
+                  allow {
+                    namespace       = "agents-e2e"
+                    service_account = "agent-runner"
+                    profiles        = ["default"]
+                  }
+                }
+              }
+            }
+          }
+
+          profile "default" {
+            credentials = []
+          }
+  - target:
+      group: apps
+      version: v1
+      kind: StatefulSet
+      name: clawpatrol-gateway
+    patch: |-
+      - op: replace
+        path: /metadata/namespace
+        value: clawpatrol-e2e
+      - op: replace
+        path: /spec/template/spec/containers/0/image
+        value: clawpatrol-kind-e2e:dev
+  - target:
+      version: v1
+      kind: Service
+      name: clawpatrol-api
+    patch: |-
+      - op: replace
+        path: /metadata/namespace
+        value: clawpatrol-e2e
+  - target:
+      version: v1
+      kind: Service
+      name: clawpatrol-wg
+    patch: |-
+      - op: replace
+        path: /metadata/namespace
+        value: clawpatrol-e2e
+  - target:
+      group: rbac.authorization.k8s.io
+      version: v1
+      kind: ClusterRole
+      name: clawpatrol-tokenreview
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: clawpatrol-tokenreview-e2e
+  - target:
+      group: rbac.authorization.k8s.io
+      version: v1
+      kind: ClusterRoleBinding
+      name: clawpatrol-tokenreview
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: clawpatrol-tokenreview-e2e
+      - op: replace
+        path: /roleRef/name
+        value: clawpatrol-tokenreview-e2e
+      - op: replace
+        path: /subjects/0/namespace
+        value: clawpatrol-e2e
+  - target:
+      group: rbac.authorization.k8s.io
+      version: v1
+      kind: Role
+      name: clawpatrol-pod-reader
+    patch: |-
+      - op: replace
+        path: /metadata/namespace
+        value: agents-e2e
+  - target:
+      group: rbac.authorization.k8s.io
+      version: v1
+      kind: RoleBinding
+      name: clawpatrol-pod-reader
+    patch: |-
+      - op: replace
+        path: /metadata/namespace
+        value: agents-e2e
+      - op: replace
+        path: /subjects/0/namespace
+        value: clawpatrol-e2e
+  - target:
+      version: v1
+      kind: ServiceAccount
+      name: agent-runner
+    patch: |-
+      - op: replace
+        path: /metadata/namespace
+        value: agents-e2e

@@ -83,7 +83,9 @@ were removed rather than aliased.
   - `doc/kubernetes-wireguard.md`
   - `doc/wireguard.md`
   - `doc/README.md`
-  - `examples/kubernetes-wireguard.yaml`
+  - `examples/kubernetes/kustomization/`
+  - `e2e/kubernetes-wireguard-e2e.sh`
+  - `e2e/kubernetes-wireguard-e2e-overlay/`
   - `site/doc/config-reference.md`
 
 ## Current Public API
