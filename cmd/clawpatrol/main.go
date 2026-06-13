@@ -358,8 +358,10 @@ type Gateway struct {
 	hitl          *HITLRegistry
 	onboard       *onboardRegistry
 	dynamicPeerMu sync.Mutex
-	// k8sVerifier is nil in production until the first request, when a
-	// stdlib in-cluster Kubernetes client is built. Tests inject fakes.
+	// k8sVerifier lets tests inject a fake Kubernetes verifier. In
+	// production it stays nil and each register request builds a
+	// short-lived in-cluster client, which re-reads the rotating
+	// ServiceAccount token, so there is nothing to cache here.
 	k8sVerifier k8sRegistrationVerifier
 	// secrets hands credential plugins the secret bytes they inject
 	// at request time. gatewaySecretStore stacks the credential_secrets
@@ -3112,8 +3114,12 @@ func runGateway(args []string) {
 			log.Fatalf("wireguard: %v", err)
 		}
 		setWGServer(wg)
+		// Always run the lease sweeper once WireGuard is up. Dynamic peers
+		// can be turned on by a later config reload, and any leases left
+		// behind must keep draining even after the feature is turned off.
+		// The sweep is a cheap no-op while the table is empty.
+		go g.startDynamicPeerLeaseSweeper(context.Background())
 		if cfg.IsWireGuardDynamicPeersEnabled() {
-			go g.startDynamicPeerLeaseSweeper(context.Background())
 			log.Printf("wireguard dynamic peers: enabled")
 		}
 		dashMux := newWebMux(g, cfg.Join(), cfg.PublicURL())

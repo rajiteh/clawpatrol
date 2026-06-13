@@ -210,6 +210,14 @@ func (w *webMux) apiDynamicPeerDelete(rw http.ResponseWriter, r *http.Request) {
 	}
 	w.g.dynamicPeerMu.Lock()
 	defer w.g.dynamicPeerMu.Unlock()
+	// Only a peer that actually holds a dynamic-peer lease may drive this
+	// teardown. A regular onboarded device can also carry a peer API token;
+	// without this guard it could revoke its own WireGuard peer and forget
+	// its device row by hitting the dynamic-peer delete path.
+	if _, err := w.g.dynamicPeerLeaseByIP(peerIP); err != nil {
+		http.NotFound(rw, r)
+		return
+	}
 	w.g.cleanupDynamicPeerLeaseByIPLocked(context.Background(), peerIP)
 	rw.WriteHeader(http.StatusNoContent)
 }
@@ -285,15 +293,23 @@ func (g *Gateway) registerDynamicPeer(ctx context.Context, cfg *config.Gateway, 
 		samePub := lease.WireGuardPublicKey == pubHex
 
 		switch {
-		case sameSubject && samePub:
+		case sameSubject:
+			// The authenticated subject already owns a lease — typically a
+			// sidecar that restarted in-place (same pod UID) with a freshly
+			// generated WireGuard key. Reuse its IP and let the transport
+			// install the new key (AddPeer evicts the stale pubkey on that
+			// IP). Same-subject is never a conflict: the identity was just
+			// re-verified by the authorizer, so it owns this slot regardless
+			// of whether the key rotated or the old lease expired.
 			reuseIP = lease.PeerIP
-		case sameSubject && !samePub && !expired:
-			return dynamicPeerRegisterResponse{}, fmt.Errorf("%w: live subject already registered with a different wireguard public key", errDynamicPeerConflict)
-		case sameReplacement && !sameSubject:
+		case sameReplacement:
+			// Same logical workload, different instance (e.g. a pod recreated
+			// under the same name with a new UID). Retire the previous
+			// instance's lease before the new one takes over.
 			g.cleanupDynamicPeerLeaseByIPLocked(ctx, lease.PeerIP)
 		case samePub && !expired:
 			return dynamicPeerRegisterResponse{}, fmt.Errorf("%w: wireguard public key is already registered to another live dynamic peer", errDynamicPeerConflict)
-		case expired:
+		case samePub && expired:
 			g.cleanupDynamicPeerLeaseByIPLocked(ctx, lease.PeerIP)
 		}
 	}
@@ -302,6 +318,17 @@ func (g *Gateway) registerDynamicPeer(ctx context.Context, cfg *config.Gateway, 
 	if err != nil {
 		return dynamicPeerRegisterResponse{}, err
 	}
+	// Until the lease is committed, roll back the transport + token state on
+	// any failure. Otherwise a partial register leaks a wg_peers row and an
+	// API token with no lease behind them, and the sweeper only reclaims IPs
+	// that still have a lease row.
+	committed := false
+	defer func() {
+		if !committed {
+			transport.Revoke(ctx, session.PeerIP)
+			deletePeerAPITokensForIP(g.db, session.PeerIP)
+		}
+	}()
 
 	deletePeerAPITokensForIP(g.db, session.PeerIP)
 	apiToken, err := mintAndPersistPeerAPIToken(g.db, session.PeerIP)
@@ -334,6 +361,7 @@ func (g *Gateway) registerDynamicPeer(ctx context.Context, cfg *config.Gateway, 
 	}); err != nil {
 		return dynamicPeerRegisterResponse{}, err
 	}
+	committed = true
 	if g.onboard != nil {
 		g.onboard.AssignProfile(session.PeerIP, identity.Profile)
 		g.onboard.SetOwner(session.PeerIP, identity.Owner)
