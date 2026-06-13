@@ -172,63 +172,66 @@ For Kubernetes:
 - The sidecar still requires `NET_ADMIN` and `/dev/net/tun`; the agent
   execution container remains unprivileged.
 
-## Validation Already Run
+## Delivery status
 
-Passed:
+Merged into `feat-dynamic-peers`:
 
-```bash
-mise exec -- gofmt -l .
-mise exec -- env GOCACHE=/tmp/clawpatrol-go-cache GOFLAGS=-mod=readonly go test ./...
-ruby -e 'require "yaml"; docs = YAML.load_stream(File.read("examples/kubernetes-wireguard.yaml")); abort "no docs" if docs.empty?; puts "parsed #{docs.size} Kubernetes documents"'
-```
+- Core generic dynamic-peer architecture (above), with tests.
+- Correctness hardening:
+  - Delete requires an existing lease — a regular onboarded peer that holds
+    a peer API token can no longer revoke its own WireGuard peer / forget
+    its device via the dynamic-peer delete path. Delete maps only
+    `sql.ErrNoRows` → 404; other DB errors → 500.
+  - Same-subject re-registration reuses the IP and swaps the key instead of
+    conflicting, so a sidecar that restarts with a fresh key is not locked
+    out until the old lease expires.
+  - Register rolls back the transport peer + API token if lease persistence
+    fails (no orphaned `wg_peers` row / token).
+  - The lease sweeper always runs once WireGuard is up, so leases keep
+    draining across config reloads / after the feature is disabled.
+  - Onboarding and dynamic-peer IP allocation share one lock.
+- Single-replica WireGuard caveat documented (see Limitations).
 
-The YAML parse reported 13 Kubernetes documents.
+In review (stacked PRs):
 
-Blocked:
+- Dashboard observability — `GET /api/dynamic-peers` plus a "Dynamic peers"
+  page listing peer / profile / authorizer / heartbeat / expiry / status.
+- CLI — `k8s-sidecar` replaced by `clawpatrol run --tun
+  --dynamic-peer-authorizer <type>/<name>`. The transport-agnostic
+  dynamic-peer client core (`cmd/clawpatrol/dynamic_peer_client.go`) and
+  `newWGTransportFromConf` were extracted to pre-stage the gVisor path.
 
-```bash
-mise exec -- kubectl apply --dry-run=client --validate=false -f examples/kubernetes-wireguard.yaml
-mise exec -- kubectl get namespace clawpatrol agents
-```
+Verification reality for the dev environment: Go is available (module proxy
+allowlisted) but there is **no `deno` and no `mise`** (`mise.run` /
+`deno.land` return 403) and **no reachable kind cluster**. So Go
+builds/tests run locally; the dashboard `deno task format:check` + SPA build
+and any `kubectl` validation must run in CI or a real cluster.
 
-Both failed because the configured kind API endpoint was unreachable:
+## Next steps
 
-```text
-The connection to the server 127.0.0.1:33137 was refused
-```
+1. **Unprivileged gVisor dynamic-peer `run`** — the main follow-up.
+   `clawpatrol run --dynamic-peer-authorizer <type>/<name> -- <cmd>` with no
+   `--tun`: a single unprivileged container that self-registers and routes a
+   wrapped child through the existing gVisor netstack (no `NET_ADMIN`/TUN).
+   Design: build a **session-scoped** transport with `newWGTransportFromConf`
+   from the registration result and run the gVisor forwarder
+   (`startTunBridge` / `enableTransportTCPForwarder`) **in-process**,
+   bypassing the per-host singleton daemon (identity is ephemeral and
+   lease-bound). Reuse the shared client core for register / heartbeat /
+   deregister. Today this combo errors (`--dynamic-peer-authorizer` requires
+   `--tun`). Needs a real cluster to verify end-to-end.
 
-This failure occurred both inside the sandbox and after escalation, so the
-blocker appears to be the local kind cluster/API server state rather than the
-manifest changes.
+2. **End-to-end / kind validation** (intentionally deferred to last).
+   Bring up a kind cluster, `kubectl apply` the example manifest, and verify
+   the full register → heartbeat → lease-expiry/revocation → graceful
+   deregister cycle for an agent pod. The earlier kind blocker was an
+   unreachable API server, not the manifest.
 
-## Next Session Checklist
+3. **Config-time profile cross-check** (minor). `allow { profiles = [...] }`
+   is validated against declared policy profiles only at register time
+   (`dynamicPeerProfileExists`); a compile-time cross-check would fail fast
+   on a typo, if the validator can reach the policy profile set.
 
-1. Confirm whether the kind cluster should be restarted or recreated.
-2. Re-run:
-
-   ```bash
-   mise exec -- kubectl get namespace clawpatrol agents
-   mise exec -- kubectl apply --dry-run=client --validate=false -f examples/kubernetes-wireguard.yaml
-   ```
-
-3. Consider adding broader tests for:
-   - `apiDynamicPeerRegister` request routing and response shape.
-   - register conflict cases with fake authorizer and fake transport.
-   - sidecar HTTP request construction for `claims`.
-   - malformed `transport` and missing `authorizer` API requests.
-4. Check git staging before committing. The worktree had pre-existing staged
-   additions from the first Kubernetes implementation. Use `git add -A` if the
-   intent is to commit the final dynamic-peer shape.
-
-## Files To Revisit
-
-- `cmd/clawpatrol/dynamic_peers.go`
-- `cmd/clawpatrol/k8s_sidecar_linux.go`
-- `internal/config/config.go`
-- `internal/config/dump.go`
-- `internal/config/compile_test.go`
-- `cmd/clawpatrol/k8s_registration_test.go`
-- `cmd/clawpatrol/migrations/sqlite/0020_dynamic_peer_leases.sql`
-- `examples/kubernetes-wireguard.yaml`
-- `doc/kubernetes-wireguard.md`
-- `site/doc/config-reference.md`
+4. **Confirm `apiConfigApply` reload semantics** (minor). The always-on
+   sweeper covers both restart and hot-reload, but the exact reload behavior
+   was never traced — document it.
