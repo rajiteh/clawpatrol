@@ -583,6 +583,10 @@ func (t *wireguardDynamicPeerTransport) Revoke(_ context.Context, peerIP string)
 	}
 }
 
+// allocateWGPeerMu serializes WireGuard /32 allocation across both the
+// dashboard onboarding path (wireguardOnboarder.allocateIP) and dynamic
+// peer registration, so two concurrent allocations can't read the same
+// free slot from wg_peers and hand out a duplicate IP.
 var allocateWGPeerMu sync.Mutex
 
 func allocateWGPeerIP(ts JoinConfig) (string, error) {
