@@ -4,7 +4,9 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"net/netip"
 	"os"
+	"strconv"
 	"strings"
 )
 
@@ -54,9 +56,22 @@ func tunModeRequested(args []string) bool {
 		if !strings.HasPrefix(a, "-") {
 			continue
 		}
-		name := strings.TrimLeft(a, "-")
-		name, _, _ = strings.Cut(name, "=")
-		if name == "tun" || name == "dynamic-peer-authorizer" {
+		name, value, hasValue := strings.Cut(strings.TrimLeft(a, "-"), "=")
+		switch name {
+		case "tun":
+			// Honor an explicit boolean value so `run --tun=false -- <cmd>`
+			// stays on the normal (gVisor) path instead of dispatching here
+			// and erroring. A bare `--tun` means true; an unparseable value
+			// is left for the flag parser to reject.
+			if !hasValue {
+				return true
+			}
+			b, err := strconv.ParseBool(value)
+			if err != nil || b {
+				return true
+			}
+			// explicit false → not requested
+		case "dynamic-peer-authorizer":
 			return true
 		}
 	}
@@ -107,6 +122,24 @@ func runTunMode(args []string) {
 		fmt.Fprintf(os.Stderr, "clawpatrol run --tun: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// preferV4 returns the first IPv4 address (unmapped), falling back to the
+// first address of any family when there is no IPv4. The tun-mode sidecar
+// pins IPv4 host routes by default and the gateway WireGuard endpoint is
+// reached over IPv4 in typical clusters; dialing an IPv6 endpoint while only
+// IPv4 is route-pinned would blackhole the handshake once the default route
+// flips to the tunnel.
+func preferV4(ips []netip.Addr) (netip.Addr, bool) {
+	if len(ips) == 0 {
+		return netip.Addr{}, false
+	}
+	for _, ip := range ips {
+		if ip.Unmap().Is4() {
+			return ip.Unmap(), true
+		}
+	}
+	return ips[0].Unmap(), true
 }
 
 // parseDynamicPeerAuthorizer splits the `<type>/<name>` value, mirroring the
