@@ -8,9 +8,10 @@ build: dashboard
 # kustomize configMapGenerator), so validating them keeps "what CI checks"
 # equal to "what deploys" — not just a standalone sample.
 validate-examples: dashboard
-	@go build -o /tmp/clawpatrol-validate ./cmd/clawpatrol
-	@git ls-files '*.hcl' | grep -E '^(examples|e2e)/' | while read -r f; do \
-		echo "validate $$f"; /tmp/clawpatrol-validate validate "$$f" || exit 1; \
+	@set -e; bin="$$(mktemp)"; trap 'rm -f "$$bin"' EXIT; \
+	go build -o "$$bin" ./cmd/clawpatrol; \
+	git ls-files '*.hcl' | grep -E '^(examples|e2e)/' | while read -r f; do \
+		echo "validate $$f"; "$$bin" validate "$$f"; \
 	done
 
 # e2e drives the Kubernetes WireGuard dynamic-peer flow against a local kind

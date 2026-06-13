@@ -36,10 +36,10 @@ E2E_HTTP="clawpatrol-e2e-http"
 KUBECTL=(kubectl --context "${KUBE_CONTEXT}")
 WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/clawpatrol-k8s-e2e.XXXXXX")"
 
-# Lease TTL is read from the overlay config so the heartbeat wait stays in
-# sync with what the gateway actually enforces.
-LEASE_TTL="$(sed -n 's/.*lease_ttl[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "${OVERLAY}/gateway.hcl" | head -1)"
-LEASE_TTL="${LEASE_TTL:-30s}"
+# LEASE_TTL is read from the overlay config (in preflight, after the files
+# are confirmed to exist) so the heartbeat wait stays in sync with what the
+# gateway actually enforces.
+LEASE_TTL="30s"
 
 usage() {
   cat <<'USAGE'
@@ -120,7 +120,12 @@ if [[ "${SKIP_BUILD}" != "1" ]]; then
   need docker
 fi
 [[ -f "${OVERLAY}/kustomization.yaml" ]] || fail "e2e overlay not found: ${OVERLAY}"
+[[ -f "${OVERLAY}/gateway.hcl" ]] || fail "e2e gateway config not found: ${OVERLAY}/gateway.hcl"
 [[ -f "${DOCKERFILE}" ]] || fail "Dockerfile not found: ${DOCKERFILE}"
+
+# Keep the heartbeat wait in sync with the lease the gateway enforces.
+LEASE_TTL="$(sed -n 's/.*lease_ttl[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "${OVERLAY}/gateway.hcl" | head -1)"
+LEASE_TTL="${LEASE_TTL:-30s}"
 
 if ! kind get clusters | grep -Fxq "${CLUSTER_NAME}"; then
   fail "kind cluster ${CLUSTER_NAME} not found"
