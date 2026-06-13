@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"net/netip"
 	"os"
 	"strings"
 )
@@ -107,6 +108,24 @@ func runTunMode(args []string) {
 		fmt.Fprintf(os.Stderr, "clawpatrol run --tun: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// preferV4 returns the first IPv4 address (unmapped), falling back to the
+// first address of any family when there is no IPv4. The tun-mode sidecar
+// pins IPv4 host routes by default and the gateway WireGuard endpoint is
+// reached over IPv4 in typical clusters; dialing an IPv6 endpoint while only
+// IPv4 is route-pinned would blackhole the handshake once the default route
+// flips to the tunnel.
+func preferV4(ips []netip.Addr) (netip.Addr, bool) {
+	if len(ips) == 0 {
+		return netip.Addr{}, false
+	}
+	for _, ip := range ips {
+		if ip.Unmap().Is4() {
+			return ip.Unmap(), true
+		}
+	}
+	return ips[0].Unmap(), true
 }
 
 // parseDynamicPeerAuthorizer splits the `<type>/<name>` value, mirroring the

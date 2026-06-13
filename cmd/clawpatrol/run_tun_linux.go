@@ -42,10 +42,14 @@ func tunModeRun(ctx context.Context, opt tunModeOptions) error {
 		return fmt.Errorf("generate wireguard keypair: %w", err)
 	}
 
-	route, err := defaultRoute4()
+	route4, err := defaultRoute4()
 	if err != nil {
 		return fmt.Errorf("default route: %w", err)
 	}
+	// IPv6 is optional: present only when the pod already has a v6 default
+	// route. We pin/replace v6 only in that case, so we never create a v6
+	// default that would blackhole traffic that previously had no route.
+	route6, have6 := defaultRoute6()
 	registerResp, err := dynamicPeerRegister(ctx, opt.GatewayURL, credential, dynamicPeerRegisterRequest{
 		Transport:          dynamicPeerTransportWireGuard,
 		Authorizer:         opt.AuthorizerName,
@@ -68,9 +72,17 @@ func tunModeRun(ctx context.Context, opt tunModeOptions) error {
 	if err != nil {
 		return err
 	}
+	// Keep the gateway API + WG endpoint reachable on the original path once
+	// the default route flips to the tunnel. A missed pin blackholes the
+	// handshake / heartbeat, so a pin failure is fatal. v6 addresses are
+	// pinned only when a v6 default route exists (the family we'll replace);
+	// otherwise they keep their existing routing.
 	for _, ip := range append(apiIPs, endpointIP) {
-		if ip.Is4() {
-			_ = pinHostRoute4(ip, route)
+		if !ip.Is4() && !have6 {
+			continue
+		}
+		if err := pinHostRoute(ip, route4, route6, have6); err != nil {
+			return fmt.Errorf("pin host route %s: %w", ip, err)
 		}
 	}
 
@@ -99,7 +111,7 @@ func tunModeRun(ctx context.Context, opt tunModeOptions) error {
 	if err := dev.Up(); err != nil {
 		return fmt.Errorf("wg up: %w", err)
 	}
-	if err := replaceDefaultRoutes(ifaceName); err != nil {
+	if err := replaceDefaultRoutes(ifaceName, have6); err != nil {
 		return err
 	}
 
@@ -156,11 +168,15 @@ func setupTunDevice(iface string, mtu int, peerIP, peerIPv6 string) error {
 	return nil
 }
 
-func replaceDefaultRoutes(iface string) error {
+func replaceDefaultRoutes(iface string, replace6 bool) error {
 	if err := runIP("ip", "route", "replace", "default", "dev", iface); err != nil {
 		return err
 	}
-	_ = runIP("ip", "-6", "route", "replace", "default", "dev", iface)
+	if replace6 {
+		// Only tunnel v6 when the pod already had a v6 default route — never
+		// create one, which would blackhole v6 that previously had no route.
+		_ = runIP("ip", "-6", "route", "replace", "default", "dev", iface)
+	}
 	return nil
 }
 
@@ -174,9 +190,28 @@ func defaultRoute4() (linuxDefaultRoute, error) {
 	if err != nil {
 		return linuxDefaultRoute{}, err
 	}
+	return parseDefaultRoute(out)
+}
+
+// defaultRoute6 returns the IPv6 default route, and false when the pod has
+// none (single-stack v4). A missing v6 default is not an error — the sidecar
+// leaves v6 untouched in that case.
+func defaultRoute6() (linuxDefaultRoute, bool) {
+	out, err := exec.Command("ip", "-6", "route", "show", "default").Output()
+	if err != nil {
+		return linuxDefaultRoute{}, false
+	}
+	r, err := parseDefaultRoute(out)
+	if err != nil {
+		return linuxDefaultRoute{}, false
+	}
+	return r, true
+}
+
+func parseDefaultRoute(out []byte) (linuxDefaultRoute, error) {
 	fields := strings.Fields(string(out))
 	if len(fields) == 0 {
-		return linuxDefaultRoute{}, fmt.Errorf("no IPv4 default route")
+		return linuxDefaultRoute{}, fmt.Errorf("no default route")
 	}
 	var r linuxDefaultRoute
 	for i := 0; i < len(fields)-1; i++ {
@@ -203,20 +238,45 @@ func pinHostRoute4(ip netip.Addr, route linuxDefaultRoute) error {
 	return runIP(args...)
 }
 
+func pinHostRoute6(ip netip.Addr, route linuxDefaultRoute) error {
+	dst := ip.String() + "/128"
+	args := []string{"ip", "-6", "route", "replace", dst}
+	if route.Via != "" {
+		args = append(args, "via", route.Via)
+	}
+	args = append(args, "dev", route.Dev)
+	return runIP(args...)
+}
+
+// pinHostRoute pins ip to its family's pre-tunnel default route.
+func pinHostRoute(ip netip.Addr, route4, route6 linuxDefaultRoute, have6 bool) error {
+	if ip.Is4() {
+		return pinHostRoute4(ip, route4)
+	}
+	if !have6 {
+		return fmt.Errorf("no IPv6 default route to pin %s", ip)
+	}
+	return pinHostRoute6(ip, route6)
+}
+
+// resolveWGEndpoint resolves the WireGuard endpoint host:port to a concrete
+// ip:port, preferring IPv4 (see preferV4). Returns the chosen IP so the
+// caller can pin a host route to it before the default route flips to the
+// tunnel.
 func resolveWGEndpoint(endpoint string) (netip.Addr, string, error) {
-	resolved, err := resolveEndpoint(endpoint)
-	if err != nil {
-		return netip.Addr{}, "", fmt.Errorf("resolve endpoint: %w", err)
-	}
-	host, _, err := net.SplitHostPort(resolved)
+	host, port, err := net.SplitHostPort(endpoint)
 	if err != nil {
 		return netip.Addr{}, "", err
 	}
-	ip, err := netip.ParseAddr(host)
+	ips, err := lookupHostIPs(host)
 	if err != nil {
-		return netip.Addr{}, "", err
+		return netip.Addr{}, "", fmt.Errorf("resolve endpoint %q: %w", host, err)
 	}
-	return ip, resolved, nil
+	ip, ok := preferV4(ips)
+	if !ok {
+		return netip.Addr{}, "", fmt.Errorf("resolve endpoint %q: no A/AAAA records", host)
+	}
+	return ip, net.JoinHostPort(ip.String(), port), nil
 }
 
 func lookupHostIPs(host string) ([]netip.Addr, error) {
@@ -224,7 +284,7 @@ func lookupHostIPs(host string) ([]netip.Addr, error) {
 		return nil, nil
 	}
 	if ip, err := netip.ParseAddr(host); err == nil {
-		return []netip.Addr{ip}, nil
+		return []netip.Addr{ip.Unmap()}, nil
 	}
 	ips, err := net.LookupIP(host)
 	if err != nil {
@@ -233,7 +293,8 @@ func lookupHostIPs(host string) ([]netip.Addr, error) {
 	out := make([]netip.Addr, 0, len(ips))
 	for _, ip := range ips {
 		if addr, ok := netip.AddrFromSlice(ip); ok {
-			out = append(out, addr)
+			// Unmap 4-in-6 so Is4()/family checks and route pinning behave.
+			out = append(out, addr.Unmap())
 		}
 	}
 	return out, nil
