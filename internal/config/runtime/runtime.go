@@ -820,6 +820,19 @@ type PlaceholderDetector interface {
 	DetectPlaceholder(req *Request, candidates []string) string
 }
 
+// CredentialPlaceholderMatcher is an optional credential-runtime hook
+// for credential types whose placeholder must be matched against their
+// own request slot, not the endpoint's generic placeholder search.
+//
+// ResolveCredential treats this hook as authoritative for the
+// credential entry that implements it: returning false means the
+// credential's placeholder constraint did not match, even if the
+// endpoint-wide PlaceholderDetector saw the same bytes somewhere else
+// in the request.
+type CredentialPlaceholderMatcher interface {
+	MatchPlaceholder(req *Request, placeholder string) bool
+}
+
 // SQLParser is the optional contract a SQL-family endpoint plugin's
 // runtime implements so a host that received a raw SQL string (rather
 // than a live wire-protocol frame) can populate `match.Request.Meta`
