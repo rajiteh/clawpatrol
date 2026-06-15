@@ -12,7 +12,7 @@ export const CREDENTIAL_TYPE_LABEL: Record<string, string> = {
   telegram_bot_token: "Telegram",
   gemini_api_key: "Gemini",
   aws_credential: "AWS",
-  basic_auth: "Basic auth",
+  basic_auth: "Basic Auth",
   bearer_token: "Bearer token",
   header_token: "Header token",
   cookie_token: "Cookie token",
