@@ -690,6 +690,40 @@ Rules attached to this endpoint are written exactly the way they
 would be against any in-process HTTPS endpoint:
 `http.method == "POST"`, `http.body.contains("…")`, etc.
 
+### Persistent state
+
+A sandboxed plugin has no writable filesystem of its own. When a plugin
+must remember a few bytes across restarts — an SSH endpoint's host key, a
+signing keypair, a dynamically registered client id — it uses the
+gateway-backed state store rather than touching disk:
+
+```go
+const hostKeyName = "host_key"
+
+func ensureHostKey(ctx context.Context) ([]byte, error) {
+    st := pluginsdk.State()
+    if v, found, err := st.Get(ctx, hostKeyName); err != nil {
+        return nil, err
+    } else if found {
+        return v, nil
+    }
+    key := generateHostKey()
+    return key, st.Put(ctx, hostKeyName, key)
+}
+```
+
+Reach for `pluginsdk.State()` from a runtime callback — `HandleConn`,
+`InjectHTTP`, `OpenTunnel`, or `Dial` — which is where identity like a
+host key is actually needed. It is not available during a `Build`
+callback on the gateway's first config load: the store lives in the
+state dir, which is part of the config being loaded, so it is wired only
+once that load finishes. The gateway namespaces every key by the plugin,
+so one plugin can never read another's; values are capped at 1 MiB (this
+is for identity, not bulk data) and survive restarts. The store is
+reached over the plugin connection — no network grant and no `dial`
+entry are involved. If the gateway is too old to provide it, the calls
+return an error so the plugin can degrade gracefully.
+
 ## Validating a plugin config
 
 `clawpatrol validate` runs the same load path the daemon does, so
