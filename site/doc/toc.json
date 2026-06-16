@@ -2,6 +2,7 @@
   "introduction",
   "getting-started",
   "configure-gateway",
+  "kubernetes-dynamic-peers",
   "credentials",
   "rules",
   "tunnels",

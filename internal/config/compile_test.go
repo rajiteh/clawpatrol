@@ -114,6 +114,134 @@ func TestCompile(t *testing.T) {
 	}
 }
 
+func TestWireGuardDynamicPeersConfigValidation(t *testing.T) {
+	valid := `gateway {
+  state_dir = "/opt/clawpatrol"
+  wireguard {
+    subnet_cidr = "10.55.0.0/24"
+    endpoint = "clawpatrol-wg.clawpatrol.svc:51820"
+
+    dynamic_peers {
+      enabled = true
+      lease_ttl = "2m"
+
+      authorizer "kubernetes_token_review" "agents" {
+        audience = "clawpatrol"
+        profile_label = "clawpatrol.dev/profile"
+        allow {
+          namespace = "agents"
+          service_account = "agent-runner"
+          profiles = ["default"]
+        }
+      }
+    }
+  }
+}
+
+profile "default" { credentials = [] }
+`
+	gw, diags := config.LoadBytes([]byte(valid), "k8s.hcl")
+	if diags.HasErrors() {
+		t.Fatalf("valid config diagnostics: %v", diags)
+	}
+	if !gw.IsWireGuardDynamicPeersEnabled() {
+		t.Fatal("wireguard dynamic peers should be enabled")
+	}
+	if ttl, err := gw.WireGuardDynamicPeersLeaseTTL(); err != nil || ttl != 2*time.Minute {
+		t.Fatalf("lease ttl = %s, %v; want 2m", ttl, err)
+	}
+	if got := gw.Settings.WireGuard.DynamicPeers.Authorizers[0].Name; got != "agents" {
+		t.Fatalf("authorizer name = %q, want agents", got)
+	}
+	dump, err := gw.Dump()
+	if err != nil {
+		t.Fatalf("dump: %v", err)
+	}
+	if !strings.Contains(string(dump), `"dynamic_peers"`) || strings.Contains(string(dump), "kubernetes_registration") {
+		t.Fatalf("dump does not use dynamic peer shape:\n%s", dump)
+	}
+
+	cases := []struct {
+		name string
+		body string
+		want string
+	}{
+		{
+			name: "missing audience",
+			body: strings.Replace(valid, `        audience = "clawpatrol"`+"\n", "", 1),
+			want: "Missing wireguard.dynamic_peers.authorizer.audience",
+		},
+		{
+			name: "bad ttl",
+			body: strings.Replace(valid, `lease_ttl = "2m"`, `lease_ttl = "-1s"`, 1),
+			want: "Invalid wireguard.dynamic_peers.lease_ttl",
+		},
+		{
+			name: "missing authorizer",
+			body: strings.Replace(valid, `      authorizer "kubernetes_token_review" "agents" {
+        audience = "clawpatrol"
+        profile_label = "clawpatrol.dev/profile"
+        allow {
+          namespace = "agents"
+          service_account = "agent-runner"
+          profiles = ["default"]
+        }
+      }
+`, "", 1),
+			want: "Missing wireguard.dynamic_peers.authorizer",
+		},
+		{
+			name: "authorizer missing allow",
+			body: strings.Replace(valid, `        allow {
+          namespace = "agents"
+          service_account = "agent-runner"
+          profiles = ["default"]
+        }
+`, "", 1),
+			want: "Missing wireguard.dynamic_peers.authorizer.allow",
+		},
+		{
+			name: "allow missing profiles",
+			body: strings.Replace(valid, `          profiles = ["default"]`+"\n", "", 1),
+			want: "Invalid wireguard.dynamic_peers.authorizer.allow",
+		},
+		{
+			name: "duplicate authorizer",
+			body: strings.Replace(valid, `      }
+    }
+`, `      }
+      authorizer "kubernetes_token_review" "agents" {
+        audience = "clawpatrol"
+        profile_label = "clawpatrol.dev/profile"
+        allow {
+          namespace = "agents"
+          service_account = "agent-runner"
+          profiles = ["default"]
+        }
+      }
+    }
+`, 1),
+			want: "Duplicate wireguard.dynamic_peers.authorizer",
+		},
+		{
+			name: "unsupported authorizer",
+			body: strings.Replace(valid, `authorizer "kubernetes_token_review" "agents"`, `authorizer "oidc_jwt" "agents"`, 1),
+			want: "Unsupported wireguard.dynamic_peers.authorizer",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, diags := config.LoadBytes([]byte(tc.body), tc.name+".hcl")
+			if !diags.HasErrors() {
+				t.Fatalf("expected diagnostics")
+			}
+			if !strings.Contains(diags.Error(), tc.want) {
+				t.Fatalf("diagnostics = %v, want %q", diags, tc.want)
+			}
+		})
+	}
+}
+
 // TestCompileWildcardHosts verifies that wildcard hosts are accepted,
 // land in HostPatterns (not HostIndex), and that malformed wildcards
 // or within-endpoint duplicates are rejected at load time.

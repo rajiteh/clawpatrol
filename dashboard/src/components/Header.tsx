@@ -39,6 +39,13 @@ export function Header({
           <NavLink href="#/devices" label="Devices" active={devicesActive}>
             <DesktopNavIcon />
           </NavLink>
+          <NavLink
+            href="#/dynamic-peers"
+            label="Dynamic peers"
+            active={currentRoute === "dynamic-peers"}
+          >
+            <DynamicPeersIcon />
+          </NavLink>
           <NavLink href="#/analytics" label="Analytics" active={currentRoute === "analytics"}>
             <Icon paths={["M3 3v18h18", "m7 16 4-8 4 4 4-6"]} />
           </NavLink>
@@ -187,6 +194,30 @@ function PluginsIcon() {
       aria-hidden="true"
     >
       <path d="M15.39 4.39a1 1 0 0 0 1.68-.474 2.5 2.5 0 1 1 3.014 3.015 1 1 0 0 0-.474 1.68l1.683 1.682a2.414 2.414 0 0 1 0 3.414L19.61 19.39a1 1 0 0 1-1.68-.474 2.5 2.5 0 1 0-3.014 3.015 1 1 0 0 1 .474 1.68l-1.683 1.682a2.414 2.414 0 0 1-3.414 0L8.61 19.61a1 1 0 0 0-1.68.474 2.5 2.5 0 1 1-3.014-3.015 1 1 0 0 0 .474-1.68l-1.683-1.682a2.414 2.414 0 0 1 0-3.414L4.39 8.61a1 1 0 0 1 1.68.474 2.5 2.5 0 1 0 3.014-3.015 1 1 0 0 1-.474-1.68l1.683-1.682a2.414 2.414 0 0 1 3.414 0z" />
+    </svg>
+  );
+}
+
+// DynamicPeersIcon is a share/topology glyph (three nodes joined to a
+// root) — a visual cue for transient, self-registering peers. Stroked
+// at the nav button's standard 18px to match the other icons.
+function DynamicPeersIcon() {
+  return (
+    <svg
+      width="18"
+      height="18"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <circle cx="12" cy="5" r="2" />
+      <circle cx="5" cy="19" r="2" />
+      <circle cx="19" cy="19" r="2" />
+      <path d="M12 7v3M12 10 6 17M12 10l6 7" />
     </svg>
   );
 }
