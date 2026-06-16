@@ -819,6 +819,9 @@ type credentialMetadata struct {
 	envVars        []config.EnvVar
 	oauth          *config.OAuthIntegration
 	httpInject     bool
+	// httpTransform: the credential rewrites method/URL/body via the
+	// streaming TransformHTTP RPC (superset of httpInject).
+	httpTransform bool
 }
 
 // dynamicCredentialBody is the per-instance base Body for credentials
@@ -884,6 +887,15 @@ func (b *dynamicOAuthHTTPCredentialBody) InjectHTTP(ctx context.Context, req *ht
 	return injectHTTPWithExternalCredential(ctx, b.dynamicCredentialBody, req, sec)
 }
 
+// RewritesHTTPRequest reports whether InjectHTTP rewrites more than
+// headers (a transform credential). The gateway fails closed on its
+// inject error since the request body was streamed to the plugin. The
+// method is promoted to the HTTP body wrappers that embed
+// *dynamicCredentialBody.
+func (b *dynamicCredentialBody) RewritesHTTPRequest() bool {
+	return b != nil && b.metadata.httpTransform
+}
+
 func (b *dynamicHTTPCredentialBody) ConsumeHTTPRedactions(req *http.Request) []string {
 	if b == nil {
 		return nil
@@ -911,6 +923,12 @@ const (
 func injectHTTPWithExternalCredential(ctx context.Context, body *dynamicCredentialBody, req *http.Request, sec runtime.Secret) error {
 	if body == nil {
 		return nil
+	}
+	// Transform credentials use the streaming TransformHTTP path (the
+	// request body flows through the plugin); header-only credentials use
+	// the unary InjectHTTP below (the body never leaves the gateway).
+	if body.metadata.httpTransform {
+		return transformHTTPWithExternalCredential(ctx, body, req, sec)
 	}
 	if body.adapter == nil || body.adapter.client == nil || body.adapter.client.credential == nil {
 		return fmt.Errorf("extplugin: credential %q InjectHTTP unavailable: plugin client is not connected", body.instanceName)
@@ -993,12 +1011,15 @@ func wrapCredentialBody(b *dynamicCredentialBody) any {
 	if b == nil {
 		return b
 	}
+	// A transform credential participates in HTTP injection too (it is the
+	// superset), so it gets the same HTTP-capable wrapper.
+	httpCapable := b.metadata.httpInject || b.metadata.httpTransform
 	switch {
-	case b.metadata.oauth != nil && b.metadata.httpInject:
+	case b.metadata.oauth != nil && httpCapable:
 		return &dynamicOAuthHTTPCredentialBody{dynamicCredentialBody: b}
 	case b.metadata.oauth != nil:
 		return &dynamicOAuthCredentialBody{dynamicCredentialBody: b}
-	case b.metadata.httpInject:
+	case httpCapable:
 		return &dynamicHTTPCredentialBody{dynamicCredentialBody: b}
 	default:
 		return b
