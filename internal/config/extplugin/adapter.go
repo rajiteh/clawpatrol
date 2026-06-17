@@ -18,6 +18,7 @@ import (
 	pb "github.com/denoland/clawpatrol/internal/config/extplugin/proto"
 	"github.com/denoland/clawpatrol/internal/config/facet"
 	"github.com/denoland/clawpatrol/internal/config/match"
+	"github.com/denoland/clawpatrol/internal/config/plugins/facets/sql"
 	"github.com/denoland/clawpatrol/internal/config/runtime"
 	"golang.org/x/net/http/httpguts"
 )
@@ -603,18 +604,77 @@ func stringField(m map[string]any, key string) string {
 	return v
 }
 
+// stringListField extracts a []string from action[key]. JSON decodes a
+// list into []any, so string elements are collected and non-string
+// elements are skipped; an already-[]string value passes through.
+// malformed is true when the key is present but not a list at all (e.g. a
+// string or number) — a contract violation the caller can treat as
+// unparseable (fail closed) instead of silently coercing to empty. An
+// absent key returns (nil, false): nothing was claimed, so nothing is
+// wrong.
+func stringListField(m map[string]any, key string) (vals []string, malformed bool) {
+	v, present := m[key]
+	if !present {
+		return nil, false
+	}
+	switch vv := v.(type) {
+	case []string:
+		return vv, false
+	case []any:
+		out := make([]string, 0, len(vv))
+		for _, item := range vv {
+			if s, ok := item.(string); ok {
+				out = append(out, s)
+			}
+		}
+		return out, false
+	}
+	return nil, true
+}
+
 // builtinRequestFor maps an EvaluateAction's action map onto a
 // match.Request shaped the way a built-in facet's matcher expects.
 // Plugins that bind their endpoint's Family to a built-in facet
-// ("http", "sql", "k8s") send the action keyed by that facet's CEL
+// ("http", "sql") send the action keyed by that facet's CEL
 // variables; the gateway translates here so the same matcher the
-// gateway's own pipeline runs sees a familiar Request.
+// gateway's own pipeline runs sees a familiar Request — the endpoint
+// reuses the operator's existing http.* / sql.* rules verbatim.
 //
-// Only "http" is supported in v1. Other families fall back to a
-// permissive Meta-bag request — rules will likely not match, which
-// surfaces as the gateway's default-deny.
+// "http" and "sql" are mapped. Other families (k8s, ssh, anything
+// bespoke) fall back to a permissive Meta-bag request — a plugin that
+// wants those should declare its own facet instead; binding family to a
+// built-in we don't map here surfaces as the gateway's default-deny.
 func builtinRequestFor(family, peerIP, summary string, action map[string]any, streams map[string][]byte) *match.Request {
 	switch family {
+	case "sql":
+		// The plugin parsed the statement and sent the coarse sql.Meta
+		// fields (verb / tables / functions / statement / database); the
+		// built-in sql matcher type-asserts req.Meta to *sql.Meta, so build
+		// one. A large statement may arrive as a stream field instead of
+		// inline JSON.
+		tables, badTables := stringListField(action, "tables")
+		functions, badFns := stringListField(action, "functions")
+		meta := &sql.Meta{
+			Verb:      stringField(action, "verb"),
+			Tables:    tables,
+			Functions: functions,
+			Database:  stringField(action, "database"),
+		}
+		if b, ok := streams["statement"]; ok {
+			meta.Statement = string(b)
+		} else {
+			meta.Statement = stringField(action, "statement")
+		}
+		req := &match.Request{Family: family, PeerIP: peerIP, Meta: meta}
+		// A present-but-wrong-typed list field (a plugin sending `tables`
+		// as a string/number instead of a list) is a contract violation.
+		// Mark the parse unreliable so sql.verb/tables/functions evaluate to
+		// a CEL unknown and any rule referencing them fails closed, rather
+		// than silently seeing an empty list and missing a guardrail.
+		if badTables || badFns {
+			req.Unparseable = true
+		}
+		return req
 	case "http":
 		req := &match.Request{
 			Family: family,
