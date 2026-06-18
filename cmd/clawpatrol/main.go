@@ -59,6 +59,23 @@ func resolveStateDir(cfg *config.Gateway) string {
 	return ""
 }
 
+// checkDirWritable verifies the current process can create files in
+// dir. os.MkdirAll is a no-op when the directory already exists, so a
+// root-owned directory — the example config's /opt/clawpatrol created
+// under sudo, or a Docker `-v` mount owned by root — passes MkdirAll
+// but fails every later write. Probing with a temp file surfaces that
+// as a clear error instead of an opaque downstream failure (sqlite's
+// "unable to open database file (14)" / SQLITE_CANTOPEN when the
+// gateway opens clawpatrol.db, a silently-dropped write on join).
+func checkDirWritable(dir string) error {
+	probe := filepath.Join(dir, ".write-probe")
+	if err := os.WriteFile(probe, nil, 0o600); err != nil {
+		return err
+	}
+	_ = os.Remove(probe)
+	return nil
+}
+
 const hitlOperationTerminalRetention = 7 * 24 * time.Hour
 
 func runHITLOperationStartupMaintenance(ctx context.Context, db *sql.DB) (HITLOperationMaintenanceResult, error) {
@@ -3038,6 +3055,9 @@ func runGateway(args []string) {
 	stateDir := resolveStateDir(cfg)
 	if err := os.MkdirAll(stateDir, 0o700); err != nil {
 		log.Fatalf("state dir: %v", err)
+	}
+	if err := checkDirWritable(stateDir); err != nil {
+		log.Fatalf("state dir: cannot create files in state_dir %s as uid %d: %v\n      Fix: run the gateway as the user that owns it, `chown` it to that user, or set a writable state_dir in the gateway block of %s.", stateDir, os.Getuid(), err, cfgPath)
 	}
 	db, err := OpenDB(filepath.Join(stateDir, "clawpatrol.db"))
 	if err != nil {
