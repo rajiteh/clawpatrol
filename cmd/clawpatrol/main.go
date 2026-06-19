@@ -2032,6 +2032,7 @@ func (g *Gateway) dispatchConnEndpoint(c net.Conn, dstIP string, dstPort uint16,
 			}
 			g.sink.Emit(Event{
 				Mode: mode, Family: ep.Family, Host: eventHost, AgentIP: agentPip,
+				ID: ev.ID, Phase: ev.Phase, Status: ev.Status,
 				Method: ev.Verb, Path: ev.Summary,
 				Action: ev.Action, Reason: ev.Reason,
 				Facets:   ev.Facets,
@@ -2428,7 +2429,7 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 				status, contentType, body := hitlRetryRelayFailure(err)
 				log.Printf("hitl retry rejected %s %s %s operation %q: %v", host, req.Method, req.URL.Path, retryOperationID, err)
 				_, _ = fmt.Fprintf(tc, "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", status, http.StatusText(status), contentType, len(body), body)
-				ev.Status = status
+				ev.Status = strconv.Itoa(status)
 				ev.Action = "hitl_retry_rejected"
 				ev.Reason = hitlRetryMismatchErrorValue
 				if status == http.StatusNotFound {
@@ -2492,7 +2493,7 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 						log.Printf("hitl async pending response write %s: %v", asyncOp.ID, err)
 					}
 					_ = tc.SetWriteDeadline(time.Time{})
-					ev.Status = http.StatusAccepted
+					ev.Status = "202"
 					ev.Action = "hitl_async_pending"
 					ev.Approver = v.ApproverName
 					ev.ApproverType = v.ApproverType
@@ -2514,7 +2515,7 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 				log.Printf("denied %s %s %s: %s (by %s/%s/%s)",
 					host, req.Method, req.URL.Path, reason, v.ApproverType, v.ApproverName, v.By)
 				_, _ = fmt.Fprintf(tc, "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", len(reason), reason)
-				ev.Status = 403
+				ev.Status = "403"
 				ev.Action = "denied"
 				ev.Approver = v.ApproverName
 				ev.ApproverType = v.ApproverType
@@ -2552,7 +2553,7 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 				}
 			}
 			_, _ = fmt.Fprintf(tc, "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", len(reason), reason)
-			ev.Status = 403
+			ev.Status = "403"
 			ev.Action = "deny"
 			ev.Reason = reason
 			ev.Ms = time.Since(start).Milliseconds()
@@ -2600,7 +2601,7 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 				if r.Body != nil {
 					defer func() { _ = r.Body.Close() }()
 				}
-				ev.Status = r.StatusCode
+				ev.Status = strconv.Itoa(r.StatusCode)
 				ev.Action = "synth"
 				// Synthetic responses are clawpatrol-generated, so the
 				// stock plugins don't set auth-bearing headers — but
@@ -2686,7 +2687,7 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 							if rw, ok := injector.(runtime.HTTPRequestRewriter); ok && rw.RewritesHTTPRequest() {
 								log.Printf("transform %s: %v; failing closed", cc.Credential.Symbol.Name, err)
 								_, _ = fmt.Fprintf(tc, "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-								ev.Status = 502
+								ev.Status = "502"
 								ev.Action = "error"
 								ev.Reason = err.Error()
 								ev.Ms = time.Since(start).Milliseconds()
@@ -2747,7 +2748,7 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 					log.Printf("hitl retry transition %s to %s: %v", hitlRetryConsumedOperation.ID, HITLOperationStateUpstreamSucceeded, err)
 				}
 			}
-			ev.Status = 101
+			ev.Status = "101"
 			ev.Ms = time.Since(start).Milliseconds()
 			g.emitEnd(ev)
 			return
@@ -2792,7 +2793,7 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 				}
 			}
 			_, _ = fmt.Fprintf(tc, "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-			ev.Status = 502
+			ev.Status = "502"
 			ev.Action = "error"
 			ev.Reason = err.Error()
 			ev.Ms = time.Since(start).Milliseconds()
@@ -2885,7 +2886,7 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 				log.Printf("hitl async operation upstream terminal %s: %v", asyncOp.ID, err)
 			}
 		}
-		ev.Status = resp.StatusCode
+		ev.Status = strconv.Itoa(resp.StatusCode)
 		ev.ReqHeaders = flatHeadersRedacted(req.Header, reqBodySecretRedactions)
 		ev.In = reqS.n
 		ev.Out = respS.n

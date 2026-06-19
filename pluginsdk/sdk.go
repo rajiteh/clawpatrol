@@ -108,6 +108,13 @@ const (
 type FacetDef struct {
 	Name   string
 	Fields []FacetField
+	// ResultFields is the after-the-fact schema a plugin reports via
+	// Conn.SetResult once an action's response is known. It mirrors Fields
+	// (same FacetField type, so Description/Title/DetailOnly and the
+	// FacetStream kind apply): the field marked Title becomes the action's
+	// status, a FacetStream field is a response body the gateway caps.
+	// Empty for facets that report nothing after the response.
+	ResultFields []FacetField
 }
 
 // FacetField declares one column in the facet's schema. Kind tells
@@ -527,6 +534,7 @@ type Conn struct {
 
 	emit         func(ConnEvent)
 	evaluate     func(ctx context.Context, facet string, action map[string]any, summary string) (Verdict, error)
+	setResult    func(ctx context.Context, result map[string]any) error
 	dialUpstream func(ctx context.Context, network, addr string, opts *DialUpstreamOptions) (net.Conn, error)
 }
 
@@ -608,6 +616,21 @@ func (c *Conn) Evaluate(ctx context.Context, facet string, action map[string]any
 		return Verdict{}, errors.New("pluginsdk: Conn.Evaluate not wired (running without a gateway?)")
 	}
 	return c.evaluate(ctx, facet, action, summary)
+}
+
+// SetResult reports an action's outcome once the response is known — the
+// after-the-fact counterpart of Evaluate. The result map's keys match the
+// facet's declared ResultFields; the field marked Title becomes the
+// action's status on the dashboard. Call it once, after the response is
+// read, for the action this connection just evaluated.
+//
+// (First cut: scalar result fields only. FacetStream result fields — a
+// response body the gateway streams and caps — are a follow-up.)
+func (c *Conn) SetResult(ctx context.Context, result map[string]any) error {
+	if c.setResult == nil {
+		return errors.New("pluginsdk: Conn.SetResult not wired (running without a gateway?)")
+	}
+	return c.setResult(ctx, result)
 }
 
 // Verdict is the gateway's decision on one EvaluateAction call.

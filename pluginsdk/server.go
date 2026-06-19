@@ -174,21 +174,31 @@ func (s *server) Manifest(_ context.Context, _ *pb.ManifestRequest) (*pb.Manifes
 		})
 	}
 	for _, f := range s.plug.Facets {
-		fields := make([]*pb.FacetFieldDecl, 0, len(f.Fields))
-		for _, fld := range f.Fields {
-			fields = append(fields, &pb.FacetFieldDecl{
-				Name:        fld.Name,
-				Kind:        pb.FacetKind(fld.Kind),
-				Label:       fld.Label,
-				Optional:    fld.Optional,
-				Description: fld.Description,
-				Title:       fld.Title,
-				DetailOnly:  fld.DetailOnly,
-			})
-		}
-		resp.Facets = append(resp.Facets, &pb.FacetDecl{Name: f.Name, Fields: fields})
+		resp.Facets = append(resp.Facets, &pb.FacetDecl{
+			Name:         f.Name,
+			Fields:       facetFieldsToProto(f.Fields),
+			ResultFields: facetFieldsToProto(f.ResultFields),
+		})
 	}
 	return resp, nil
+}
+
+// facetFieldsToProto maps SDK facet fields (request or result schema) onto
+// their proto form.
+func facetFieldsToProto(in []FacetField) []*pb.FacetFieldDecl {
+	out := make([]*pb.FacetFieldDecl, 0, len(in))
+	for _, fld := range in {
+		out = append(out, &pb.FacetFieldDecl{
+			Name:        fld.Name,
+			Kind:        pb.FacetKind(fld.Kind),
+			Label:       fld.Label,
+			Optional:    fld.Optional,
+			Description: fld.Description,
+			Title:       fld.Title,
+			DetailOnly:  fld.DetailOnly,
+		})
+	}
+	return out
 }
 
 func networkAccessToProto(n NetworkAccess) pb.NetworkAccess {
@@ -508,6 +518,16 @@ func (s *server) HandleConn(stream pb.Endpoint_HandleConnServer) error {
 		return stream.Send(m)
 	}
 
+	conn.setResult = func(_ context.Context, result map[string]any) error {
+		// First cut: scalar result fields only (the body-stream support that
+		// FacetStream result fields will need is a follow-up). The gateway
+		// correlates this to the conn's current action, so no call_id.
+		j, err := json.Marshal(result)
+		if err != nil {
+			return fmt.Errorf("pluginsdk: marshal result: %w", err)
+		}
+		return doSend(&pb.ConnMessage{Kind: &pb.ConnMessage_Result{Result: &pb.ActionResult{ResultJson: j}}})
+	}
 	conn.emit = func(ev ConnEvent) {
 		facets, _ := json.Marshal(ev.Facets)
 		_ = doSend(&pb.ConnMessage{Kind: &pb.ConnMessage_Event{Event: &pb.ConnEvent{
