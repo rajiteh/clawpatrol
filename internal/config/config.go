@@ -204,6 +204,11 @@ type GatewaySettings struct {
 	// Tailscale control plane (OAuth key minting, exit-node routing).
 	// Both transports may be enabled simultaneously.
 	Tailscale *TailscaleBlock `hcl:"tailscale,block"`
+
+	// Enrollment, if present, lets workloads self-enroll as transient
+	// WireGuard peers through a configured authorizer (e.g. Kubernetes
+	// TokenReview). Requires a `wireguard` block for the data plane.
+	Enrollment *EnrollmentBlock `hcl:"enrollment,block"`
 }
 
 // GenAITelemetryBlock is the body of the `genai_telemetry { ... }`
@@ -259,31 +264,29 @@ type WireGuardBlock struct {
 	// clients. Normally derived from gateway state; only set when
 	// bootstrapping from an external key.
 	ServerPub string `hcl:"server_pub,optional"`
-
-	// DynamicPeers lets workloads self-register as transient peers for
-	// this WireGuard transport. v1 supports Kubernetes TokenReview
-	// authorizers only.
-	DynamicPeers *DynamicPeersBlock `hcl:"dynamic_peers,block"`
 }
 
-// DynamicPeersBlock is the body of a transport's `dynamic_peers { ... }`
-// block. It configures transient, self-registering peers for that
-// transport.
-type DynamicPeersBlock struct {
-	Enabled bool `hcl:"enabled,optional"`
-
-	// LeaseTTL is a time.ParseDuration string. Empty defaults to 2m.
-	LeaseTTL string `hcl:"lease_ttl,optional"`
+// EnrollmentBlock is the body of the top-level `enrollment { ... }`
+// block inside `gateway { ... }`. It lets workloads self-enroll as
+// transient WireGuard peers through a configured authorizer, instead of
+// the interactive `clawpatrol join` flow. The data plane is WireGuard
+// (v1); the authorizer is pluggable.
+type EnrollmentBlock struct {
+	// PeerTTL is a time.ParseDuration grace window: an enrolled peer is
+	// reaped once its WireGuard traffic has been quiet for longer than
+	// this. Empty defaults to 3m. Liveness is observed from the WG
+	// device (rx_bytes progress), not an app-level heartbeat.
+	PeerTTL string `hcl:"peer_ttl,optional"`
 
 	// Authorizers lists `authorizer "<type>" "<name>" { ... }` blocks.
 	// v1 supports type "kubernetes_token_review".
-	Authorizers []DynamicPeerAuthorizerBlock `hcl:"authorizer,block"`
+	Authorizers []EnrollmentAuthorizerBlock `hcl:"authorizer,block"`
 }
 
-// DynamicPeerAuthorizerBlock is a named dynamic-peer authorization
-// source. Kubernetes TokenReview is the first supported type; the
-// generic labels keep the config shape ready for future authorizers.
-type DynamicPeerAuthorizerBlock struct {
+// EnrollmentAuthorizerBlock is a named enrollment authorization source.
+// Kubernetes TokenReview is the first supported type; the generic labels
+// keep the config shape ready for future authorizers (OIDC, SPIFFE, …).
+type EnrollmentAuthorizerBlock struct {
 	Type string `hcl:"type,label"`
 	Name string `hcl:"name,label"`
 
@@ -295,11 +298,11 @@ type DynamicPeerAuthorizerBlock struct {
 	// to submit their own profile.
 	ProfileLabel string `hcl:"profile_label,optional"`
 
-	Allow []DynamicPeerKubernetesAllow `hcl:"allow,block"`
+	Allow []EnrollmentAllow `hcl:"allow,block"`
 }
 
-// DynamicPeerKubernetesAllow is one Kubernetes identity/profile allow rule.
-type DynamicPeerKubernetesAllow struct {
+// EnrollmentAllow is one Kubernetes identity/profile allow rule.
+type EnrollmentAllow struct {
 	Namespace      string   `hcl:"namespace,optional"`
 	ServiceAccount string   `hcl:"service_account,optional"`
 	Profiles       []string `hcl:"profiles,optional"`
@@ -394,14 +397,14 @@ func (g *Gateway) IsTailscaleEnabled() bool {
 	return g != nil && g.Settings != nil && g.Settings.Tailscale != nil
 }
 
-// IsWireGuardDynamicPeersEnabled reports whether transient peer
-// self-registration is enabled for the WireGuard transport.
-func (g *Gateway) IsWireGuardDynamicPeersEnabled() bool {
+// IsEnrollmentEnabled reports whether workload self-enrollment is
+// configured. Presence of an `enrollment` block with at least one
+// authorizer enables it.
+func (g *Gateway) IsEnrollmentEnabled() bool {
 	return g != nil &&
 		g.Settings != nil &&
-		g.Settings.WireGuard != nil &&
-		g.Settings.WireGuard.DynamicPeers != nil &&
-		g.Settings.WireGuard.DynamicPeers.Enabled
+		g.Settings.Enrollment != nil &&
+		len(g.Settings.Enrollment.Authorizers) > 0
 }
 
 // settings returns g.Settings, or a zero-value pointer when nil so
@@ -472,19 +475,19 @@ func (g *Gateway) Operators() []string {
 	return g.Settings.Tailscale.Operators
 }
 
-// WireGuardDynamicPeersLeaseTTL returns the configured dynamic peer
-// lease TTL, defaulting to 2m.
-func (g *Gateway) WireGuardDynamicPeersLeaseTTL() (time.Duration, error) {
-	if !g.IsWireGuardDynamicPeersEnabled() {
-		return 0, fmt.Errorf("wireguard dynamic peers disabled")
+// EnrollmentPeerTTL returns the configured enrollment peer liveness
+// grace, defaulting to 3m.
+func (g *Gateway) EnrollmentPeerTTL() (time.Duration, error) {
+	if !g.IsEnrollmentEnabled() {
+		return 0, fmt.Errorf("enrollment is not enabled")
 	}
-	return DynamicPeersLeaseTTLFromString(g.Settings.WireGuard.DynamicPeers.LeaseTTL)
+	return EnrollmentPeerTTLFromString(g.Settings.Enrollment.PeerTTL)
 }
 
-// DynamicPeersLeaseTTLFromString parses a dynamic peer lease TTL string.
-func DynamicPeersLeaseTTLFromString(s string) (time.Duration, error) {
+// EnrollmentPeerTTLFromString parses an enrollment peer-TTL string.
+func EnrollmentPeerTTLFromString(s string) (time.Duration, error) {
 	if s == "" {
-		return 2 * time.Minute, nil
+		return 3 * time.Minute, nil
 	}
 	d, err := time.ParseDuration(s)
 	if err != nil {
@@ -1182,44 +1185,52 @@ func validateOperational(gw *Gateway) hcl.Diagnostics {
 	}
 
 	diags = append(diags, validateLimits(gw.Settings.Limits)...)
-	diags = append(diags, validateWireGuardDynamicPeers(gw)...)
+	diags = append(diags, validateEnrollment(gw)...)
 
 	return diags
 }
 
-func validateWireGuardDynamicPeers(gw *Gateway) hcl.Diagnostics {
+func validateEnrollment(gw *Gateway) hcl.Diagnostics {
 	var diags hcl.Diagnostics
-	if gw == nil || !gw.IsWireGuardDynamicPeersEnabled() {
+	if gw == nil || gw.Settings == nil || gw.Settings.Enrollment == nil {
 		return nil
 	}
-	dp := gw.Settings.WireGuard.DynamicPeers
-	if _, err := DynamicPeersLeaseTTLFromString(dp.LeaseTTL); err != nil {
+	en := gw.Settings.Enrollment
+	// Enrollment provisions WireGuard peers, so it needs the WG data plane.
+	if gw.Settings.WireGuard == nil {
 		diags = append(diags, &hcl.Diagnostic{
 			Severity: hcl.DiagError,
-			Summary:  "Invalid wireguard.dynamic_peers.lease_ttl",
-			Detail:   fmt.Sprintf("lease_ttl = %q: %v. Use a time.ParseDuration string like \"2m\".", dp.LeaseTTL, err),
+			Summary:  "enrollment requires a wireguard block",
+			Detail:   "`enrollment` provisions WireGuard peers; declare a `wireguard { ... }` block for the data plane.",
 		})
 	}
-	if len(dp.Authorizers) == 0 {
+	if _, err := EnrollmentPeerTTLFromString(en.PeerTTL); err != nil {
 		diags = append(diags, &hcl.Diagnostic{
 			Severity: hcl.DiagError,
-			Summary:  "Missing wireguard.dynamic_peers.authorizer",
-			Detail:   "`wireguard.dynamic_peers` requires at least one `authorizer \"kubernetes_token_review\" \"name\" { ... }` block.",
+			Summary:  "Invalid enrollment.peer_ttl",
+			Detail:   fmt.Sprintf("peer_ttl = %q: %v. Use a time.ParseDuration string like \"3m\".", en.PeerTTL, err),
+		})
+	}
+	if len(en.Authorizers) == 0 {
+		diags = append(diags, &hcl.Diagnostic{
+			Severity: hcl.DiagError,
+			Summary:  "Missing enrollment.authorizer",
+			Detail:   "`enrollment` requires at least one `authorizer \"kubernetes_token_review\" \"name\" { ... }` block.",
 		})
 	}
 	seenNames := map[string]bool{}
-	for ai, a := range dp.Authorizers {
+	for ai, a := range en.Authorizers {
 		if strings.TrimSpace(a.Name) == "" {
 			diags = append(diags, &hcl.Diagnostic{
 				Severity: hcl.DiagError,
-				Summary:  "Invalid wireguard.dynamic_peers.authorizer",
+				Summary:  "Invalid enrollment.authorizer",
 				Detail:   fmt.Sprintf("authorizer[%d] is missing a name label.", ai),
 			})
 		}
 		if seenNames[a.Name] {
 			diags = append(diags, &hcl.Diagnostic{
 				Severity: hcl.DiagError,
-				Summary:  "Duplicate wireguard.dynamic_peers.authorizer",
+				Summary:  "Duplicate enrollment.authorizer",
 				Detail:   fmt.Sprintf("authorizer name %q is declared more than once.", a.Name),
 			})
 		}
@@ -1227,7 +1238,7 @@ func validateWireGuardDynamicPeers(gw *Gateway) hcl.Diagnostics {
 		if a.Type != "kubernetes_token_review" {
 			diags = append(diags, &hcl.Diagnostic{
 				Severity: hcl.DiagError,
-				Summary:  "Unsupported wireguard.dynamic_peers.authorizer",
+				Summary:  "Unsupported enrollment.authorizer",
 				Detail:   fmt.Sprintf("authorizer %q has unsupported type %q; v1 supports \"kubernetes_token_review\".", a.Name, a.Type),
 			})
 			continue
@@ -1235,21 +1246,21 @@ func validateWireGuardDynamicPeers(gw *Gateway) hcl.Diagnostics {
 		if strings.TrimSpace(a.Audience) == "" {
 			diags = append(diags, &hcl.Diagnostic{
 				Severity: hcl.DiagError,
-				Summary:  "Missing wireguard.dynamic_peers.authorizer.audience",
+				Summary:  "Missing enrollment.authorizer.audience",
 				Detail:   fmt.Sprintf("authorizer %q requires `audience` so projected ServiceAccount tokens are scoped to clawpatrol.", a.Name),
 			})
 		}
 		if strings.TrimSpace(a.ProfileLabel) == "" {
 			diags = append(diags, &hcl.Diagnostic{
 				Severity: hcl.DiagError,
-				Summary:  "Missing wireguard.dynamic_peers.authorizer.profile_label",
+				Summary:  "Missing enrollment.authorizer.profile_label",
 				Detail:   fmt.Sprintf("authorizer %q requires `profile_label` so the gateway can resolve the pod's clawpatrol profile from Kubernetes.", a.Name),
 			})
 		}
 		if len(a.Allow) == 0 {
 			diags = append(diags, &hcl.Diagnostic{
 				Severity: hcl.DiagError,
-				Summary:  "Missing wireguard.dynamic_peers.authorizer.allow",
+				Summary:  "Missing enrollment.authorizer.allow",
 				Detail:   fmt.Sprintf("authorizer %q requires at least one `allow { namespace = ..., service_account = ..., profiles = [...] }` rule.", a.Name),
 			})
 		}
@@ -1257,21 +1268,21 @@ func validateWireGuardDynamicPeers(gw *Gateway) hcl.Diagnostics {
 			if strings.TrimSpace(rule.Namespace) == "" {
 				diags = append(diags, &hcl.Diagnostic{
 					Severity: hcl.DiagError,
-					Summary:  "Invalid wireguard.dynamic_peers.authorizer.allow",
+					Summary:  "Invalid enrollment.authorizer.allow",
 					Detail:   fmt.Sprintf("authorizer %q allow[%d] is missing `namespace`.", a.Name, i),
 				})
 			}
 			if strings.TrimSpace(rule.ServiceAccount) == "" {
 				diags = append(diags, &hcl.Diagnostic{
 					Severity: hcl.DiagError,
-					Summary:  "Invalid wireguard.dynamic_peers.authorizer.allow",
+					Summary:  "Invalid enrollment.authorizer.allow",
 					Detail:   fmt.Sprintf("authorizer %q allow[%d] is missing `service_account`.", a.Name, i),
 				})
 			}
 			if len(rule.Profiles) == 0 {
 				diags = append(diags, &hcl.Diagnostic{
 					Severity: hcl.DiagError,
-					Summary:  "Invalid wireguard.dynamic_peers.authorizer.allow",
+					Summary:  "Invalid enrollment.authorizer.allow",
 					Detail:   fmt.Sprintf("authorizer %q allow[%d] is missing at least one profile.", a.Name, i),
 				})
 			}
@@ -1279,7 +1290,7 @@ func validateWireGuardDynamicPeers(gw *Gateway) hcl.Diagnostics {
 				if strings.TrimSpace(p) == "" {
 					diags = append(diags, &hcl.Diagnostic{
 						Severity: hcl.DiagError,
-						Summary:  "Invalid wireguard.dynamic_peers.authorizer.allow",
+						Summary:  "Invalid enrollment.authorizer.allow",
 						Detail:   fmt.Sprintf("authorizer %q allow[%d].profiles[%d] is empty.", a.Name, i, j),
 					})
 				}

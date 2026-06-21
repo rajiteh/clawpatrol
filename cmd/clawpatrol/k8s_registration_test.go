@@ -34,8 +34,8 @@ func TestK8sServiceAccountAndAllowlist(t *testing.T) {
 	if _, _, ok := serviceAccountFromUsername("alice@example.com"); ok {
 		t.Fatal("non-serviceaccount username accepted")
 	}
-	cfg := &config.DynamicPeerAuthorizerBlock{
-		Allow: []config.DynamicPeerKubernetesAllow{{
+	cfg := &config.EnrollmentAuthorizerBlock{
+		Allow: []config.EnrollmentAllow{{
 			Namespace:      "agents",
 			ServiceAccount: "agent-runner",
 			Profiles:       []string{"default", "prod"},
@@ -52,14 +52,14 @@ func TestK8sServiceAccountAndAllowlist(t *testing.T) {
 	}
 }
 
-type fakeK8sVerifier func(context.Context, string, k8sDynamicPeerClaims, *config.DynamicPeerAuthorizerBlock) (k8sVerifiedPod, error)
+type fakeK8sVerifier func(context.Context, string, k8sDynamicPeerClaims, *config.EnrollmentAuthorizerBlock) (k8sVerifiedPod, error)
 
-func (f fakeK8sVerifier) VerifyPod(ctx context.Context, token string, claims k8sDynamicPeerClaims, cfg *config.DynamicPeerAuthorizerBlock) (k8sVerifiedPod, error) {
+func (f fakeK8sVerifier) VerifyPod(ctx context.Context, token string, claims k8sDynamicPeerClaims, cfg *config.EnrollmentAuthorizerBlock) (k8sVerifiedPod, error) {
 	return f(ctx, token, claims, cfg)
 }
 
 func TestKubernetesTokenReviewAuthorizerIdentity(t *testing.T) {
-	cfg := &config.DynamicPeerAuthorizerBlock{Name: "agents"}
+	cfg := &config.EnrollmentAuthorizerBlock{Name: "agents"}
 	claims, err := json.Marshal(k8sDynamicPeerClaims{
 		PodName:      "agent-1",
 		PodNamespace: "agents",
@@ -72,7 +72,7 @@ func TestKubernetesTokenReviewAuthorizerIdentity(t *testing.T) {
 	auth := &kubernetesTokenReviewAuthorizer{
 		name: "agents",
 		cfg:  cfg,
-		verifier: fakeK8sVerifier(func(_ context.Context, token string, got k8sDynamicPeerClaims, _ *config.DynamicPeerAuthorizerBlock) (k8sVerifiedPod, error) {
+		verifier: fakeK8sVerifier(func(_ context.Context, token string, got k8sDynamicPeerClaims, _ *config.EnrollmentAuthorizerBlock) (k8sVerifiedPod, error) {
 			if token != "pod-token" {
 				t.Fatalf("token = %q, want pod-token", token)
 			}

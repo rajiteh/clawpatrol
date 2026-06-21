@@ -399,21 +399,19 @@ func TestApiDynamicPeerList(t *testing.T) {
 
 func enabledDynamicPeersCfg() *config.Gateway {
 	return &config.Gateway{Settings: &config.GatewaySettings{
-		WireGuard: &config.WireGuardBlock{
-			DynamicPeers: &config.DynamicPeersBlock{
-				Enabled: true,
-				Authorizers: []config.DynamicPeerAuthorizerBlock{{
-					Type:         dynamicPeerAuthorizerKubernetesTokenRev,
-					Name:         "agents",
-					Audience:     "clawpatrol",
-					ProfileLabel: "clawpatrol.dev/profile",
-					Allow: []config.DynamicPeerKubernetesAllow{{
-						Namespace:      "agents",
-						ServiceAccount: "agent-runner",
-						Profiles:       []string{"default"},
-					}},
+		WireGuard: &config.WireGuardBlock{},
+		Enrollment: &config.EnrollmentBlock{
+			Authorizers: []config.EnrollmentAuthorizerBlock{{
+				Type:         dynamicPeerAuthorizerKubernetesTokenRev,
+				Name:         "agents",
+				Audience:     "clawpatrol",
+				ProfileLabel: "clawpatrol.dev/profile",
+				Allow: []config.EnrollmentAllow{{
+					Namespace:      "agents",
+					ServiceAccount: "agent-runner",
+					Profiles:       []string{"default"},
 				}},
-			},
+			}},
 		},
 	}}
 }
@@ -434,7 +432,7 @@ func TestApiDynamicPeerRegisterGuards(t *testing.T) {
 	g.policy.Store(&config.CompiledPolicy{Profiles: map[string]*config.CompiledProfile{"default": {}}})
 	// Verifier resolves any token to a pod in the "ghost" profile, which is
 	// not declared in the policy above.
-	g.k8sVerifier = fakeK8sVerifier(func(_ context.Context, _ string, claims k8sDynamicPeerClaims, _ *config.DynamicPeerAuthorizerBlock) (k8sVerifiedPod, error) {
+	g.k8sVerifier = fakeK8sVerifier(func(_ context.Context, _ string, claims k8sDynamicPeerClaims, _ *config.EnrollmentAuthorizerBlock) (k8sVerifiedPod, error) {
 		return k8sVerifiedPod{
 			Namespace:      claims.PodNamespace,
 			Name:           claims.PodName,

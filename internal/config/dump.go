@@ -68,6 +68,9 @@ func dumpSettings(s *GatewaySettings) map[string]any {
 	if s.Tailscale != nil {
 		out["tailscale"] = dumpTailscale(s.Tailscale)
 	}
+	if s.Enrollment != nil {
+		out["enrollment"] = dumpEnrollment(s.Enrollment)
+	}
 	return out
 }
 
@@ -90,9 +93,6 @@ func dumpWireGuard(w *WireGuardBlock) map[string]any {
 	}
 	if w.ServerPub != "" {
 		out["server_pub"] = w.ServerPub
-	}
-	if w.DynamicPeers != nil {
-		out["dynamic_peers"] = dumpDynamicPeers(w.DynamicPeers)
 	}
 	return out
 }
@@ -126,17 +126,14 @@ func dumpTailscale(t *TailscaleBlock) map[string]any {
 	return out
 }
 
-func dumpDynamicPeers(d *DynamicPeersBlock) map[string]any {
+func dumpEnrollment(e *EnrollmentBlock) map[string]any {
 	out := map[string]any{}
-	if d.Enabled {
-		out["enabled"] = true
+	if e.PeerTTL != "" {
+		out["peer_ttl"] = e.PeerTTL
 	}
-	if d.LeaseTTL != "" {
-		out["lease_ttl"] = d.LeaseTTL
-	}
-	if len(d.Authorizers) > 0 {
-		authorizers := make([]map[string]any, 0, len(d.Authorizers))
-		for _, a := range d.Authorizers {
+	if len(e.Authorizers) > 0 {
+		authorizers := make([]map[string]any, 0, len(e.Authorizers))
+		for _, a := range e.Authorizers {
 			row := map[string]any{
 				"type": a.Type,
 				"name": a.Name,
@@ -148,7 +145,7 @@ func dumpDynamicPeers(d *DynamicPeersBlock) map[string]any {
 				row["profile_label"] = a.ProfileLabel
 			}
 			if len(a.Allow) > 0 {
-				row["allow"] = dumpDynamicPeerKubernetesAllow(a.Allow)
+				row["allow"] = dumpEnrollmentAllow(a.Allow)
 			}
 			authorizers = append(authorizers, row)
 		}
@@ -157,7 +154,7 @@ func dumpDynamicPeers(d *DynamicPeersBlock) map[string]any {
 	return out
 }
 
-func dumpDynamicPeerKubernetesAllow(rules []DynamicPeerKubernetesAllow) []map[string]any {
+func dumpEnrollmentAllow(rules []EnrollmentAllow) []map[string]any {
 	if len(rules) == 0 {
 		return nil
 	}

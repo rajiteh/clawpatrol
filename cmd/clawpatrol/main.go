@@ -3437,7 +3437,7 @@ func runGateway(args []string) {
 			log.Fatalf("wireguard: %v", err)
 		}
 		setWGServer(wg)
-		if cfg.IsWireGuardDynamicPeersEnabled() {
+		if cfg.IsEnrollmentEnabled() {
 			g.logDynamicPeerReconcile(context.Background())
 		}
 		// Always run the lease sweeper once WireGuard is up. Dynamic peers
@@ -3445,7 +3445,7 @@ func runGateway(args []string) {
 		// behind must keep draining even after the feature is turned off.
 		// The sweep is a cheap no-op while the table is empty.
 		go g.startDynamicPeerLeaseSweeper(context.Background())
-		if cfg.IsWireGuardDynamicPeersEnabled() {
+		if cfg.IsEnrollmentEnabled() {
 			log.Printf("wireguard dynamic peers: enabled")
 		}
 		dashMux := newWebMux(g, cfg.Join(), cfg.PublicURL())

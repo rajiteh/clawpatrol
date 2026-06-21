@@ -135,7 +135,7 @@ func (w *webMux) apiDynamicPeerRegister(rw http.ResponseWriter, r *http.Request)
 		return
 	}
 	cfg := w.g.cfg.Load()
-	if cfg == nil || !cfg.IsWireGuardDynamicPeersEnabled() {
+	if cfg == nil || !cfg.IsEnrollmentEnabled() {
 		http.NotFound(rw, r)
 		return
 	}
@@ -163,7 +163,7 @@ func (w *webMux) apiDynamicPeerRegister(rw http.ResponseWriter, r *http.Request)
 		http.Error(rw, err.Error(), http.StatusForbidden)
 		return
 	}
-	ttl, err := cfg.WireGuardDynamicPeersLeaseTTL()
+	ttl, err := cfg.EnrollmentPeerTTL()
 	if err != nil {
 		http.Error(rw, "invalid lease ttl", http.StatusInternalServerError)
 		return
@@ -186,7 +186,7 @@ func (w *webMux) apiDynamicPeerHeartbeat(rw http.ResponseWriter, r *http.Request
 		return
 	}
 	cfg := w.g.cfg.Load()
-	if cfg == nil || !cfg.IsWireGuardDynamicPeersEnabled() {
+	if cfg == nil || !cfg.IsEnrollmentEnabled() {
 		http.NotFound(rw, r)
 		return
 	}
@@ -196,7 +196,7 @@ func (w *webMux) apiDynamicPeerHeartbeat(rw http.ResponseWriter, r *http.Request
 		http.Error(rw, "unknown or missing peer api token", http.StatusUnauthorized)
 		return
 	}
-	ttl, err := cfg.WireGuardDynamicPeersLeaseTTL()
+	ttl, err := cfg.EnrollmentPeerTTL()
 	if err != nil {
 		http.Error(rw, "invalid lease ttl", http.StatusInternalServerError)
 		return
@@ -220,7 +220,7 @@ func (w *webMux) apiDynamicPeerHeartbeat(rw http.ResponseWriter, r *http.Request
 
 func (w *webMux) apiDynamicPeerDelete(rw http.ResponseWriter, r *http.Request) {
 	cfg := w.g.cfg.Load()
-	if cfg == nil || !cfg.IsWireGuardDynamicPeersEnabled() {
+	if cfg == nil || !cfg.IsEnrollmentEnabled() {
 		http.NotFound(rw, r)
 		return
 	}
@@ -314,11 +314,11 @@ func (g *Gateway) dynamicPeerAuthorizerFor(cfg *config.Gateway, transport, name 
 	if strings.TrimSpace(name) == "" {
 		return nil, fmt.Errorf("dynamic peer authorizer is required")
 	}
-	if cfg == nil || !cfg.IsWireGuardDynamicPeersEnabled() {
+	if cfg == nil || !cfg.IsEnrollmentEnabled() {
 		return nil, fmt.Errorf("wireguard dynamic peers are not enabled")
 	}
-	for i := range cfg.Settings.WireGuard.DynamicPeers.Authorizers {
-		a := &cfg.Settings.WireGuard.DynamicPeers.Authorizers[i]
+	for i := range cfg.Settings.Enrollment.Authorizers {
+		a := &cfg.Settings.Enrollment.Authorizers[i]
 		if a.Name != name {
 			continue
 		}
@@ -840,12 +840,12 @@ type k8sVerifiedPod struct {
 }
 
 type k8sRegistrationVerifier interface {
-	VerifyPod(ctx context.Context, token string, claims k8sDynamicPeerClaims, cfg *config.DynamicPeerAuthorizerBlock) (k8sVerifiedPod, error)
+	VerifyPod(ctx context.Context, token string, claims k8sDynamicPeerClaims, cfg *config.EnrollmentAuthorizerBlock) (k8sVerifiedPod, error)
 }
 
 type kubernetesTokenReviewAuthorizer struct {
 	name     string
-	cfg      *config.DynamicPeerAuthorizerBlock
+	cfg      *config.EnrollmentAuthorizerBlock
 	verifier k8sRegistrationVerifier
 }
 
@@ -930,7 +930,7 @@ func newInClusterK8sClient() (*inClusterK8sClient, error) {
 	}, nil
 }
 
-func (c *inClusterK8sClient) VerifyPod(ctx context.Context, token string, claims k8sDynamicPeerClaims, cfg *config.DynamicPeerAuthorizerBlock) (k8sVerifiedPod, error) {
+func (c *inClusterK8sClient) VerifyPod(ctx context.Context, token string, claims k8sDynamicPeerClaims, cfg *config.EnrollmentAuthorizerBlock) (k8sVerifiedPod, error) {
 	user, err := c.tokenReview(ctx, token, cfg.Audience)
 	if err != nil {
 		return k8sVerifiedPod{}, err
@@ -1084,7 +1084,7 @@ func serviceAccountFromUsername(username string) (namespace, serviceAccount stri
 	return parts[0], parts[1], true
 }
 
-func k8sRegistrationAllowed(cfg *config.DynamicPeerAuthorizerBlock, namespace, serviceAccount, profile string) bool {
+func k8sRegistrationAllowed(cfg *config.EnrollmentAuthorizerBlock, namespace, serviceAccount, profile string) bool {
 	for _, rule := range cfg.Allow {
 		if rule.Namespace == namespace &&
 			rule.ServiceAccount == serviceAccount &&
