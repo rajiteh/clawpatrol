@@ -248,9 +248,10 @@ func ResolveCredential(policy *config.CompiledPolicy, profile string, ep *config
 	}
 	// Placeholder detection: if any entry constrains "placeholder",
 	// ask the endpoint plugin's detector once for the value the
-	// agent embedded in this request. Cheaper than re-detecting per
-	// entry; consistent across same-placeholder candidates that
-	// differ on other fields.
+	// agent embedded in this request. Credential types with a
+	// CredentialPlaceholderMatcher use their own exact matching hook
+	// below instead; the endpoint-wide result remains the fallback
+	// for all existing placeholder-based credentials.
 	var sentPlaceholder string
 	if det, ok := ep.Plugin.Runtime.(PlaceholderDetector); ok && req != nil {
 		candidates := make([]string, 0, len(entries))
@@ -270,7 +271,7 @@ func ResolveCredential(policy *config.CompiledPolicy, profile string, ep *config
 	bestSpecificity := -1
 	tiedAtBest := false
 	for _, c := range entries {
-		if !disambiguatorMatches(c.Disambiguators, req, sentPlaceholder) {
+		if !disambiguatorMatches(c, req, sentPlaceholder) {
 			continue
 		}
 		spec := len(c.Disambiguators)
@@ -362,12 +363,22 @@ func CredentialMismatchReason(policy *config.CompiledPolicy, profile string, ep 
 // entry's disambiguator map is satisfied by the request. Unknown
 // field names always fail-closed — the dispatcher won't guess at
 // future fields it doesn't know how to read off req.
-func disambiguatorMatches(d map[string]string, req *match.Request, sentPlaceholder string) bool {
+func disambiguatorMatches(c *config.CompiledCredential, req *match.Request, sentPlaceholder string) bool {
+	if c == nil {
+		return false
+	}
+	d := c.Disambiguators
 	for field, want := range d {
 		var got string
 		switch field {
 		case "placeholder":
-			got = sentPlaceholder
+			if matcher := credentialPlaceholderMatcher(c); matcher != nil {
+				if matcher.MatchPlaceholder(req, want) {
+					got = want
+				}
+			} else {
+				got = sentPlaceholder
+			}
 		case "user":
 			if req != nil {
 				got = req.User
@@ -384,6 +395,17 @@ func disambiguatorMatches(d map[string]string, req *match.Request, sentPlacehold
 		}
 	}
 	return true
+}
+
+func credentialPlaceholderMatcher(c *config.CompiledCredential) CredentialPlaceholderMatcher {
+	if c == nil || c.Credential == nil {
+		return nil
+	}
+	matcher, ok := c.Credential.Body.(CredentialPlaceholderMatcher)
+	if !ok {
+		return nil
+	}
+	return matcher
 }
 
 // profileCredentialsAt returns the per-endpoint dispatch entries for

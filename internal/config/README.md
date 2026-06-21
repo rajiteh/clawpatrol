@@ -208,6 +208,11 @@ real secret. A bare-name entry in the same profile is the
 no-placeholder fallback for that (profile, endpoint) pair — at most
 one fallback per pair.
 
+`header_token` narrows placeholder detection to its configured
+header: the request header value must equal `prefix + placeholder`.
+Placeholders in other headers, or embedded inside a larger header
+value, do not select the credential.
+
 Placeholders live on the profile, not on the credential, because the
 disambiguation is only needed when a single identity actively wields
 multiple credentials at one endpoint. Per-user-fanout endpoints

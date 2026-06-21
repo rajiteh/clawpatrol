@@ -350,6 +350,14 @@ credential "google_gke_credential" "example" {}
 
 ### `credential "header_token" "<name>"`
 
+Stamps the secret onto an arbitrary HTTP header,
+optionally prefixed.
+
+When a header_token credential uses a placeholder disambiguator, the
+incoming request must contain the exact configured header value
+`prefix + placeholder`. Placeholders found in other headers or
+embedded inside a larger header value do not select this credential.
+
 | Attribute | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `header` | `string` | yes | The HTTP header name to overwrite with the secret value. |
