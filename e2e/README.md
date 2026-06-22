@@ -1,9 +1,9 @@
 # End-to-end tests
 
 This directory contains repo-level end-to-end validation flows. The
-Kubernetes WireGuard dynamic-peer test is the main one today.
+Kubernetes WireGuard enrollment test is the main one today.
 
-## Kubernetes WireGuard dynamic peers
+## Kubernetes WireGuard enrollment
 
 Run from the repo root:
 
@@ -22,19 +22,19 @@ The overlay reuses the example base at
 
 - `clawpatrol-e2e` and `agents-e2e` namespaces,
 - the local `clawpatrol-kind-e2e:dev` image,
-- short dynamic-peer leases,
+- a short enrollment `peer_ttl`,
 - an e2e HTTP target used to prove tunneled data-path traffic.
 
 The script validates:
 
 - gateway rollout,
-- dynamic peer registration,
+- workload enrollment through the authorizer,
 - env and CA handoff from the sidecar,
 - restricted agent container contract,
 - tunnel routing through the WireGuard interface,
 - a TCP request through the tunnel,
-- dynamic peer lease and WireGuard peer state,
-- heartbeat advancement,
+- the enrolled `wg_peers` row and WireGuard peer state,
+- rx_bytes liveness (a live tunnel holds its peer past `peer_ttl`),
 - graceful deregistration and peer revocation.
 
 By default the script deletes the e2e namespaces and cluster-scoped RBAC
@@ -60,7 +60,7 @@ CLAWPATROL_E2E_CLUSTER=kind-dev ./e2e/kubernetes-wireguard-e2e.sh
 CLAWPATROL_E2E_CONTEXT=kind-kind-dev ./e2e/kubernetes-wireguard-e2e.sh
 CLAWPATROL_E2E_SKIP_BUILD=1 ./e2e/kubernetes-wireguard-e2e.sh
 CLAWPATROL_E2E_KEEP_RESOURCES=1 ./e2e/kubernetes-wireguard-e2e.sh
-CLAWPATROL_E2E_CHECK_HEARTBEAT=0 ./e2e/kubernetes-wireguard-e2e.sh
+CLAWPATROL_E2E_CHECK_LIVENESS=0 ./e2e/kubernetes-wireguard-e2e.sh
 CLAWPATROL_E2E_CHECK_EXPIRY=1 ./e2e/kubernetes-wireguard-e2e.sh
 CLAWPATROL_E2E_GOARCH=arm64 ./e2e/kubernetes-wireguard-e2e.sh
 ```
@@ -70,5 +70,5 @@ already loaded into the kind cluster. `CLAWPATROL_E2E_KEEP_RESOURCES=1`
 keeps namespaces and RBAC objects around for debugging; clean them up
 manually afterward.
 
-Image tag, namespace names, RBAC names, and lease TTL are owned by the
-overlay files, not by the shell script.
+Image tag, namespace names, RBAC names, and enrollment `peer_ttl` are
+owned by the overlay files, not by the shell script.

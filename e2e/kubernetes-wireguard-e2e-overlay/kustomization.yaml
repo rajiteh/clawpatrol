@@ -5,7 +5,7 @@ resources:
   - ../../examples/kubernetes/kustomization
   - http-echo.yaml
 
-# Swap the gateway config for the e2e one (short lease + *-e2e namespaces).
+# Swap the gateway config for the e2e one (short peer_ttl + *-e2e namespaces).
 # behavior: replace targets the base configMapGenerator by name+namespace;
 # the namespace is then renamed to clawpatrol-e2e by the patch below.
 generatorOptions:

@@ -52,6 +52,7 @@ The gateway block carries operational settings — listen addresses, the WireGua
 | `genai_telemetry` | `block` | no | GenAITelemetry, if present, enables export of OpenTelemetry GenAI semantic-convention spans (gen_ai.*) for intercepted LLM requests. Requires the OTLP exporter to be configured (OTEL_EXPORTER_OTLP_ENDPOINT); without it there is nothing to export to. The block is opt-in: when absent, no gen_ai.* spans are emitted and there is no added per-request overhead. |
 | `wireguard` | `block` | no | WireGuard, if present, enables the embedded userspace WireGuard server. Required block when running WG-mode deployments. |
 | `tailscale` | `block` | no | Tailscale, if present, enables the embedded tsnet node and the Tailscale control plane (OAuth key minting, exit-node routing). Both transports may be enabled simultaneously. |
+| `enrollment` | `block` | no | Enrollment, if present, lets workloads self-enroll as transient WireGuard peers through a configured authorizer (e.g. Kubernetes TokenReview). Requires a `wireguard` block for the data plane. |
 
 **Nested block `limits {}`:**
 
@@ -99,39 +100,6 @@ transport.
 | `endpoint` | `string` | no | The host:port advertised in client wg.conf as `Endpoint = ...`. Host defaults to public_url's host; port defaults to listen_port. Set only for split-host deployments (gateway sits behind a different hostname/IP for WG than for the dashboard). |
 | `interface` | `string` | no | The WireGuard interface name the gateway manages. Mostly irrelevant in userspace mode; leave unset. |
 | `server_pub` | `string` | no | The WireGuard server public key advertised to clients. Normally derived from gateway state; only set when bootstrapping from an external key. |
-| `dynamic_peers` | `block` | no | Lets workloads self-register as transient peers for this WireGuard transport. v1 supports Kubernetes TokenReview authorizers only. |
-
-**Nested block `dynamic_peers {}`:**
-
-The body of a transport's `dynamic_peers { ... }`
-block. It configures transient, self-registering peers for that
-transport.
-
-| Attribute | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `enabled` | `bool` | no | Enables the dynamic peer registration APIs for this transport. When false or omitted, authorizer config may be present but workloads cannot self-register. |
-| `lease_ttl` | `string` | no | How long a dynamic peer remains valid without a heartbeat. Uses Go time.ParseDuration syntax; empty defaults to 2m. |
-| `authorizer` | `block` | no | Lists `authorizer "<type>" "<name>" { ... }` blocks. v1 supports type "kubernetes_token_review". |
-
-**Nested block `authorizer {}`:**
-
-A named dynamic-peer authorization
-source. Kubernetes TokenReview is the first supported type; the
-generic labels keep the config shape ready for future authorizers.
-
-| Attribute | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `audience` | `string` | no | Passed to Kubernetes TokenReview and should match the projected ServiceAccount token's audience. |
-| `profile_label` | `string` | no | Read from the live Pod object; clients do not get to submit their own profile. |
-| `allow` | `block` | no | Allow rules for Kubernetes identities that may register through this authorizer. At least one valid rule is required. |
-
-**Nested block `allow {}`:**
-
-| Attribute | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `namespace` | `string` | no | Kubernetes namespace whose pods may register. The TokenReview identity and live Pod namespace must both match. |
-| `service_account` | `string` | no | Kubernetes ServiceAccount name required for registration. |
-| `profiles` | `[]string` | no | Claw Patrol profiles this rule may select. The selected profile comes from the live Pod label named by `profile_label`. |
 
 **Nested block `tailscale {}`:**
 
@@ -148,6 +116,41 @@ inside `gateway { ... }`. Presence of the block enables tsnet.
 | `funnel` | `bool` | no | Enables Tailscale Funnel on :443 so the join bootstrap and credential webhook paths are internet-reachable via the tsnet cert domain. Requires HTTPS enabled for the tailnet; if public_url is unset the gateway derives it from the tsnet cert domain at startup. |
 | `oauth_client_id` | `string` | no | The OAuth client id used to mint per-device tailnet auth keys at approval time. |
 | `oauth_client_secret` | `string` | no | The OAuth client secret paired with OAuthClientID. |
+
+**Nested block `enrollment {}`:**
+
+The body of the top-level `enrollment { ... }`
+block inside `gateway { ... }`. It lets workloads self-enroll as
+transient WireGuard peers through a configured authorizer, instead of
+the interactive `clawpatrol join` flow. The data plane is WireGuard
+(v1); the authorizer is pluggable.
+
+| Attribute | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `peer_ttl` | `string` | no | A time.ParseDuration grace window: an enrolled peer is reaped once its WireGuard traffic has been quiet for longer than this. Empty defaults to 3m. Liveness is observed from the WG device (rx_bytes progress), not an app-level heartbeat. |
+| `authorizer` | `block` | no | Lists `authorizer "<type>" "<name>" { ... }` blocks. v1 supports type "kubernetes_token_review". |
+
+**Nested block `authorizer {}`:**
+
+A named enrollment authorization source.
+Kubernetes TokenReview is the first supported type; the generic labels
+keep the config shape ready for future authorizers (OIDC, SPIFFE, …).
+
+| Attribute | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `audience` | `string` | no | Passed to Kubernetes TokenReview and should match the projected ServiceAccount token's audience. |
+| `profile_label` | `string` | no | Read from the live Pod object; clients do not get to submit their own profile. |
+| `allow` | `block` | no |  |
+
+**Nested block `allow {}`:**
+
+One Kubernetes identity/profile allow rule.
+
+| Attribute | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `namespace` | `string` | no |  |
+| `service_account` | `string` | no |  |
+| `profiles` | `[]string` | no |  |
 
 ## `profile "<name>" { ... }`
 

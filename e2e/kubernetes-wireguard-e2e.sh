@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# Kubernetes WireGuard dynamic-peer e2e against a local kind cluster.
+# Kubernetes WireGuard enrollment e2e against a local kind cluster.
 #
 # Builds the workspace into a kind-loaded image, applies the e2e kustomize
 # overlay (examples base + *-e2e isolation), and drives the full lifecycle:
-# register -> handoff -> restricted-agent contract -> tunnel data path ->
-# lease/peer tables -> heartbeat -> deregister/expiry -> peer revocation.
+# enroll -> handoff -> restricted-agent contract -> tunnel data path ->
+# wg_peers enrollment row -> rx_bytes liveness -> deregister/reap ->
+# peer revocation.
 #
 # The manifests are the source of truth (examples/kubernetes/kustomization +
 # e2e/kubernetes-wireguard-e2e-overlay); this script only builds the image,
@@ -20,7 +21,7 @@ KUBE_CONTEXT="${CLAWPATROL_E2E_CONTEXT:-kind-${CLUSTER_NAME}}"
 TIMEOUT="${CLAWPATROL_E2E_TIMEOUT:-180s}"
 SKIP_BUILD="${CLAWPATROL_E2E_SKIP_BUILD:-0}"
 KEEP_RESOURCES="${CLAWPATROL_E2E_KEEP_RESOURCES:-0}"
-CHECK_HEARTBEAT="${CLAWPATROL_E2E_CHECK_HEARTBEAT:-1}"
+CHECK_LIVENESS="${CLAWPATROL_E2E_CHECK_LIVENESS:-1}"
 CHECK_EXPIRY="${CLAWPATROL_E2E_CHECK_EXPIRY:-0}"
 GOARCH_OVERRIDE="${CLAWPATROL_E2E_GOARCH:-}"
 
@@ -36,14 +37,14 @@ E2E_HTTP="clawpatrol-e2e-http"
 KUBECTL=(kubectl --context "${KUBE_CONTEXT}")
 WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/clawpatrol-k8s-e2e.XXXXXX")"
 
-# LEASE_TTL is read from the overlay config (in preflight, after the files
-# are confirmed to exist) so the heartbeat wait stays in sync with what the
-# gateway actually enforces.
-LEASE_TTL="30s"
+# PEER_TTL is read from the overlay config (in preflight, after the files
+# are confirmed to exist) so the liveness/reap waits stay in sync with what
+# the gateway actually enforces.
+PEER_TTL="30s"
 
 usage() {
   cat <<'USAGE'
-Run the Kubernetes WireGuard dynamic-peer e2e against a local kind cluster.
+Run the Kubernetes WireGuard enrollment e2e against a local kind cluster.
 
   ./e2e/kubernetes-wireguard-e2e.sh
 
@@ -53,11 +54,11 @@ Environment knobs:
   CLAWPATROL_E2E_TIMEOUT         kubectl wait timeout, default: 180s
   CLAWPATROL_E2E_SKIP_BUILD      set 1 to skip go/docker build + kind load
   CLAWPATROL_E2E_KEEP_RESOURCES  set 1 to skip final namespace cleanup
-  CLAWPATROL_E2E_CHECK_HEARTBEAT set 0 to skip the heartbeat advancement check
-  CLAWPATROL_E2E_CHECK_EXPIRY    set 1 to test TTL cleanup (force-delete sidecar)
+  CLAWPATROL_E2E_CHECK_LIVENESS  set 0 to skip the rx_bytes liveness check
+  CLAWPATROL_E2E_CHECK_EXPIRY    set 1 to test reap cleanup (force-delete sidecar)
   CLAWPATROL_E2E_GOARCH          override node arch for the Linux build
 
-Image tag, namespaces, lease TTL, and RBAC names live in the overlay
+Image tag, namespaces, peer TTL, and RBAC names live in the overlay
 (e2e/kubernetes-wireguard-e2e-overlay); edit there, not here.
 USAGE
 }
@@ -123,9 +124,9 @@ fi
 [[ -f "${OVERLAY}/gateway.hcl" ]] || fail "e2e gateway config not found: ${OVERLAY}/gateway.hcl"
 [[ -f "${DOCKERFILE}" ]] || fail "Dockerfile not found: ${DOCKERFILE}"
 
-# Keep the heartbeat wait in sync with the lease the gateway enforces.
-LEASE_TTL="$(sed -n 's/.*lease_ttl[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "${OVERLAY}/gateway.hcl" | head -1)"
-LEASE_TTL="${LEASE_TTL:-30s}"
+# Keep the liveness/reap waits in sync with the peer_ttl the gateway enforces.
+PEER_TTL="$(sed -n 's/.*peer_ttl[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "${OVERLAY}/gateway.hcl" | head -1)"
+PEER_TTL="${PEER_TTL:-30s}"
 
 if ! kind get clusters | grep -Fxq "${CLUSTER_NAME}"; then
   fail "kind cluster ${CLUSTER_NAME} not found"
@@ -181,9 +182,11 @@ agent_exec() { "${KUBECTL[@]}" -n "${AGENTS_NS}" exec "${E2E_POD}" -c agent -- "
 gateway_exec() { "${KUBECTL[@]}" -n "${GATEWAY_NS}" exec "${GATEWAY_POD}" -c gateway -- "$@"; }
 sqlite_query() { gateway_exec sqlite3 -cmd '.timeout 5000' /opt/clawpatrol/clawpatrol.db "$1"; }
 
-lease_count() { sqlite_query "SELECT count(*) FROM dynamic_peer_leases WHERE display_name = '${AGENTS_NS}/${E2E_POD}';" 2>/dev/null; }
-lease_present() { [[ "$(lease_count || printf '0')" -ge 1 ]]; }
-lease_absent() { [[ "$(lease_count || printf '1')" -eq 0 ]]; }
+# Enrollment state lives on the wg_peers row (enrolled = 1); there is no
+# separate lease table. The reaper only ever touches enrolled rows.
+enrolled_count() { sqlite_query "SELECT count(*) FROM wg_peers WHERE enrolled = 1 AND display_name = '${AGENTS_NS}/${E2E_POD}';" 2>/dev/null; }
+enrolled_present() { [[ "$(enrolled_count || printf '0')" -ge 1 ]]; }
+enrolled_absent() { [[ "$(enrolled_count || printf '1')" -eq 0 ]]; }
 
 log "waiting for sidecar handoff files"
 wait_until "sidecar wrote ready/env/ca files" 120 \
@@ -203,35 +206,35 @@ log "checking tunnel route and a relayed TCP request"
 agent_exec sh -lc "ip route get '${HTTP_CLUSTER_IP}' | grep -q 'dev clawpatrol0'"
 agent_exec sh -lc "test \"\$(curl -sS --max-time 10 'http://${HTTP_CLUSTER_IP}:8081/')\" = 'ok'"
 
-log "checking dynamic peer lease and WireGuard peer tables"
+log "checking enrolled peer row and WireGuard peer tables"
 gateway_exec sh -lc 'command -v sqlite3 >/dev/null'
-wait_until "dynamic peer lease is present" 60 lease_present
-PEER_IP="$(sqlite_query "SELECT peer_ip FROM dynamic_peer_leases WHERE display_name = '${AGENTS_NS}/${E2E_POD}' LIMIT 1;")"
-[[ -n "${PEER_IP}" ]] || fail "dynamic peer lease did not include peer_ip"
+wait_until "enrolled peer row is present" 60 enrolled_present
+PEER_IP="$(sqlite_query "SELECT ip FROM wg_peers WHERE enrolled = 1 AND display_name = '${AGENTS_NS}/${E2E_POD}' LIMIT 1;")"
+[[ -n "${PEER_IP}" ]] || fail "enrolled peer row did not include an ip"
 sqlite_query "SELECT count(*) FROM wg_peers WHERE ip = '${PEER_IP}';" | grep -qx '1'
-log "registered peer ${PEER_IP}"
+log "enrolled peer ${PEER_IP}"
 
-if [[ "${CHECK_HEARTBEAT}" == "1" ]]; then
-  TTL_SECONDS="$(seconds_from_duration "${LEASE_TTL}")"
-  SLEEP_SECONDS=$(( TTL_SECONDS / 2 + 7 ))
-  (( SLEEP_SECONDS >= 8 )) || SLEEP_SECONDS=8
-  BEFORE_HEARTBEAT="$(sqlite_query "SELECT last_heartbeat_ns FROM dynamic_peer_leases WHERE peer_ip = '${PEER_IP}';")"
-  log "waiting ${SLEEP_SECONDS}s for heartbeat"
+if [[ "${CHECK_LIVENESS}" == "1" ]]; then
+  # No app-level heartbeat: the gateway drives liveness from WireGuard
+  # rx_bytes movement (persistent-keepalive ~every 25s). A live tunnel must
+  # therefore keep its enrolled row past peer_ttl without being reaped.
+  TTL_SECONDS="$(seconds_from_duration "${PEER_TTL}")"
+  SLEEP_SECONDS=$(( TTL_SECONDS + 30 ))
+  log "waiting ${SLEEP_SECONDS}s (> peer_ttl) to confirm keepalive liveness holds the peer"
   sleep "${SLEEP_SECONDS}"
-  AFTER_HEARTBEAT="$(sqlite_query "SELECT last_heartbeat_ns FROM dynamic_peer_leases WHERE peer_ip = '${PEER_IP}';")"
-  [[ "${AFTER_HEARTBEAT}" -gt "${BEFORE_HEARTBEAT}" ]] || fail "heartbeat did not advance"
-  log "heartbeat advanced"
+  enrolled_present || fail "live peer was reaped despite an active tunnel (rx_bytes liveness regressed)"
+  log "live peer survived past peer_ttl"
 fi
 
 if [[ "${CHECK_EXPIRY}" == "1" ]]; then
-  TTL_SECONDS="$(seconds_from_duration "${LEASE_TTL}")"
-  log "force deleting sidecar pod to test TTL expiry cleanup"
+  TTL_SECONDS="$(seconds_from_duration "${PEER_TTL}")"
+  log "force deleting sidecar pod to test rx_bytes reap cleanup"
   "${KUBECTL[@]}" -n "${AGENTS_NS}" delete pod "${E2E_POD}" --force --grace-period=0 --wait=true
-  wait_until "dynamic peer lease expired and was swept" "$((TTL_SECONDS + 75))" lease_absent
+  wait_until "enrolled peer went stale and was reaped" "$((TTL_SECONDS + 90))" enrolled_absent
 else
   log "deleting e2e pod and checking graceful deregistration"
   "${KUBECTL[@]}" -n "${AGENTS_NS}" delete pod "${E2E_POD}" --wait=true --timeout=60s
-  wait_until "dynamic peer lease removed" 45 lease_absent
+  wait_until "enrolled peer removed" 45 enrolled_absent
 fi
 
 sqlite_query "SELECT count(*) FROM wg_peers WHERE ip = '${PEER_IP}';" | grep -qx '0'

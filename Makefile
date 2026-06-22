@@ -14,7 +14,7 @@ validate-examples: dashboard
 		echo "validate $$f"; "$$bin" validate "$$f"; \
 	done
 
-# e2e drives the Kubernetes WireGuard dynamic-peer flow against a local kind
+# e2e drives the Kubernetes WireGuard enrollment flow against a local kind
 # cluster (see e2e/kubernetes-wireguard-e2e.sh for prerequisites + knobs).
 e2e:
 	./e2e/kubernetes-wireguard-e2e.sh

@@ -4,7 +4,7 @@ Claw Patrol can run inside Kubernetes with one long-lived gateway pod
 and stateless agent pods that appear only for the lifetime of a job.
 The gateway still uses the WireGuard transport, but agent pods do not
 need a pre-created peer or a human approval flow. Instead, each pod
-self-registers as a short-lived **dynamic peer** using its projected
+**self-enrolls** as a transient WireGuard peer using its projected
 Kubernetes ServiceAccount token.
 
 This mode is for same-cluster deployments where:
@@ -15,9 +15,9 @@ This mode is for same-cluster deployments where:
 - a privileged networking helper is acceptable outside the execution
   container.
 
-The Kubernetes authorizer is currently supported only under
-`gateway.wireguard.dynamic_peers`; Tailscale dynamic peers are not
-implemented yet.
+Enrollment is configured under a top-level `enrollment` block. The
+Kubernetes authorizer ships in-tree; it requires a `wireguard` block
+(the only transport in v1).
 
 ## Architecture
 
@@ -26,10 +26,10 @@ The deployment has three parts:
 - **Gateway pod** — runs `clawpatrol gateway`, the dashboard/API, and
   the userspace WireGuard server. It needs Kubernetes API permission to
   create TokenReviews and read allowed agent pods.
-- **WireGuard sidecar init container** — runs `clawpatrol run --tun`
-  with `restartPolicy: Always`. It owns `/dev/net/tun`, `NET_ADMIN`,
-  pod routing, the projected ServiceAccount token, dynamic peer
-  registration, heartbeats, and deregistration.
+- **WireGuard sidecar init container** — runs `clawpatrol agent` with
+  `restartPolicy: Always`. It owns `/dev/net/tun`, `NET_ADMIN`, pod
+  routing, the projected ServiceAccount token, enrollment, and
+  best-effort deregistration on shutdown.
 - **Agent container** — runs the actual workload. It has no Kubernetes
   token, no `/dev/net/tun`, no added capabilities, and only a read-only
   shared handoff volume.
@@ -43,8 +43,8 @@ succeeded.
 
 ## Gateway config
 
-Enable dynamic peers inside the WireGuard transport and add a named
-`kubernetes_token_review` authorizer:
+Add a top-level `enrollment` block with a named `kubernetes_token_review`
+authorizer:
 
 ```hcl
 gateway {
@@ -55,20 +55,19 @@ gateway {
     subnet_cidr = "10.55.0.0/24"
     listen_port = 51820
     endpoint    = "clawpatrol-wg.clawpatrol.svc:51820"
+  }
 
-    dynamic_peers {
-      enabled   = true
-      lease_ttl = "2m"
+  enrollment {
+    peer_ttl = "3m"
 
-      authorizer "kubernetes_token_review" "agents" {
-        audience      = "clawpatrol"
-        profile_label = "clawpatrol.dev/profile"
+    authorizer "kubernetes_token_review" "agents" {
+      audience      = "clawpatrol"
+      profile_label = "clawpatrol.dev/profile"
 
-        allow {
-          namespace       = "agents"
-          service_account = "agent-runner"
-          profiles        = ["default"]
-        }
+      allow {
+        namespace       = "agents"
+        service_account = "agent-runner"
+        profiles        = ["default"]
       }
     }
   }
@@ -84,6 +83,8 @@ Kubernetes TokenReview, reads the live Pod object, checks namespace and
 ServiceAccount against the allowlist, and selects the Claw Patrol
 profile from the configured pod label. The client does not get to
 submit its own profile.
+
+`peer_ttl` is the liveness window the gateway enforces (default `3m`).
 
 The complete standalone HCL example lives at
 [`examples/wireguard-dynamic-peers-kubernetes.hcl`](https://github.com/denoland/clawpatrol/blob/main/examples/wireguard-dynamic-peers-kubernetes.hcl).
@@ -108,10 +109,9 @@ initContainers:
     restartPolicy: Always
     image: ghcr.io/denoland/clawpatrol:latest
     args:
-      - run
-      - --tun
+      - agent
       - --gateway-url=http://clawpatrol-api.clawpatrol.svc:8080
-      - --dynamic-peer-authorizer=kubernetes_token_review/agents
+      - --authorizer=kubernetes_token_review/agents
       - --kubernetes-token-path=/var/run/secrets/tokens/clawpatrol-token
       - --env-out=/clawpatrol/env
       - --ca-out=/clawpatrol/ca.crt
@@ -134,6 +134,11 @@ out of the agent-visible filesystem.
 The full pod example is in the Kustomize base at
 [`examples/kubernetes/kustomization`](https://github.com/denoland/clawpatrol/tree/main/examples/kubernetes/kustomization).
 
+The explicit pod spec is the supported baseline and needs no extra
+controllers. Auto-injecting the sidecar with a `MutatingAdmissionPolicy`
+(or a mutating webhook) is an optional ergonomic layer; nothing in the
+enrollment path depends on it.
+
 ## Deploy the example
 
 The example base creates:
@@ -152,7 +157,7 @@ kubectl apply -k examples/kubernetes/kustomization
 The gateway ServiceAccount needs only:
 
 - `create` on `tokenreviews.authentication.k8s.io`
-- `get` on pods in namespaces that can run dynamic peer agents
+- `get` on pods in namespaces that can run agent pods
 
 The WireGuard endpoint in the example uses same-cluster Service DNS:
 
@@ -160,23 +165,29 @@ The WireGuard endpoint in the example uses same-cluster Service DNS:
 endpoint = "clawpatrol-wg.clawpatrol.svc:51820"
 ```
 
-## Lease lifecycle
+## Enrollment lifecycle
 
 On startup, the sidecar:
 
 1. generates a WireGuard private key locally,
 2. sends only the public key and Kubernetes pod claims to
    `POST /api/dynamic-peers/register`,
-3. receives WireGuard client config, CA PEM, lease TTL, and a peer API
-   token,
-4. brings up the TUN device and routes pod traffic through it,
+3. receives WireGuard client config, CA PEM, and a peer API token,
+4. brings up the TUN device and routes pod traffic through it with
+   persistent keepalive,
 5. fetches env pushdown and writes `/clawpatrol/env`,
    `/clawpatrol/ca.crt`, and `/clawpatrol/ready`.
 
-The sidecar heartbeats at half the lease TTL. On shutdown it sends a
-best-effort deregistration request. If the pod disappears without
-cleanup, the gateway expires the lease and revokes the transient
-WireGuard peer.
+There is no application heartbeat. The gateway observes liveness from
+the WireGuard device: persistent keepalive advances the peer's
+`rx_bytes` roughly every 25s, and a peer whose `rx_bytes` stops
+advancing past `peer_ttl` is reaped. A freshly enrolled peer gets a full
+`peer_ttl` grace window first. On shutdown the sidecar best-effort
+deregisters; either way the gateway revokes the transient WireGuard peer
+and clears its enrolled `wg_peers` row.
+
+Enrolled peers show up in the dashboard as regular devices — there is no
+separate dynamic-peers surface.
 
 ## Local e2e
 
@@ -190,7 +201,8 @@ Kustomize base plus an e2e overlay:
 The test builds the current workspace image, loads it into kind,
 applies the e2e overlay, waits for the agent handoff, verifies the
 restricted agent contract, checks traffic through the tunnel, confirms
-heartbeat behavior, and verifies peer cleanup.
+rx_bytes liveness holds a live peer past `peer_ttl`, and verifies peer
+cleanup.
 
 ## Limitations
 
@@ -200,4 +212,4 @@ heartbeat behavior, and verifies peer cleanup.
   existing userspace WireGuard gateway.
 - The sidecar needs pod-network privileges. The execution container
   should remain restricted.
-- Dynamic peers are currently implemented only for WireGuard.
+- Enrollment is currently implemented only for WireGuard.
