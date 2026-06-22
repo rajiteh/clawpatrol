@@ -370,11 +370,17 @@ type Gateway struct {
 	blobs runtime.BlobStore
 	// pluginMgr supervises the external plugin subprocesses; the
 	// dashboard reads it for the Plugins page.
-	pluginMgr *extplugin.Manager
-	oauth     *OAuthRegistry
-	agents    *AgentRegistry
-	hitl      *HITLRegistry
-	onboard   *onboardRegistry
+	pluginMgr     *extplugin.Manager
+	oauth         *OAuthRegistry
+	agents        *AgentRegistry
+	hitl          *HITLRegistry
+	onboard       *onboardRegistry
+	dynamicPeerMu sync.Mutex
+	// k8sVerifier lets tests inject a fake Kubernetes verifier. In
+	// production it stays nil and each register request builds a
+	// short-lived in-cluster client, which re-reads the rotating
+	// ServiceAccount token, so there is nothing to cache here.
+	k8sVerifier k8sRegistrationVerifier
 	// secrets hands credential plugins the secret bytes they inject
 	// at request time. gatewaySecretStore stacks the credential_secrets
 	// table (dashboard slots), OAuthRegistry (refreshed access tokens),
@@ -3050,7 +3056,11 @@ func main() {
 	case "join":
 		runJoin(os.Args[2:])
 	case "run":
-		runRun(os.Args[2:])
+		if tunModeRequested(os.Args[2:]) {
+			runTunMode(os.Args[2:])
+		} else {
+			runRun(os.Args[2:])
+		}
 	case "daemon-internal":
 		// internal: re-exec'd by `clawpatrol run` (Linux only) to host
 		// the per-user tsnet daemon. Hidden from usage(); name carries
@@ -3163,6 +3173,9 @@ usage:
                                          with no public URL (creds discarded
                                          once join completes)
   clawpatrol run -- <cmd> [args...]      route one process tree through gateway
+  clawpatrol run --tun --dynamic-peer-authorizer <type>/<name> [flags]
+                                         resident sidecar: self-register as a
+                                         dynamic peer and route the pod netns
   clawpatrol status                      report install + tunnel state
   clawpatrol uninstall                   remove local join state and tunnel config
   clawpatrol env                         print shell exports for sourcing
@@ -3424,6 +3437,17 @@ func runGateway(args []string) {
 			log.Fatalf("wireguard: %v", err)
 		}
 		setWGServer(wg)
+		if cfg.IsWireGuardDynamicPeersEnabled() {
+			g.logDynamicPeerReconcile(context.Background())
+		}
+		// Always run the lease sweeper once WireGuard is up. Dynamic peers
+		// can be turned on by a later config reload, and any leases left
+		// behind must keep draining even after the feature is turned off.
+		// The sweep is a cheap no-op while the table is empty.
+		go g.startDynamicPeerLeaseSweeper(context.Background())
+		if cfg.IsWireGuardDynamicPeersEnabled() {
+			log.Printf("wireguard dynamic peers: enabled")
+		}
 		dashMux := newWebMux(g, cfg.Join(), cfg.PublicURL())
 		dashPort := portOf(dashListen)
 		tcpDispatch := func(c net.Conn, dstIP string, dstPort uint16) {

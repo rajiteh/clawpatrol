@@ -430,6 +430,34 @@ export async function deleteAgent(ip: string): Promise<void> {
   if (!r.ok) throw new Error(await r.text());
 }
 
+// DynamicPeerLease mirrors a row of the gateway's dynamic_peer_leases
+// table — a transient, self-registered WireGuard peer (e.g. a Kubernetes
+// agent pod that authenticated via TokenReview). expires_at is Unix
+// seconds (fmtExpiry); last_heartbeat and created_at are RFC3339 strings
+// (fmtAge / fmtDateTime). expired is precomputed server-side.
+export type DynamicPeerLease = {
+  peer_ip: string;
+  transport: string;
+  authorizer_type: string;
+  authorizer_name: string;
+  subject_key: string;
+  display_name: string;
+  owner: string;
+  profile: string;
+  public_key?: string;
+  metadata?: Record<string, string>;
+  expires_at: number;
+  last_heartbeat: string;
+  created_at: string;
+  expired: boolean;
+};
+
+export async function getDynamicPeers(): Promise<DynamicPeerLease[]> {
+  const r = await api("/api/dynamic-peers");
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
 // /api/state bundles whoami + integrations + agents in one ETag'd
 // response. Module-level lastTag persists across getState calls so
 // the 304 fast path kicks in on every poll after the first; cached

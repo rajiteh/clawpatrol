@@ -5,6 +5,7 @@ import { AnalyticsPage } from "./components/AnalyticsPage";
 import { ConnectModal } from "./components/ConnectModal";
 import { DevicePage } from "./components/DevicePage";
 import { DevicesPage } from "./components/DevicesPage";
+import { DynamicPeersPage } from "./components/DynamicPeersPage";
 import { Header } from "./components/Header";
 import { HITLBar } from "./components/HITLBar";
 import { LiveRequests } from "./components/LiveRequests";
@@ -20,6 +21,7 @@ type Route =
   | { name: "main" }
   | { name: "devices" }
   | { name: "device"; ip: string }
+  | { name: "dynamic-peers" }
   | { name: "analytics"; ip?: string }
   | { name: "onboard"; code: string }
   | { name: "request"; id: string }
@@ -41,6 +43,7 @@ function parseRoute(): Route {
   if (h === "#/settings") return { name: "settings" };
   if (h === "#/plugins") return { name: "plugins" };
   if (h === "#/devices") return { name: "devices" };
+  if (h === "#/dynamic-peers") return { name: "dynamic-peers" };
   if (h === "#/account") return { name: "account" };
   if (h === "#/analytics") return { name: "analytics" };
   const a = h.match(/^#\/analytics\/([^/]+)$/);
@@ -117,6 +120,8 @@ export default function App() {
           whoami={whoami}
           onSelect={(ip) => navigate("#/device/" + encodeURIComponent(ip))}
         />
+      ) : route.name === "dynamic-peers" ? (
+        <DynamicPeersPage />
       ) : route.name === "analytics" ? (
         <AnalyticsPage ip={route.ip} agents={agents} />
       ) : route.name === "request" ? (

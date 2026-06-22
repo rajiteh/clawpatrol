@@ -500,6 +500,7 @@ func (r *onboardRegistry) ForgetIP(ip string) {
 	delete(r.profileByIP, ip)
 	delete(r.extV4ByIP, ip)
 	delete(r.extV6ByIP, ip)
+	delete(r.knownDeviceIPs, ip)
 	// Drop the IP from the alias graph too — both as an alias and as a
 	// canonical. Otherwise a stale alias outlives the device and, after
 	// IP reuse, AssignProfile's alias fan-out could re-stamp a profile
