@@ -1,12 +1,14 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"database/sql"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -18,6 +20,7 @@ import (
 	"net/netip"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -27,10 +30,10 @@ import (
 
 const (
 	dynamicPeerRegisterPath                 = "/api/dynamic-peers/register"
-	dynamicPeerHeartbeatPath                = "/api/dynamic-peers/heartbeat"
 	dynamicPeerTransportWireGuard           = "wireguard"
 	dynamicPeerAuthorizerKubernetesTokenRev = "kubernetes_token_review"
 	dynamicPeerDefaultMTU                   = 1420
+	enrollmentReaperInterval                = 20 * time.Second
 )
 
 type dynamicPeerRegisterRequest struct {
@@ -48,11 +51,13 @@ type dynamicPeerRegisterResponse struct {
 	Endpoint        string   `json:"endpoint"`
 	AllowedIPs      []string `json:"allowed_ips"`
 	MTU             int      `json:"mtu"`
-	LeaseTTLSeconds int      `json:"lease_ttl_seconds"`
 	APIToken        string   `json:"api_token"`
 	CAPEM           string   `json:"ca_pem,omitempty"`
 }
 
+// dynamicPeerIdentity is the normalized identity an authorizer returns
+// after verifying a workload. Profile is server-derived (e.g. from a Pod
+// label), never submitted by the client.
 type dynamicPeerIdentity struct {
 	SubjectKey     string
 	ReplacementKey string
@@ -68,42 +73,33 @@ type dynamicPeerAuthorizer interface {
 	Authorize(ctx context.Context, token string, claims json.RawMessage) (dynamicPeerIdentity, error)
 }
 
-type dynamicPeerTransport interface {
-	Name() string
-	Provision(ctx context.Context, cfg *config.Gateway, publicKeyHex, reuseIP string) (dynamicPeerTransportSession, error)
-	Revoke(ctx context.Context, peerIP string)
+// enrolledPeer is the enrollment metadata stored alongside a WireGuard
+// peer in the wg_peers table (enrolled=1). There is no separate lease
+// table; liveness is observed from the WG device (rx_bytes progress), so
+// there is no stored expiry.
+type enrolledPeer struct {
+	PeerIP         string
+	PubKeyHex      string
+	SubjectKey     string
+	ReplacementKey string
+	DisplayName    string
+	Owner          string
+	Profile        string
+	AuthorizerType string
+	AuthorizerName string
+	MetadataJSON   string
+	AddedNS        int64
 }
 
-type dynamicPeerTransportSession struct {
-	PeerIP          string
-	PeerIPv6        string
-	ServerPublicKey string
-	Endpoint        string
-	AllowedIPs      []string
-	MTU             int
+// enrollmentLiveness tracks per-peer WireGuard receive progress so the
+// reaper can revoke peers whose tunnel has gone quiet past peer_ttl.
+type enrollmentLiveness struct {
+	lastRx       uint64
+	lastProgress time.Time
 }
 
-type dynamicPeerLease struct {
-	PeerIP             string
-	Transport          string
-	AuthorizerType     string
-	AuthorizerName     string
-	SubjectKey         string
-	ReplacementKey     string
-	DisplayName        string
-	Owner              string
-	Profile            string
-	WireGuardPublicKey string
-	MetadataJSON       string
-	ExpiresNS          int64
-	LastHeartbeatNS    int64
-}
-
-// dynamicPeerLeaseView is the dashboard-facing shape of a lease. Times
-// are rendered for the UI's format helpers: ExpiresAt is Unix seconds
-// (fmtExpiry), LastHeartbeat and CreatedAt are RFC3339 strings (fmtAge /
-// fmtDateTime).
-type dynamicPeerLeaseView struct {
+// enrolledPeerView is the dashboard/API shape of an enrolled peer.
+type enrolledPeerView struct {
 	PeerIP         string            `json:"peer_ip"`
 	Transport      string            `json:"transport"`
 	AuthorizerType string            `json:"authorizer_type"`
@@ -114,16 +110,11 @@ type dynamicPeerLeaseView struct {
 	Profile        string            `json:"profile"`
 	PublicKey      string            `json:"public_key,omitempty"`
 	Metadata       map[string]string `json:"metadata,omitempty"`
-	ExpiresAt      int64             `json:"expires_at"`
-	LastHeartbeat  string            `json:"last_heartbeat"`
 	CreatedAt      string            `json:"created_at"`
-	Expired        bool              `json:"expired"`
+	LastHandshake  string            `json:"last_handshake,omitempty"`
 }
 
-var (
-	dynamicPeerLeaseSweepInterval = 30 * time.Second
-	errDynamicPeerConflict        = errors.New("dynamic peer conflict")
-)
+var errDynamicPeerConflict = errors.New("dynamic peer conflict")
 
 func (w *webMux) apiDynamicPeerRegister(rw http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost && r.Method != http.MethodDelete {
@@ -163,12 +154,7 @@ func (w *webMux) apiDynamicPeerRegister(rw http.ResponseWriter, r *http.Request)
 		http.Error(rw, err.Error(), http.StatusForbidden)
 		return
 	}
-	ttl, err := cfg.EnrollmentPeerTTL()
-	if err != nil {
-		http.Error(rw, "invalid lease ttl", http.StatusInternalServerError)
-		return
-	}
-	resp, err := w.g.registerDynamicPeer(r.Context(), cfg, authorizer, &wireguardDynamicPeerTransport{}, identity, req, ttl)
+	resp, err := w.g.registerEnrolledPeer(r.Context(), cfg, authorizer, identity, req)
 	if err != nil {
 		status := http.StatusInternalServerError
 		if errors.Is(err, errDynamicPeerConflict) {
@@ -178,44 +164,6 @@ func (w *webMux) apiDynamicPeerRegister(rw http.ResponseWriter, r *http.Request)
 		return
 	}
 	writeJSON(rw, resp)
-}
-
-func (w *webMux) apiDynamicPeerHeartbeat(rw http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(rw, http.MethodPost, http.StatusMethodNotAllowed)
-		return
-	}
-	cfg := w.g.cfg.Load()
-	if cfg == nil || !cfg.IsEnrollmentEnabled() {
-		http.NotFound(rw, r)
-		return
-	}
-	token := bearerFromAuthHeader(r.Header.Get("Authorization"))
-	peerIP := peerIPForAPIToken(w.g.db, token)
-	if peerIP == "" {
-		http.Error(rw, "unknown or missing peer api token", http.StatusUnauthorized)
-		return
-	}
-	ttl, err := cfg.EnrollmentPeerTTL()
-	if err != nil {
-		http.Error(rw, "invalid lease ttl", http.StatusInternalServerError)
-		return
-	}
-	lease, err := w.g.refreshDynamicPeerLease(r.Context(), peerIP, ttl)
-	if err != nil {
-		status := http.StatusInternalServerError
-		if errors.Is(err, sql.ErrNoRows) {
-			status = http.StatusNotFound
-		}
-		http.Error(rw, err.Error(), status)
-		return
-	}
-	writeJSON(rw, map[string]any{
-		"transport":         lease.Transport,
-		"peer_ip":           lease.PeerIP,
-		"lease_ttl_seconds": int(ttl.Seconds()),
-		"expires_at_ns":     lease.ExpiresNS,
-	})
 }
 
 func (w *webMux) apiDynamicPeerDelete(rw http.ResponseWriter, r *http.Request) {
@@ -232,11 +180,11 @@ func (w *webMux) apiDynamicPeerDelete(rw http.ResponseWriter, r *http.Request) {
 	}
 	w.g.dynamicPeerMu.Lock()
 	defer w.g.dynamicPeerMu.Unlock()
-	// Only a peer that actually holds a dynamic-peer lease may drive this
-	// teardown. A regular onboarded device can also carry a peer API token;
-	// without this guard it could revoke its own WireGuard peer and forget
-	// its device row by hitting the dynamic-peer delete path.
-	if _, err := w.g.dynamicPeerLeaseByIP(peerIP); err != nil {
+	// Only a peer that actually holds an enrollment may drive this teardown.
+	// A regular onboarded device can also carry a peer API token; without
+	// this guard it could revoke its own WireGuard peer + forget its device
+	// row by hitting the enrollment delete path.
+	if _, err := w.g.enrolledPeerByIP(peerIP); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			http.NotFound(rw, r)
 		} else {
@@ -244,21 +192,19 @@ func (w *webMux) apiDynamicPeerDelete(rw http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	w.g.cleanupDynamicPeerLeaseByIPLocked(context.Background(), peerIP)
+	w.g.cleanupEnrolledPeerLocked(context.Background(), peerIP)
 	rw.WriteHeader(http.StatusNoContent)
 }
 
-// apiDynamicPeerList is the dashboard read endpoint: it lists every
-// dynamic-peer lease (live and not-yet-swept expired) for operator
-// observability. Unlike register/heartbeat it is not gated on the
-// feature flag — leases can still be draining after the feature is
-// turned off, and an empty list is a fine answer when it's never been on.
+// apiDynamicPeerList lists every enrolled peer for operator observability.
+// Not gated on the feature flag — peers can still be draining after the
+// feature is turned off, and an empty list is a fine answer.
 func (w *webMux) apiDynamicPeerList(rw http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(rw, http.MethodGet, http.StatusMethodNotAllowed)
 		return
 	}
-	views, err := w.g.listDynamicPeerLeaseViews()
+	views, err := w.g.listEnrolledPeerViews()
 	if err != nil {
 		http.Error(rw, err.Error(), http.StatusInternalServerError)
 		return
@@ -266,45 +212,38 @@ func (w *webMux) apiDynamicPeerList(rw http.ResponseWriter, r *http.Request) {
 	writeJSON(rw, views)
 }
 
-func (g *Gateway) listDynamicPeerLeaseViews() ([]dynamicPeerLeaseView, error) {
-	rows, err := g.db.Query(`
-		SELECT peer_ip, transport, authorizer_type, authorizer_name, subject_key,
-		       display_name, owner, profile, wireguard_public_key, metadata_json,
-		       expires_ns, last_heartbeat_ns, created_ns
-		FROM dynamic_peer_leases
-		ORDER BY created_ns DESC
-	`)
+func (g *Gateway) listEnrolledPeerViews() ([]enrolledPeerView, error) {
+	peers, err := g.listEnrolledPeers()
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = rows.Close() }()
-	nowNS := time.Now().UTC().UnixNano()
-	views := []dynamicPeerLeaseView{}
-	for rows.Next() {
-		var (
-			v           dynamicPeerLeaseView
-			pubKey      sql.NullString
-			metaJSON    string
-			expiresNS   int64
-			heartbeatNS int64
-			createdNS   int64
-		)
-		if err := rows.Scan(&v.PeerIP, &v.Transport, &v.AuthorizerType, &v.AuthorizerName,
-			&v.SubjectKey, &v.DisplayName, &v.Owner, &v.Profile, &pubKey, &metaJSON,
-			&expiresNS, &heartbeatNS, &createdNS); err != nil {
-			return nil, err
+	var stats map[string]wgDevPeerStat
+	if globalWG != nil {
+		stats = globalWG.PeerStats()
+	}
+	views := make([]enrolledPeerView, 0, len(peers))
+	for _, p := range peers {
+		v := enrolledPeerView{
+			PeerIP:         p.PeerIP,
+			Transport:      dynamicPeerTransportWireGuard,
+			AuthorizerType: p.AuthorizerType,
+			AuthorizerName: p.AuthorizerName,
+			SubjectKey:     p.SubjectKey,
+			DisplayName:    p.DisplayName,
+			Owner:          p.Owner,
+			Profile:        p.Profile,
+			PublicKey:      p.PubKeyHex,
+			CreatedAt:      time.Unix(0, p.AddedNS).UTC().Format(time.RFC3339Nano),
 		}
-		v.PublicKey = pubKey.String
-		if metaJSON != "" && metaJSON != "{}" {
-			_ = json.Unmarshal([]byte(metaJSON), &v.Metadata)
+		if p.MetadataJSON != "" && p.MetadataJSON != "{}" {
+			_ = json.Unmarshal([]byte(p.MetadataJSON), &v.Metadata)
 		}
-		v.ExpiresAt = expiresNS / int64(time.Second)
-		v.LastHeartbeat = time.Unix(0, heartbeatNS).UTC().Format(time.RFC3339Nano)
-		v.CreatedAt = time.Unix(0, createdNS).UTC().Format(time.RFC3339Nano)
-		v.Expired = expiresNS <= nowNS
+		if st, ok := stats[p.PubKeyHex]; ok && !st.lastHandshake.IsZero() {
+			v.LastHandshake = st.lastHandshake.UTC().Format(time.RFC3339Nano)
+		}
 		views = append(views, v)
 	}
-	return views, rows.Err()
+	return views, nil
 }
 
 func (g *Gateway) dynamicPeerAuthorizerFor(cfg *config.Gateway, transport, name string) (dynamicPeerAuthorizer, error) {
@@ -315,7 +254,7 @@ func (g *Gateway) dynamicPeerAuthorizerFor(cfg *config.Gateway, transport, name 
 		return nil, fmt.Errorf("dynamic peer authorizer is required")
 	}
 	if cfg == nil || !cfg.IsEnrollmentEnabled() {
-		return nil, fmt.Errorf("wireguard dynamic peers are not enabled")
+		return nil, fmt.Errorf("enrollment is not enabled")
 	}
 	for i := range cfg.Settings.Enrollment.Authorizers {
 		a := &cfg.Settings.Enrollment.Authorizers[i]
@@ -350,7 +289,9 @@ func (g *Gateway) dynamicPeerProfileExists(profile string) error {
 	return nil
 }
 
-func (g *Gateway) registerDynamicPeer(ctx context.Context, cfg *config.Gateway, authorizer dynamicPeerAuthorizer, transport dynamicPeerTransport, identity dynamicPeerIdentity, req dynamicPeerRegisterRequest, ttl time.Duration) (dynamicPeerRegisterResponse, error) {
+// registerEnrolledPeer provisions (or reuses) a WireGuard peer for a
+// verified identity and records the enrollment on its wg_peers row.
+func (g *Gateway) registerEnrolledPeer(ctx context.Context, cfg *config.Gateway, authorizer dynamicPeerAuthorizer, identity dynamicPeerIdentity, req dynamicPeerRegisterRequest) (dynamicPeerRegisterResponse, error) {
 	pubHex, err := normalizeWGPublicKey(req.WireGuardPublicKey)
 	if err != nil {
 		return dynamicPeerRegisterResponse{}, err
@@ -358,65 +299,56 @@ func (g *Gateway) registerDynamicPeer(ctx context.Context, cfg *config.Gateway, 
 	if identity.SubjectKey == "" || identity.ReplacementKey == "" || identity.Profile == "" {
 		return dynamicPeerRegisterResponse{}, fmt.Errorf("dynamic peer authorizer returned incomplete identity")
 	}
+	if globalWG == nil {
+		return dynamicPeerRegisterResponse{}, fmt.Errorf("wireguard server not started")
+	}
 
 	g.dynamicPeerMu.Lock()
 	defer g.dynamicPeerMu.Unlock()
 
-	now := time.Now().UTC()
-	nowNS := now.UnixNano()
-	expiresNS := now.Add(ttl).UnixNano()
-
-	leases, err := g.findDynamicPeerLeases(identity.ReplacementKey, pubHex)
+	existing, err := g.findEnrolledPeers(identity.ReplacementKey, pubHex)
 	if err != nil {
 		return dynamicPeerRegisterResponse{}, err
 	}
 	var reuseIP string
-	for _, lease := range leases {
-		expired := lease.ExpiresNS <= nowNS
-		sameSubject := lease.SubjectKey == identity.SubjectKey
-		sameReplacement := lease.ReplacementKey == identity.ReplacementKey
-		samePub := lease.WireGuardPublicKey == pubHex
-
+	for _, p := range existing {
 		switch {
-		case sameSubject:
-			// The authenticated subject already owns a lease — typically a
-			// sidecar that restarted in-place (same pod UID) with a freshly
-			// generated WireGuard key. Reuse its IP and let the transport
-			// install the new key (AddPeer evicts the stale pubkey on that
-			// IP). Same-subject is never a conflict: the identity was just
-			// re-verified by the authorizer, so it owns this slot regardless
-			// of whether the key rotated or the old lease expired.
-			reuseIP = lease.PeerIP
-		case sameReplacement:
-			// Same logical workload, different instance (e.g. a pod recreated
-			// under the same name with a new UID). Retire the previous
-			// instance's lease before the new one takes over.
-			g.cleanupDynamicPeerLeaseByIPLocked(ctx, lease.PeerIP)
-		case samePub && !expired:
-			return dynamicPeerRegisterResponse{}, fmt.Errorf("%w: wireguard public key is already registered to another live dynamic peer", errDynamicPeerConflict)
-		case samePub && expired:
-			g.cleanupDynamicPeerLeaseByIPLocked(ctx, lease.PeerIP)
+		case p.SubjectKey == identity.SubjectKey:
+			// Same authenticated subject (e.g. a sidecar that restarted with
+			// a fresh key): reuse its IP, let AddPeer swap the key.
+			reuseIP = p.PeerIP
+		case p.ReplacementKey == identity.ReplacementKey:
+			// Same logical workload, new instance (pod recreated under the
+			// same name with a new UID): retire the old instance.
+			g.cleanupEnrolledPeerLocked(ctx, p.PeerIP)
+		case p.PubKeyHex == pubHex:
+			// A different subject is holding this public key.
+			return dynamicPeerRegisterResponse{}, fmt.Errorf("%w: wireguard public key is already registered to another enrolled peer", errDynamicPeerConflict)
 		}
 	}
 
-	session, err := transport.Provision(ctx, cfg, pubHex, reuseIP)
-	if err != nil {
-		return dynamicPeerRegisterResponse{}, err
+	peerIP := reuseIP
+	if peerIP == "" {
+		peerIP, err = allocateWGPeerIP(cfg.Join())
+		if err != nil {
+			return dynamicPeerRegisterResponse{}, err
+		}
 	}
-	// Until the lease is committed, roll back the transport + token state on
-	// any failure. Otherwise a partial register leaks a wg_peers row and an
-	// API token with no lease behind them, and the sweeper only reclaims IPs
-	// that still have a lease row.
+	if err := globalWG.AddPeer(pubHex, peerIP); err != nil {
+		return dynamicPeerRegisterResponse{}, fmt.Errorf("wg add peer: %w", err)
+	}
+	// Roll back the transport peer + token on any failure before the
+	// enrollment row is committed.
 	committed := false
 	defer func() {
 		if !committed {
-			transport.Revoke(ctx, session.PeerIP)
-			deletePeerAPITokensForIP(g.db, session.PeerIP)
+			globalWG.RevokePeerByIP(peerIP)
+			deletePeerAPITokensForIP(g.db, peerIP)
 		}
 	}()
 
-	deletePeerAPITokensForIP(g.db, session.PeerIP)
-	apiToken, err := mintAndPersistPeerAPIToken(g.db, session.PeerIP)
+	deletePeerAPITokensForIP(g.db, peerIP)
+	apiToken, err := mintAndPersistPeerAPIToken(g.db, peerIP)
 	if err != nil {
 		return dynamicPeerRegisterResponse{}, err
 	}
@@ -429,42 +361,51 @@ func (g *Gateway) registerDynamicPeer(ctx context.Context, cfg *config.Gateway, 
 		}
 		metaJSON = string(meta)
 	}
-	if err := upsertDynamicPeerLease(g.db, dynamicPeerLease{
-		PeerIP:             session.PeerIP,
-		Transport:          transport.Name(),
-		AuthorizerType:     authorizer.Type(),
-		AuthorizerName:     authorizer.Name(),
-		SubjectKey:         identity.SubjectKey,
-		ReplacementKey:     identity.ReplacementKey,
-		DisplayName:        identity.DisplayName,
-		Owner:              identity.Owner,
-		Profile:            identity.Profile,
-		WireGuardPublicKey: pubHex,
-		MetadataJSON:       metaJSON,
-		ExpiresNS:          expiresNS,
-		LastHeartbeatNS:    nowNS,
+	if err := markEnrolledPeer(g.db, enrolledPeer{
+		PeerIP:         peerIP,
+		PubKeyHex:      pubHex,
+		SubjectKey:     identity.SubjectKey,
+		ReplacementKey: identity.ReplacementKey,
+		DisplayName:    identity.DisplayName,
+		Owner:          identity.Owner,
+		Profile:        identity.Profile,
+		AuthorizerType: authorizer.Type(),
+		AuthorizerName: authorizer.Name(),
+		MetadataJSON:   metaJSON,
 	}); err != nil {
 		return dynamicPeerRegisterResponse{}, err
 	}
 	committed = true
+	g.noteEnrolledLiveLocked(pubHex)
 	if g.onboard != nil {
-		g.onboard.AssignProfile(session.PeerIP, identity.Profile)
-		g.onboard.SetOwner(session.PeerIP, identity.Owner)
-		g.onboard.SetHostname(session.PeerIP, identity.DisplayName)
+		g.onboard.AssignProfile(peerIP, identity.Profile)
+		g.onboard.SetOwner(peerIP, identity.Owner)
+		g.onboard.SetHostname(peerIP, identity.DisplayName)
 	}
 	if g.agents != nil {
-		g.agents.Seed(session.PeerIP)
+		g.agents.Seed(peerIP)
 	}
 
+	serverPubHex, err := globalWG.PublicKey()
+	if err != nil {
+		return dynamicPeerRegisterResponse{}, fmt.Errorf("wg server pub: %w", err)
+	}
+	serverPubB64, err := hexToB64(serverPubHex)
+	if err != nil {
+		return dynamicPeerRegisterResponse{}, err
+	}
+	endpoint, err := wgClientEndpoint(cfg.Join().WGEndpoint, cfg.PublicURL(), cfg.Join().WGListenPort)
+	if err != nil {
+		return dynamicPeerRegisterResponse{}, err
+	}
 	resp := dynamicPeerRegisterResponse{
-		Transport:       transport.Name(),
-		PeerIP:          session.PeerIP,
-		PeerIPv6:        session.PeerIPv6,
-		ServerPublicKey: session.ServerPublicKey,
-		Endpoint:        session.Endpoint,
-		AllowedIPs:      session.AllowedIPs,
-		MTU:             session.MTU,
-		LeaseTTLSeconds: int(ttl.Seconds()),
+		Transport:       dynamicPeerTransportWireGuard,
+		PeerIP:          peerIP,
+		PeerIPv6:        wg6FromV4(netip.MustParseAddr(peerIP)).String(),
+		ServerPublicKey: serverPubB64,
+		Endpoint:        endpoint,
+		AllowedIPs:      []string{"0.0.0.0/0", "::/0"},
+		MTU:             dynamicPeerDefaultMTU,
 		APIToken:        apiToken,
 	}
 	if g.certs != nil {
@@ -473,183 +414,96 @@ func (g *Gateway) registerDynamicPeer(ctx context.Context, cfg *config.Gateway, 
 	return resp, nil
 }
 
-func (g *Gateway) refreshDynamicPeerLease(ctx context.Context, peerIP string, ttl time.Duration) (dynamicPeerLease, error) {
-	g.dynamicPeerMu.Lock()
-	defer g.dynamicPeerMu.Unlock()
-	now := time.Now().UTC()
-	expires := now.Add(ttl).UnixNano()
-	res, err := g.db.Exec(
-		`UPDATE dynamic_peer_leases SET expires_ns = ?, last_heartbeat_ns = ? WHERE peer_ip = ?`,
-		expires, now.UnixNano(), peerIP,
+// --- enrollment store (wg_peers, enrolled=1) ---------------------------
+
+const enrolledPeerCols = `pubkey, ip, subject_key, replacement_key, display_name, owner, profile, authorizer_type, authorizer_name, metadata_json, added_ns`
+
+func scanEnrolledPeer(s interface{ Scan(...any) error }) (enrolledPeer, error) {
+	var (
+		p                                                                 enrolledPeer
+		subject, replacement, display, owner, profile, authT, authN, meta sql.NullString
 	)
-	if err != nil {
-		return dynamicPeerLease{}, err
+	if err := s.Scan(&p.PubKeyHex, &p.PeerIP, &subject, &replacement, &display, &owner, &profile, &authT, &authN, &meta, &p.AddedNS); err != nil {
+		return enrolledPeer{}, err
 	}
-	n, _ := res.RowsAffected()
-	if n == 0 {
-		return dynamicPeerLease{}, sql.ErrNoRows
-	}
-	lease, err := g.dynamicPeerLeaseByIP(peerIP)
-	if err != nil {
-		return dynamicPeerLease{}, err
-	}
-	if err := g.reconcileDynamicPeerLeaseLocked(ctx, lease); err != nil {
-		return dynamicPeerLease{}, err
-	}
-	return lease, nil
+	p.SubjectKey, p.ReplacementKey, p.DisplayName = subject.String, replacement.String, display.String
+	p.Owner, p.Profile = owner.String, profile.String
+	p.AuthorizerType, p.AuthorizerName = authT.String, authN.String
+	p.MetadataJSON = meta.String
+	return p, nil
 }
 
-func (g *Gateway) findDynamicPeerLeases(replacementKey, pubHex string) ([]dynamicPeerLease, error) {
-	rows, err := g.db.Query(`
-		SELECT peer_ip, transport, authorizer_type, authorizer_name, subject_key, replacement_key,
-		       display_name, owner, profile, wireguard_public_key, metadata_json, expires_ns, last_heartbeat_ns
-		FROM dynamic_peer_leases
-		WHERE replacement_key = ? OR wireguard_public_key = ?
-	`, replacementKey, pubHex)
+func (g *Gateway) findEnrolledPeers(replacementKey, pubHex string) ([]enrolledPeer, error) {
+	rows, err := g.db.Query(`SELECT `+enrolledPeerCols+` FROM wg_peers
+		WHERE enrolled = 1 AND (replacement_key = ? OR pubkey = ?)`, replacementKey, pubHex)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = rows.Close() }()
-	var out []dynamicPeerLease
+	var out []enrolledPeer
 	for rows.Next() {
-		var lease dynamicPeerLease
-		if err := rows.Scan(&lease.PeerIP, &lease.Transport, &lease.AuthorizerType, &lease.AuthorizerName,
-			&lease.SubjectKey, &lease.ReplacementKey, &lease.DisplayName, &lease.Owner, &lease.Profile,
-			&lease.WireGuardPublicKey, &lease.MetadataJSON, &lease.ExpiresNS, &lease.LastHeartbeatNS); err != nil {
+		p, err := scanEnrolledPeer(rows)
+		if err != nil {
 			return nil, err
 		}
-		out = append(out, lease)
+		out = append(out, p)
 	}
 	return out, rows.Err()
 }
 
-func (g *Gateway) dynamicPeerLeaseByIP(peerIP string) (dynamicPeerLease, error) {
-	var lease dynamicPeerLease
-	err := g.db.QueryRow(`
-		SELECT peer_ip, transport, authorizer_type, authorizer_name, subject_key, replacement_key,
-		       display_name, owner, profile, wireguard_public_key, metadata_json, expires_ns, last_heartbeat_ns
-		FROM dynamic_peer_leases
-		WHERE peer_ip = ?
-	`, peerIP).Scan(&lease.PeerIP, &lease.Transport, &lease.AuthorizerType, &lease.AuthorizerName,
-		&lease.SubjectKey, &lease.ReplacementKey, &lease.DisplayName, &lease.Owner, &lease.Profile,
-		&lease.WireGuardPublicKey, &lease.MetadataJSON, &lease.ExpiresNS, &lease.LastHeartbeatNS)
-	return lease, err
+func (g *Gateway) enrolledPeerByIP(peerIP string) (enrolledPeer, error) {
+	return scanEnrolledPeer(g.db.QueryRow(`SELECT `+enrolledPeerCols+` FROM wg_peers
+		WHERE ip = ? AND enrolled = 1`, peerIP))
 }
 
-func upsertDynamicPeerLease(db *sql.DB, lease dynamicPeerLease) error {
-	if lease.MetadataJSON == "" {
-		lease.MetadataJSON = "{}"
-	}
-	_, err := db.Exec(`
-		INSERT INTO dynamic_peer_leases (
-			peer_ip, transport, authorizer_type, authorizer_name, subject_key, replacement_key,
-			display_name, owner, profile, wireguard_public_key, metadata_json,
-			expires_ns, last_heartbeat_ns, created_ns
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(peer_ip) DO UPDATE SET
-			transport = excluded.transport,
-			authorizer_type = excluded.authorizer_type,
-			authorizer_name = excluded.authorizer_name,
-			subject_key = excluded.subject_key,
-			replacement_key = excluded.replacement_key,
-			display_name = excluded.display_name,
-			owner = excluded.owner,
-			profile = excluded.profile,
-			wireguard_public_key = excluded.wireguard_public_key,
-			metadata_json = excluded.metadata_json,
-			expires_ns = excluded.expires_ns,
-			last_heartbeat_ns = excluded.last_heartbeat_ns
-	`, lease.PeerIP, lease.Transport, lease.AuthorizerType, lease.AuthorizerName, lease.SubjectKey,
-		lease.ReplacementKey, lease.DisplayName, lease.Owner, lease.Profile, lease.WireGuardPublicKey,
-		lease.MetadataJSON, lease.ExpiresNS, lease.LastHeartbeatNS, time.Now().UTC().UnixNano())
-	return err
-}
-
-func (g *Gateway) reconcileDynamicPeerLeases(ctx context.Context) (int, error) {
-	if g == nil || g.db == nil {
-		return 0, nil
-	}
-	nowNS := time.Now().UTC().UnixNano()
-	rows, err := g.db.Query(`
-		SELECT peer_ip, transport, authorizer_type, authorizer_name, subject_key, replacement_key,
-		       display_name, owner, profile, wireguard_public_key, metadata_json, expires_ns, last_heartbeat_ns
-		FROM dynamic_peer_leases
-		WHERE expires_ns > ?
-		ORDER BY created_ns ASC
-	`, nowNS)
+func (g *Gateway) listEnrolledPeers() ([]enrolledPeer, error) {
+	rows, err := g.db.Query(`SELECT ` + enrolledPeerCols + ` FROM wg_peers WHERE enrolled = 1 ORDER BY added_ns DESC`)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 	defer func() { _ = rows.Close() }()
-	var leases []dynamicPeerLease
+	out := []enrolledPeer{}
 	for rows.Next() {
-		var lease dynamicPeerLease
-		if err := rows.Scan(&lease.PeerIP, &lease.Transport, &lease.AuthorizerType, &lease.AuthorizerName,
-			&lease.SubjectKey, &lease.ReplacementKey, &lease.DisplayName, &lease.Owner, &lease.Profile,
-			&lease.WireGuardPublicKey, &lease.MetadataJSON, &lease.ExpiresNS, &lease.LastHeartbeatNS); err != nil {
-			return 0, err
+		p, err := scanEnrolledPeer(rows)
+		if err != nil {
+			return nil, err
 		}
-		leases = append(leases, lease)
+		out = append(out, p)
 	}
-	if err := rows.Err(); err != nil {
-		return 0, err
-	}
-	if len(leases) == 0 {
-		return 0, nil
-	}
-
-	g.dynamicPeerMu.Lock()
-	defer g.dynamicPeerMu.Unlock()
-	var errs []error
-	restored := 0
-	for _, lease := range leases {
-		if err := g.reconcileDynamicPeerLeaseLocked(ctx, lease); err != nil {
-			errs = append(errs, fmt.Errorf("%s: %w", lease.PeerIP, err))
-			continue
-		}
-		restored++
-	}
-	return restored, errors.Join(errs...)
+	return out, rows.Err()
 }
 
-func (g *Gateway) reconcileDynamicPeerLeaseLocked(_ context.Context, lease dynamicPeerLease) error {
-	switch lease.Transport {
-	case dynamicPeerTransportWireGuard:
-		if lease.WireGuardPublicKey == "" {
-			return fmt.Errorf("wireguard public key is empty")
-		}
-		if globalWG == nil {
-			return fmt.Errorf("wireguard server not started")
-		}
-		if err := globalWG.AddPeer(lease.WireGuardPublicKey, lease.PeerIP); err != nil {
-			return fmt.Errorf("wg add peer: %w", err)
-		}
-	default:
-		return fmt.Errorf("unsupported dynamic peer transport %q", lease.Transport)
+// markEnrolledPeer stamps enrollment metadata onto the wg_peers row that
+// AddPeer just created/updated for pubHex.
+func markEnrolledPeer(db *sql.DB, p enrolledPeer) error {
+	if p.MetadataJSON == "" {
+		p.MetadataJSON = "{}"
 	}
-	g.restoreDynamicPeerRegistryLocked(lease)
+	res, err := db.Exec(`UPDATE wg_peers SET
+		enrolled = 1, subject_key = ?, replacement_key = ?, display_name = ?,
+		owner = ?, profile = ?, authorizer_type = ?, authorizer_name = ?, metadata_json = ?
+		WHERE pubkey = ?`,
+		p.SubjectKey, p.ReplacementKey, p.DisplayName, p.Owner, p.Profile,
+		p.AuthorizerType, p.AuthorizerName, p.MetadataJSON, p.PubKeyHex)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("wg_peers row for pubkey not found")
+	}
 	return nil
 }
 
-func (g *Gateway) restoreDynamicPeerRegistryLocked(lease dynamicPeerLease) {
-	if g.onboard != nil {
-		g.onboard.AssignProfile(lease.PeerIP, lease.Profile)
-		g.onboard.SetOwner(lease.PeerIP, lease.Owner)
-		g.onboard.SetHostname(lease.PeerIP, lease.DisplayName)
-	}
-	if g.agents != nil {
-		g.agents.Seed(lease.PeerIP)
-	}
-}
-
-func (g *Gateway) cleanupDynamicPeerLeaseByIPLocked(ctx context.Context, peerIP string) {
+// cleanupEnrolledPeerLocked revokes the WireGuard peer (which also deletes
+// its wg_peers row, clearing the enrollment), its API tokens, and its
+// device/agent registry entries. Caller holds dynamicPeerMu.
+func (g *Gateway) cleanupEnrolledPeerLocked(_ context.Context, peerIP string) {
 	if peerIP == "" {
 		return
 	}
-	lease, _ := g.dynamicPeerLeaseByIP(peerIP)
-	switch lease.Transport {
-	case "", dynamicPeerTransportWireGuard:
-		(&wireguardDynamicPeerTransport{}).Revoke(ctx, peerIP)
+	p, _ := g.enrolledPeerByIP(peerIP)
+	if globalWG != nil {
+		globalWG.RevokePeerByIP(peerIP) // removes the wg_peers row too
 	}
 	deletePeerAPITokensForIP(g.db, peerIP)
 	if g.onboard != nil {
@@ -658,14 +512,25 @@ func (g *Gateway) cleanupDynamicPeerLeaseByIPLocked(ctx context.Context, peerIP 
 	if g.agents != nil {
 		g.agents.Delete(peerIP)
 	}
-	_, _ = g.db.Exec("DELETE FROM dynamic_peer_leases WHERE peer_ip = ?", peerIP)
+	if p.PubKeyHex != "" && g.enrollLive != nil {
+		delete(g.enrollLive, p.PubKeyHex)
+	}
 }
 
-func (g *Gateway) startDynamicPeerLeaseSweeper(ctx context.Context) {
-	ticker := time.NewTicker(dynamicPeerLeaseSweepInterval)
+// --- liveness reaper ---------------------------------------------------
+
+func (g *Gateway) noteEnrolledLiveLocked(pubHex string) {
+	if g.enrollLive == nil {
+		g.enrollLive = map[string]enrollmentLiveness{}
+	}
+	g.enrollLive[pubHex] = enrollmentLiveness{lastProgress: time.Now()}
+}
+
+func (g *Gateway) startEnrollmentReaper(ctx context.Context) {
+	ticker := time.NewTicker(enrollmentReaperInterval)
 	defer ticker.Stop()
 	for {
-		g.sweepExpiredDynamicPeerLeases()
+		g.reapStaleEnrolledPeers(ctx)
 		select {
 		case <-ctx.Done():
 			return
@@ -674,99 +539,118 @@ func (g *Gateway) startDynamicPeerLeaseSweeper(ctx context.Context) {
 	}
 }
 
-func (g *Gateway) sweepExpiredDynamicPeerLeases() {
-	if g == nil || g.db == nil {
+// reapStaleEnrolledPeers revokes enrolled peers whose WireGuard receive
+// counter has not advanced within peer_ttl. Liveness comes from the device
+// (persistent-keepalive traffic increments rx_bytes ~every 25s), not an
+// app-level heartbeat. A freshly enrolled peer gets a full peer_ttl grace
+// before it is eligible (lastProgress is seeded on first sight).
+func (g *Gateway) reapStaleEnrolledPeers(_ context.Context) {
+	if g == nil || g.db == nil || globalWG == nil {
 		return
 	}
-	nowNS := time.Now().UTC().UnixNano()
-	rows, err := g.db.Query("SELECT peer_ip FROM dynamic_peer_leases WHERE expires_ns <= ?", nowNS)
+	cfg := g.cfg.Load()
+	ttl, err := cfg.EnrollmentPeerTTL()
 	if err != nil {
 		return
 	}
-	defer func() { _ = rows.Close() }()
-	var ips []string
-	for rows.Next() {
-		var ip string
-		if rows.Scan(&ip) == nil {
-			ips = append(ips, ip)
+	stats := globalWG.PeerStats()
+
+	g.dynamicPeerMu.Lock()
+	defer g.dynamicPeerMu.Unlock()
+	peers, err := g.listEnrolledPeers()
+	if err != nil {
+		return
+	}
+	if g.enrollLive == nil {
+		g.enrollLive = map[string]enrollmentLiveness{}
+	}
+	now := time.Now()
+	seen := make(map[string]bool, len(peers))
+	var stale []string
+	for _, p := range peers {
+		seen[p.PubKeyHex] = true
+		st, ok := stats[p.PubKeyHex]
+		live, tracked := g.enrollLive[p.PubKeyHex]
+		switch {
+		case !tracked:
+			rx := uint64(0)
+			if ok {
+				rx = st.rxBytes
+			}
+			g.enrollLive[p.PubKeyHex] = enrollmentLiveness{lastRx: rx, lastProgress: now}
+		case ok && st.rxBytes > live.lastRx:
+			g.enrollLive[p.PubKeyHex] = enrollmentLiveness{lastRx: st.rxBytes, lastProgress: now}
+		default:
+			if now.Sub(live.lastProgress) > ttl {
+				stale = append(stale, p.PeerIP)
+			}
 		}
 	}
-	if err := rows.Err(); err != nil {
-		return
+	// Drop trackers for peers that no longer exist.
+	for pub := range g.enrollLive {
+		if !seen[pub] {
+			delete(g.enrollLive, pub)
+		}
 	}
-	if len(ips) == 0 {
-		return
+	for _, ip := range stale {
+		g.cleanupEnrolledPeerLocked(context.Background(), ip)
+	}
+}
+
+// --- restart reconcile -------------------------------------------------
+
+// reconcileEnrolledPeers restores the onboard/agent registry view for
+// persisted enrolled peers after a gateway restart (the WireGuard device's
+// trie is rebuilt from wg_peers by loadPeers) and seeds liveness tracking
+// with a fresh grace window.
+func (g *Gateway) reconcileEnrolledPeers(_ context.Context) (int, error) {
+	if g == nil || g.db == nil {
+		return 0, nil
+	}
+	peers, err := g.listEnrolledPeers()
+	if err != nil {
+		return 0, err
+	}
+	if len(peers) == 0 {
+		return 0, nil
 	}
 	g.dynamicPeerMu.Lock()
 	defer g.dynamicPeerMu.Unlock()
-	for _, ip := range ips {
-		g.cleanupDynamicPeerLeaseByIPLocked(context.Background(), ip)
+	if g.enrollLive == nil {
+		g.enrollLive = map[string]enrollmentLiveness{}
 	}
+	now := time.Now()
+	for _, p := range peers {
+		if g.onboard != nil {
+			g.onboard.AssignProfile(p.PeerIP, p.Profile)
+			g.onboard.SetOwner(p.PeerIP, p.Owner)
+			g.onboard.SetHostname(p.PeerIP, p.DisplayName)
+		}
+		if g.agents != nil {
+			g.agents.Seed(p.PeerIP)
+		}
+		g.enrollLive[p.PubKeyHex] = enrollmentLiveness{lastProgress: now}
+	}
+	return len(peers), nil
 }
 
-func (g *Gateway) logDynamicPeerReconcile(ctx context.Context) {
-	restored, err := g.reconcileDynamicPeerLeases(ctx)
+func (g *Gateway) logEnrollmentReconcile(ctx context.Context) {
+	restored, err := g.reconcileEnrolledPeers(ctx)
 	if err != nil {
-		log.Printf("wireguard dynamic peers: restored %d persisted lease(s) with errors: %v", restored, err)
+		log.Printf("enrollment: restoring persisted peers: %v", err)
 		return
 	}
 	if restored > 0 {
-		log.Printf("wireguard dynamic peers: restored %d persisted lease(s)", restored)
+		log.Printf("enrollment: restored %d persisted peer(s)", restored)
 	}
 }
 
-type wireguardDynamicPeerTransport struct{}
-
-func (t *wireguardDynamicPeerTransport) Name() string { return dynamicPeerTransportWireGuard }
-
-func (t *wireguardDynamicPeerTransport) Provision(_ context.Context, cfg *config.Gateway, publicKeyHex, reuseIP string) (dynamicPeerTransportSession, error) {
-	if globalWG == nil {
-		return dynamicPeerTransportSession{}, fmt.Errorf("wireguard server not started")
-	}
-	peerIP := reuseIP
-	var err error
-	if peerIP == "" {
-		peerIP, err = allocateWGPeerIP(cfg.Join())
-		if err != nil {
-			return dynamicPeerTransportSession{}, err
-		}
-	}
-	if err := globalWG.AddPeer(publicKeyHex, peerIP); err != nil {
-		return dynamicPeerTransportSession{}, fmt.Errorf("wg add peer: %w", err)
-	}
-	serverPubHex, err := globalWG.PublicKey()
-	if err != nil {
-		return dynamicPeerTransportSession{}, fmt.Errorf("wg server pub: %w", err)
-	}
-	serverPubB64, err := hexToB64(serverPubHex)
-	if err != nil {
-		return dynamicPeerTransportSession{}, err
-	}
-	endpoint, err := wgClientEndpoint(cfg.Join().WGEndpoint, cfg.PublicURL(), cfg.Join().WGListenPort)
-	if err != nil {
-		return dynamicPeerTransportSession{}, err
-	}
-	ip6 := wg6FromV4(netip.MustParseAddr(peerIP)).String()
-	return dynamicPeerTransportSession{
-		PeerIP:          peerIP,
-		PeerIPv6:        ip6,
-		ServerPublicKey: serverPubB64,
-		Endpoint:        endpoint,
-		AllowedIPs:      []string{"0.0.0.0/0", "::/0"},
-		MTU:             dynamicPeerDefaultMTU,
-	}, nil
-}
-
-func (t *wireguardDynamicPeerTransport) Revoke(_ context.Context, peerIP string) {
-	if globalWG != nil {
-		globalWG.RevokePeerByIP(peerIP)
-	}
-}
+// --- WireGuard /32 allocation ------------------------------------------
 
 // allocateWGPeerMu serializes WireGuard /32 allocation across both the
-// dashboard onboarding path (wireguardOnboarder.allocateIP) and dynamic
-// peer registration, so two concurrent allocations can't read the same
-// free slot from wg_peers and hand out a duplicate IP.
+// dashboard onboarding path (wireguardOnboarder.allocateIP) and enrollment
+// registration, so two concurrent allocations can't read the same free
+// slot from wg_peers and hand out a duplicate IP.
 var allocateWGPeerMu sync.Mutex
 
 func allocateWGPeerIP(ts JoinConfig) (string, error) {
@@ -792,12 +676,22 @@ func allocateWGPeerIP(ts JoinConfig) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	first := cidr.IP.To4()
-	if first == nil {
+	base := cidr.IP.To4()
+	if base == nil {
 		return "", fmt.Errorf("wireguard subnet must be IPv4")
 	}
-	for i := 2; i < 255; i++ {
-		ip := net.IPv4(first[0], first[1], first[2], byte(i)).String()
+	ones, _ := cidr.Mask.Size()
+	size := uint32(1) << uint(32-ones)
+	if size < 4 {
+		return "", fmt.Errorf("wireguard subnet %s is too small", ts.WGSubnetCIDR)
+	}
+	network := binary.BigEndian.Uint32(base)
+	// Skip the network address (offset 0), the gateway's own .1 (offset 1),
+	// and the broadcast (offset size-1).
+	for off := uint32(2); off < size-1; off++ {
+		var b [4]byte
+		binary.BigEndian.PutUint32(b[:], network+off)
+		ip := net.IP(b[:]).String()
 		if !used[ip] {
 			return ip, nil
 		}
@@ -822,6 +716,8 @@ func normalizeWGPublicKey(s string) (string, error) {
 	}
 	return hex.EncodeToString(b), nil
 }
+
+// --- kubernetes_token_review authorizer --------------------------------
 
 type k8sDynamicPeerClaims struct {
 	PodName      string `json:"pod_name"`
@@ -1093,4 +989,43 @@ func k8sRegistrationAllowed(cfg *config.EnrollmentAuthorizerBlock, namespace, se
 		}
 	}
 	return false
+}
+
+// parseAllPeerStats parses a wireguard-go IpcGet (UAPI) dump into per-peer
+// receive + handshake stats, keyed by hex public key.
+func parseAllPeerStats(uapi string) map[string]wgDevPeerStat {
+	out := map[string]wgDevPeerStat{}
+	var cur string
+	var st wgDevPeerStat
+	var secs, nsec int64
+	flush := func() {
+		if cur != "" {
+			if secs != 0 || nsec != 0 {
+				st.lastHandshake = time.Unix(secs, nsec)
+			}
+			out[cur] = st
+		}
+		st = wgDevPeerStat{}
+		secs, nsec = 0, 0
+	}
+	sc := bufio.NewScanner(strings.NewReader(uapi))
+	for sc.Scan() {
+		k, v, ok := strings.Cut(sc.Text(), "=")
+		if !ok {
+			continue
+		}
+		switch k {
+		case "public_key":
+			flush()
+			cur = v
+		case "rx_bytes":
+			st.rxBytes, _ = strconv.ParseUint(v, 10, 64)
+		case "last_handshake_time_sec":
+			secs, _ = strconv.ParseInt(v, 10, 64)
+		case "last_handshake_time_nsec":
+			nsec, _ = strconv.ParseInt(v, 10, 64)
+		}
+	}
+	flush()
+	return out
 }

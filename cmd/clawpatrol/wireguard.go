@@ -625,6 +625,28 @@ func relayUDP(c net.Conn, dstIP string, dstPort uint16) {
 	<-done
 }
 
+// wgDevPeerStat is the per-peer liveness subset of the device's IpcGet
+// output: received bytes (advanced by persistent-keepalive traffic) and
+// the last handshake time (diagnostic only — it moves on rekey, not on
+// every keepalive). The enrollment reaper drives liveness off rx_bytes.
+type wgDevPeerStat struct {
+	rxBytes       uint64
+	lastHandshake time.Time
+}
+
+// PeerStats returns per-peer receive + handshake stats keyed by hex public
+// key, parsed from the device's UAPI dump. nil when the device is down.
+func (s *WGServer) PeerStats() map[string]wgDevPeerStat {
+	if s == nil || s.dev == nil {
+		return nil
+	}
+	uapi, err := s.dev.IpcGet()
+	if err != nil {
+		return nil
+	}
+	return parseAllPeerStats(uapi)
+}
+
 func (s *WGServer) loadPeers() map[string]string {
 	out := map[string]string{}
 	if s.db == nil {

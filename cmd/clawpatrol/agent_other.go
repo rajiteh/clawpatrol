@@ -7,6 +7,6 @@ import (
 	"fmt"
 )
 
-func tunModeRun(_ context.Context, _ tunModeOptions) error {
+func agentRun(_ context.Context, _ agentOptions) error {
 	return fmt.Errorf("run --tun is only supported on Linux")
 }

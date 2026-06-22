@@ -3,9 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"path/filepath"
 	"testing"
-	"time"
 
 	"github.com/denoland/clawpatrol/internal/config"
 )
@@ -104,64 +102,35 @@ func TestKubernetesTokenReviewAuthorizerIdentity(t *testing.T) {
 	}
 }
 
-func TestDynamicPeerLeaseRefreshAndCleanup(t *testing.T) {
-	db, err := OpenDB(filepath.Join(t.TempDir(), "test.db"))
-	if err != nil {
-		t.Fatalf("OpenDB: %v", err)
-	}
-	defer func() { _ = db.Close() }()
-	g := &Gateway{db: db, onboard: newOnboardRegistry(), agents: NewAgentRegistry()}
-	if err := g.onboard.Load(db); err != nil {
-		t.Fatalf("onboard load: %v", err)
-	}
+// cleanupEnrolledPeerLocked tears down every trace of an enrolled peer:
+// the WireGuard peer (and its wg_peers row), the API token, and the
+// device/agent registry entries.
+func TestCleanupEnrolledPeer(t *testing.T) {
+	g := newDynamicPeerTestGateway(t)
 	startDynamicPeerTestWGServer(t, g)
 
-	lease := dynamicPeerLease{
-		PeerIP:             "10.55.0.42",
-		Transport:          dynamicPeerTransportWireGuard,
-		AuthorizerType:     dynamicPeerAuthorizerKubernetesTokenRev,
-		AuthorizerName:     "agents",
-		SubjectKey:         "kubernetes:agents:uid-1",
-		ReplacementKey:     "kubernetes:agents:agent-1",
-		DisplayName:        "agents/agent-1",
-		Owner:              "system:serviceaccount:agents:agent-runner",
-		Profile:            "default",
-		WireGuardPublicKey: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-		MetadataJSON:       "{}",
-		ExpiresNS:          time.Now().Add(time.Minute).UnixNano(),
-		LastHeartbeatNS:    time.Now().UnixNano(),
-	}
-	if err := upsertDynamicPeerLease(db, lease); err != nil {
-		t.Fatalf("upsert lease: %v", err)
-	}
-	token, err := mintAndPersistPeerAPIToken(db, lease.PeerIP)
+	resp, err := registerFor(t, g, "kubernetes:agents:uid-1", "kubernetes:agents:agent-1", keyA)
 	if err != nil {
-		t.Fatalf("mint token: %v", err)
+		t.Fatalf("register: %v", err)
 	}
-	g.onboard.AssignProfile(lease.PeerIP, lease.Profile)
-	g.onboard.SetHostname(lease.PeerIP, "agents/agent-1")
-	g.agents.Seed(lease.PeerIP)
-
-	refreshed, err := g.refreshDynamicPeerLease(context.Background(), lease.PeerIP, 2*time.Minute)
-	if err != nil {
-		t.Fatalf("refresh: %v", err)
-	}
-	if refreshed.ExpiresNS <= lease.ExpiresNS {
-		t.Fatalf("refresh did not extend expiry")
+	if _, err := g.enrolledPeerByIP(resp.PeerIP); err != nil {
+		t.Fatalf("precondition: enrolled peer not present: %v", err)
 	}
 
-	_, err = db.Exec("UPDATE dynamic_peer_leases SET expires_ns = ? WHERE peer_ip = ?", time.Now().Add(-time.Second).UnixNano(), lease.PeerIP)
-	if err != nil {
-		t.Fatalf("expire lease: %v", err)
+	g.dynamicPeerMu.Lock()
+	g.cleanupEnrolledPeerLocked(context.Background(), resp.PeerIP)
+	g.dynamicPeerMu.Unlock()
+
+	if _, err := g.enrolledPeerByIP(resp.PeerIP); err == nil {
+		t.Fatal("enrolled peer still present after cleanup")
 	}
-	g.sweepExpiredDynamicPeerLeases()
-	if _, err := g.dynamicPeerLeaseByIP(lease.PeerIP); err == nil {
-		t.Fatal("expired lease still present")
+	if got := wgPeerRowsForIP(t, g, resp.PeerIP); got != 0 {
+		t.Fatalf("wg_peers rows after cleanup = %d, want 0", got)
 	}
-	if got := peerIPForAPIToken(db, token); got != "" {
-		t.Fatalf("expired peer API token still resolves to %q", got)
+	if got := peerIPForAPIToken(g.db, resp.APIToken); got != "" {
+		t.Fatalf("peer API token still resolves to %q", got)
 	}
-	if g.onboard.HasDevice(lease.PeerIP) {
-		t.Fatal("expired peer still has device row")
+	if g.onboard.HasDevice(resp.PeerIP) {
+		t.Fatal("device row still present after cleanup")
 	}
 }

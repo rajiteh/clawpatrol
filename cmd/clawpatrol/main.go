@@ -376,6 +376,9 @@ type Gateway struct {
 	hitl          *HITLRegistry
 	onboard       *onboardRegistry
 	dynamicPeerMu sync.Mutex
+	// enrollLive tracks per-peer WireGuard rx_bytes progress for the
+	// enrollment liveness reaper. Guarded by dynamicPeerMu.
+	enrollLive map[string]enrollmentLiveness
 	// k8sVerifier lets tests inject a fake Kubernetes verifier. In
 	// production it stays nil and each register request builds a
 	// short-lived in-cluster client, which re-reads the rotating
@@ -3056,11 +3059,11 @@ func main() {
 	case "join":
 		runJoin(os.Args[2:])
 	case "run":
-		if tunModeRequested(os.Args[2:]) {
-			runTunMode(os.Args[2:])
-		} else {
-			runRun(os.Args[2:])
-		}
+		runRun(os.Args[2:])
+	case "agent":
+		// Foreground enrollment data plane: self-enroll through an authorizer,
+		// bring up a userspace WireGuard TUN, route the netns, stay up.
+		runAgent(os.Args[2:])
 	case "daemon-internal":
 		// internal: re-exec'd by `clawpatrol run` (Linux only) to host
 		// the per-user tsnet daemon. Hidden from usage(); name carries
@@ -3173,9 +3176,9 @@ usage:
                                          with no public URL (creds discarded
                                          once join completes)
   clawpatrol run -- <cmd> [args...]      route one process tree through gateway
-  clawpatrol run --tun --dynamic-peer-authorizer <type>/<name> [flags]
-                                         resident sidecar: self-register as a
-                                         dynamic peer and route the pod netns
+  clawpatrol agent --authorizer <type>/<name> [flags]
+                                         resident sidecar: self-enroll and
+                                         route the whole network namespace
   clawpatrol status                      report install + tunnel state
   clawpatrol uninstall                   remove local join state and tunnel config
   clawpatrol env                         print shell exports for sourcing
@@ -3437,16 +3440,15 @@ func runGateway(args []string) {
 			log.Fatalf("wireguard: %v", err)
 		}
 		setWGServer(wg)
+		// Restore any persisted enrolled peers into the device + registry,
+		// then run the liveness reaper. Both are always-on once WireGuard is
+		// up: enrollment can be turned on by a later config reload, and any
+		// peers left behind must keep getting reaped after the feature is
+		// turned off. The reaper is a cheap no-op while there are none.
+		g.logEnrollmentReconcile(context.Background())
+		go g.startEnrollmentReaper(context.Background())
 		if cfg.IsEnrollmentEnabled() {
-			g.logDynamicPeerReconcile(context.Background())
-		}
-		// Always run the lease sweeper once WireGuard is up. Dynamic peers
-		// can be turned on by a later config reload, and any leases left
-		// behind must keep draining even after the feature is turned off.
-		// The sweep is a cheap no-op while the table is empty.
-		go g.startDynamicPeerLeaseSweeper(context.Background())
-		if cfg.IsEnrollmentEnabled() {
-			log.Printf("wireguard dynamic peers: enabled")
+			log.Printf("enrollment: enabled")
 		}
 		dashMux := newWebMux(g, cfg.Join(), cfg.PublicURL())
 		dashPort := portOf(dashListen)

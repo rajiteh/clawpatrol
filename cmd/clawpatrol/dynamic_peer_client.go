@@ -9,14 +9,13 @@ import (
 	"net/http"
 	"os"
 	"strings"
-	"time"
 )
 
-// Dynamic-peer client core — transport-agnostic. These calls (register /
-// fetch env / heartbeat / deregister) and the claims providers are
-// independent of how traffic is actually carried, so they're shared by
-// `run --tun` (TUN transport) and, in future, the unprivileged gVisor
-// transport. The transport-specific bring-up lives elsewhere.
+// Enrollment client core used by `clawpatrol agent`: register through the
+// configured authorizer, fetch the env-pushdown, and best-effort deregister
+// on shutdown. There is no heartbeat — the gateway observes liveness from
+// the WireGuard device (rx_bytes), so keepalive traffic is the liveness
+// signal.
 
 func dynamicPeerRegister(ctx context.Context, gatewayURL, token string, reqBody dynamicPeerRegisterRequest) (dynamicPeerRegisterResponse, error) {
 	var buf bytes.Buffer
@@ -48,9 +47,6 @@ func dynamicPeerRegister(ctx context.Context, gatewayURL, token string, reqBody 
 	if out.PeerIP == "" || out.ServerPublicKey == "" || out.Endpoint == "" || out.APIToken == "" {
 		return dynamicPeerRegisterResponse{}, fmt.Errorf("register response missing peer_ip, server_public_key, endpoint, or api_token")
 	}
-	if out.LeaseTTLSeconds <= 0 {
-		return dynamicPeerRegisterResponse{}, fmt.Errorf("register response has invalid lease_ttl_seconds")
-	}
 	return out, nil
 }
 
@@ -73,32 +69,6 @@ func dynamicPeerFetchEnv(ctx context.Context, gatewayURL, apiToken string) ([]pu
 		return nil, err
 	}
 	return parseEnvPushdownJSON(raw)
-}
-
-func dynamicPeerHeartbeatLoop(ctx context.Context, gatewayURL, apiToken string, ttlSeconds int) {
-	interval := time.Duration(ttlSeconds) * time.Second / 2
-	if interval < 5*time.Second {
-		interval = 5 * time.Second
-	}
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(gatewayURL, "/")+dynamicPeerHeartbeatPath, nil)
-			if err != nil {
-				continue
-			}
-			req.Header.Set("Authorization", "Bearer "+apiToken)
-			resp, err := http.DefaultClient.Do(req)
-			if err == nil {
-				_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-				_ = resp.Body.Close()
-			}
-		}
-	}
 }
 
 func dynamicPeerDeregister(ctx context.Context, gatewayURL, apiToken string) {

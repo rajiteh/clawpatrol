@@ -23,7 +23,7 @@ import (
 	wgtun "golang.zx2c4.com/wireguard/tun"
 )
 
-// tunModeRun is the resident, privileged data plane behind
+// agentRun is the resident, privileged data plane behind
 // `clawpatrol run --tun`. It self-registers as a dynamic peer, brings up a
 // userspace WireGuard TUN, routes the whole network namespace through the
 // gateway, writes the CA + env handoff for the sibling workload container,
@@ -31,7 +31,7 @@ import (
 // heartbeat / deregister / claims logic is the transport-agnostic
 // dynamic-peer client core (dynamic_peer_client.go); everything here is
 // the TUN-specific bring-up.
-func tunModeRun(ctx context.Context, opt tunModeOptions) error {
+func agentRun(ctx context.Context, opt agentOptions) error {
 	claims, credential, err := gatherDynamicPeerClaims(opt.AuthorizerType, opt.KubeTokenPath)
 	if err != nil {
 		return err
@@ -158,12 +158,14 @@ func tunModeRun(ctx context.Context, opt tunModeOptions) error {
 		return err
 	}
 
+	// Stay up for the netns lifetime. WireGuard persistent-keepalive keeps
+	// the tunnel live and lets the gateway observe liveness (rx_bytes); the
+	// gateway reaps the peer if we go quiet. No app-level heartbeat.
 	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	go dynamicPeerHeartbeatLoop(ctx, opt.GatewayURL, registerResp.APIToken, registerResp.LeaseTTLSeconds)
 	<-ctx.Done()
 	// Best-effort deregister, bounded so a hung gateway/DNS call can't delay
-	// pod termination past the grace period (the lease still TTL-expires).
+	// pod termination past the grace period (the gateway still reaps us).
 	delCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	dynamicPeerDeregister(delCtx, opt.GatewayURL, registerResp.APIToken)
@@ -350,7 +352,7 @@ func runIP(args ...string) error {
 	return nil
 }
 
-func writeTunFiles(opt tunModeOptions, vars []pushdownEnvVar, caPEM string) error {
+func writeTunFiles(opt agentOptions, vars []pushdownEnvVar, caPEM string) error {
 	if err := os.MkdirAll(filepath.Dir(opt.EnvOut), 0o755); err != nil {
 		return err
 	}

@@ -23,7 +23,6 @@ func TestDynamicPeerRegisterRequest(t *testing.T) {
 			ServerPublicKey: "srv-pub",
 			Endpoint:        "ep.example:51820",
 			APIToken:        "peer-token",
-			LeaseTTLSeconds: 120,
 		})
 	}))
 	defer srv.Close()
@@ -83,8 +82,7 @@ func TestDynamicPeerRegisterRejectsIncompleteResponse(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
 		// Valid transport but missing peer_ip / server_public_key / token.
 		_ = json.NewEncoder(rw).Encode(dynamicPeerRegisterResponse{
-			Transport:       dynamicPeerTransportWireGuard,
-			LeaseTTLSeconds: 120,
+			Transport: dynamicPeerTransportWireGuard,
 		})
 	}))
 	defer srv.Close()
