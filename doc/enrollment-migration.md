@@ -3,7 +3,7 @@
 This guide migrates an existing clawpatrol deployment from the old
 "dynamic peers" shape (`gateway.wireguard.dynamic_peers { ... }` +
 `clawpatrol run --tun`) to the new enrollment design (top-level
-`enrollment { ... }` + `clawpatrol agent`).
+`enrollment { ... }` + `clawpatrol bridge`).
 
 No data migration is needed: the storage migration
 (`0020_wg_peer_enrollment.sql`) runs automatically on gateway startup
@@ -81,7 +81,7 @@ Notes:
 
 ## 2. Agent sidecar invocation
 
-The sidecar verb changed from `run --tun` to `agent`, and
+The sidecar verb changed from `run --tun` to `bridge`, and
 `--dynamic-peer-authorizer` is now `--authorizer`. All other flags are
 unchanged.
 
@@ -103,7 +103,7 @@ args:
 
 ```yaml
 args:
-  - agent
+  - bridge
   - --gateway-url=http://clawpatrol-api.clawpatrol.svc:8080
   - --authorizer=kubernetes_token_review/agents
   - --kubernetes-token-path=/var/run/secrets/tokens/clawpatrol-token
@@ -147,7 +147,7 @@ container that reads the handoff files.
 - [ ] Rename `lease_ttl` → `peer_ttl` (and bump to ≥ `2m` if it was
       shorter than the keepalive interval).
 - [ ] In every agent pod spec: replace the `run` + `--tun` args with a
-      single `agent` arg.
+      single `bridge` arg.
 - [ ] Rename `--dynamic-peer-authorizer=` → `--authorizer=`.
 - [ ] `clawpatrol validate <config>` then restart the gateway, then
       roll the agent pods.

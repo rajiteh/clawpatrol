@@ -11,7 +11,7 @@ import (
 	"strings"
 )
 
-// Enrollment client core used by `clawpatrol agent`: register through the
+// Enrollment client core used by `clawpatrol bridge`: register through the
 // configured authorizer, fetch the env-pushdown, and best-effort deregister
 // on shutdown. There is no heartbeat — the gateway observes liveness from
 // the WireGuard device (rx_bytes), so keepalive traffic is the liveness

@@ -24,14 +24,14 @@ func TestPreferV4(t *testing.T) {
 	}
 }
 
-func TestParseAgentAuthorizer(t *testing.T) {
-	typ, name, err := parseAgentAuthorizer("kubernetes_token_review/agents")
+func TestParseBridgeAuthorizer(t *testing.T) {
+	typ, name, err := parseBridgeAuthorizer("kubernetes_token_review/agents")
 	if err != nil || typ != "kubernetes_token_review" || name != "agents" {
 		t.Fatalf("parse = %q %q %v", typ, name, err)
 	}
 	for _, bad := range []string{"", "agents", "kubernetes_token_review/", "/agents", "oidc/agents"} {
-		if _, _, err := parseAgentAuthorizer(bad); err == nil {
-			t.Errorf("parseAgentAuthorizer(%q) expected error", bad)
+		if _, _, err := parseBridgeAuthorizer(bad); err == nil {
+			t.Errorf("parseBridgeAuthorizer(%q) expected error", bad)
 		}
 	}
 }

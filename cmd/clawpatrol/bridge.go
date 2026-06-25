@@ -14,14 +14,15 @@ import (
 // in the linux-only file) because it's a cross-platform flag default.
 const kubernetesDefaultTokenPath = "/var/run/secrets/tokens/clawpatrol-token"
 
-// agentOptions configures `clawpatrol agent`: a resident, foreground,
-// privileged data plane that self-enrolls through an authorizer, brings up
-// a userspace WireGuard TUN, and routes the whole network namespace through
-// the gateway. It stays up for the netns lifetime (the userspace device
-// dies with the process) and deregisters best-effort on SIGTERM. The
-// execution workload runs in a sibling, unprivileged container that shares
-// this netns and reads the handoff files below.
-type agentOptions struct {
+// bridgeOptions configures `clawpatrol bridge`: a resident, foreground,
+// privileged data plane that self-enrolls through an authorizer, hosts a
+// userspace WireGuard tunnel, and routes the whole network namespace through
+// the gateway — bridging the netns to the gateway. It stays up for the netns
+// lifetime (the userspace device dies with the process) and deregisters
+// best-effort on SIGTERM. The execution workload runs in a sibling,
+// unprivileged container that shares this netns and reads the handoff files
+// below.
+type bridgeOptions struct {
 	GatewayURL string
 
 	// AuthorizerType/Name mirror the gateway's two-label authorizer block
@@ -46,15 +47,15 @@ type agentOptions struct {
 	MTU   int
 }
 
-// runAgent parses the `clawpatrol agent` flags and dispatches to the
+// runBridge parses the `clawpatrol bridge` flags and dispatches to the
 // platform implementation. Kept cross-platform (no wireguard imports) so
-// the flag surface and validation errors are identical everywhere; agentRun
+// the flag surface and validation errors are identical everywhere; bridgeRun
 // is linux-only.
-func runAgent(args []string) {
-	fs := flag.NewFlagSet("agent", flag.ExitOnError)
+func runBridge(args []string) {
+	fs := flag.NewFlagSet("bridge", flag.ExitOnError)
 	var (
 		authorizer string
-		opt        agentOptions
+		opt        bridgeOptions
 	)
 	fs.StringVar(&opt.GatewayURL, "gateway-url", "", "gateway API URL, e.g. https://clawpatrol.clawpatrol.svc:8443")
 	fs.StringVar(&authorizer, "authorizer", "", "enrollment authorizer to register through, as <type>/<name> (e.g. kubernetes_token_review/agents)")
@@ -67,19 +68,19 @@ func runAgent(args []string) {
 	_ = fs.Parse(args)
 
 	if len(fs.Args()) > 0 {
-		fail("clawpatrol agent does not take a command; the workload runs in a sibling container sharing this netns")
+		fail("clawpatrol bridge does not take a command; the workload runs in a sibling container sharing this netns")
 	}
 	if strings.TrimSpace(opt.GatewayURL) == "" {
-		fail("clawpatrol agent: --gateway-url is required")
+		fail("clawpatrol bridge: --gateway-url is required")
 	}
-	typ, name, err := parseAgentAuthorizer(authorizer)
+	typ, name, err := parseBridgeAuthorizer(authorizer)
 	if err != nil {
 		fail("%v", err)
 	}
 	opt.AuthorizerType, opt.AuthorizerName = typ, name
 
-	if err := agentRun(context.Background(), opt); err != nil {
-		fmt.Fprintf(os.Stderr, "clawpatrol agent: %v\n", err)
+	if err := bridgeRun(context.Background(), opt); err != nil {
+		fmt.Fprintf(os.Stderr, "clawpatrol bridge: %v\n", err)
 		os.Exit(1)
 	}
 }
@@ -102,10 +103,10 @@ func preferV4(ips []netip.Addr) (netip.Addr, bool) {
 	return ips[0].Unmap(), true
 }
 
-// parseAgentAuthorizer splits the `--authorizer <type>/<name>` value,
+// parseBridgeAuthorizer splits the `--authorizer <type>/<name>` value,
 // mirroring the gateway's `authorizer "<type>" "<name>"` block. The type
 // selects the client claims provider; the name is sent on the wire.
-func parseAgentAuthorizer(s string) (typ, name string, err error) {
+func parseBridgeAuthorizer(s string) (typ, name string, err error) {
 	s = strings.TrimSpace(s)
 	if s == "" {
 		return "", "", fmt.Errorf("--authorizer is required (form: <type>/<name>, e.g. kubernetes_token_review/agents)")

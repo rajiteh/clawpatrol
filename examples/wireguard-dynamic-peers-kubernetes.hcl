@@ -1,7 +1,7 @@
 # WireGuard enrollment for Kubernetes agent pods.
 #
 # The gateway runs the userspace WireGuard server. Agent pods run a
-# privileged native sidecar init container running `clawpatrol agent`
+# privileged native sidecar init container running `clawpatrol bridge`
 # that self-enrolls through the `kubernetes_token_review` authorizer while
 # the execution container stays restricted.
 

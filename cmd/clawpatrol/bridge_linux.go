@@ -23,15 +23,14 @@ import (
 	wgtun "golang.zx2c4.com/wireguard/tun"
 )
 
-// agentRun is the resident, privileged data plane behind
-// `clawpatrol run --tun`. It self-registers as a dynamic peer, brings up a
-// userspace WireGuard TUN, routes the whole network namespace through the
+// bridgeRun is the resident, privileged data plane behind
+// `clawpatrol bridge`. It self-enrolls through an authorizer, hosts a
+// userspace WireGuard tunnel, routes the whole network namespace through the
 // gateway, writes the CA + env handoff for the sibling workload container,
-// heartbeats the lease, and deregisters on SIGTERM. The register /
-// heartbeat / deregister / claims logic is the transport-agnostic
-// dynamic-peer client core (dynamic_peer_client.go); everything here is
-// the TUN-specific bring-up.
-func agentRun(ctx context.Context, opt agentOptions) error {
+// and deregisters on SIGTERM. The enroll / deregister / claims logic is the
+// transport-agnostic enrollment client core (dynamic_peer_client.go);
+// everything here is the TUN-specific bring-up.
+func bridgeRun(ctx context.Context, opt bridgeOptions) error {
 	claims, credential, err := gatherDynamicPeerClaims(opt.AuthorizerType, opt.KubeTokenPath)
 	if err != nil {
 		return err
@@ -352,7 +351,7 @@ func runIP(args ...string) error {
 	return nil
 }
 
-func writeTunFiles(opt agentOptions, vars []pushdownEnvVar, caPEM string) error {
+func writeTunFiles(opt bridgeOptions, vars []pushdownEnvVar, caPEM string) error {
 	if err := os.MkdirAll(filepath.Dir(opt.EnvOut), 0o755); err != nil {
 		return err
 	}

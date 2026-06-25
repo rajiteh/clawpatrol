@@ -3,18 +3,19 @@
 Clawpatrol can run in Kubernetes with the gateway as a long-lived pod and
 agents as on-demand pods. The gateway keeps using the existing userspace
 WireGuard server. Agent pods use a native Kubernetes sidecar init container
-running `clawpatrol agent` to bring up the pod-level WireGuard tunnel; the
+running `clawpatrol bridge` to bring up the pod-level WireGuard tunnel; the
 execution container remains unprivileged.
 
-`clawpatrol agent` is a foreground, privileged data plane: it self-enrolls
-through a configured authorizer, brings up a userspace WireGuard TUN, and
-routes the whole pod network namespace through the gateway. It stays up for
-the netns lifetime and best-effort deregisters on SIGTERM. The execution
-workload runs in a sibling, unprivileged container that shares this netns
-and reads the handoff files the agent writes.
+`clawpatrol bridge` is a foreground, privileged data plane: it self-enrolls
+through a configured authorizer, hosts a userspace WireGuard tunnel, and
+routes the whole pod network namespace through the gateway — bridging the
+pod's netns to the gateway. It stays up for the netns lifetime and
+best-effort deregisters on SIGTERM. The execution workload runs in a
+sibling, unprivileged container that shares this netns and reads the handoff
+files the bridge writes.
 
 ```
-clawpatrol agent \
+clawpatrol bridge \
   --gateway-url=http://clawpatrol-api.clawpatrol.svc:8080 \
   --authorizer=kubernetes_token_review/agents \
   --kubernetes-token-path=/var/run/secrets/tokens/clawpatrol-token \

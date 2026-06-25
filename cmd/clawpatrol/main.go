@@ -3060,10 +3060,10 @@ func main() {
 		runJoin(os.Args[2:])
 	case "run":
 		runRun(os.Args[2:])
-	case "agent":
-		// Foreground enrollment data plane: self-enroll through an authorizer,
-		// bring up a userspace WireGuard TUN, route the netns, stay up.
-		runAgent(os.Args[2:])
+	case "bridge":
+		// Foreground data plane: self-enroll through an authorizer, bring up
+		// and host a userspace WireGuard tunnel, route the netns, stay up.
+		runBridge(os.Args[2:])
 	case "daemon-internal":
 		// internal: re-exec'd by `clawpatrol run` (Linux only) to host
 		// the per-user tsnet daemon. Hidden from usage(); name carries
@@ -3176,9 +3176,9 @@ usage:
                                          with no public URL (creds discarded
                                          once join completes)
   clawpatrol run -- <cmd> [args...]      route one process tree through gateway
-  clawpatrol agent --authorizer <type>/<name> [flags]
-                                         resident sidecar: self-enroll and
-                                         route the whole network namespace
+  clawpatrol bridge --authorizer <type>/<name> [flags]
+                                         resident sidecar: self-enroll, host the
+                                         WireGuard tunnel, route the netns
   clawpatrol status                      report install + tunnel state
   clawpatrol uninstall                   remove local join state and tunnel config
   clawpatrol env                         print shell exports for sourcing

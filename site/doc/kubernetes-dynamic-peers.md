@@ -26,10 +26,10 @@ The deployment has three parts:
 - **Gateway pod** — runs `clawpatrol gateway`, the dashboard/API, and
   the userspace WireGuard server. It needs Kubernetes API permission to
   create TokenReviews and read allowed agent pods.
-- **WireGuard sidecar init container** — runs `clawpatrol agent` with
+- **WireGuard sidecar init container** — runs `clawpatrol bridge` with
   `restartPolicy: Always`. It owns `/dev/net/tun`, `NET_ADMIN`, pod
-  routing, the projected ServiceAccount token, enrollment, and
-  best-effort deregistration on shutdown.
+  routing, the projected ServiceAccount token, enrollment, hosting the
+  userspace WireGuard tunnel, and best-effort deregistration on shutdown.
 - **Agent container** — runs the actual workload. It has no Kubernetes
   token, no `/dev/net/tun`, no added capabilities, and only a read-only
   shared handoff volume.
@@ -109,7 +109,7 @@ initContainers:
     restartPolicy: Always
     image: ghcr.io/denoland/clawpatrol:latest
     args:
-      - agent
+      - bridge
       - --gateway-url=http://clawpatrol-api.clawpatrol.svc:8080
       - --authorizer=kubernetes_token_review/agents
       - --kubernetes-token-path=/var/run/secrets/tokens/clawpatrol-token
