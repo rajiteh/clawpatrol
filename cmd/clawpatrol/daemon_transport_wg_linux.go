@@ -109,7 +109,7 @@ func (t *wgTransport) Close() error {
 // startWGTransport reads the user wg.conf written by `clawpatrol join`
 // and brings up the transport. The device bring-up itself lives in
 // newWGTransportFromConf so it can also be driven from an in-memory
-// runConf (e.g. a enrollment registration result) without a wg.conf
+// runConf (e.g. an enrollment registration result) without a wg.conf
 // on disk.
 func startWGTransport() (daemonTransport, error) {
 	confPath := defaultRunConf()
