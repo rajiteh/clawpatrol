@@ -68,6 +68,9 @@ func dumpSettings(s *GatewaySettings) map[string]any {
 	if s.Tailscale != nil {
 		out["tailscale"] = dumpTailscale(s.Tailscale)
 	}
+	if s.Enrollment != nil {
+		out["enrollment"] = dumpEnrollment(s.Enrollment)
+	}
 	return out
 }
 
@@ -121,6 +124,55 @@ func dumpTailscale(t *TailscaleBlock) map[string]any {
 		out["oauth_client_secret"] = t.OAuthClientSecret
 	}
 	return out
+}
+
+func dumpEnrollment(e *EnrollmentBlock) map[string]any {
+	out := map[string]any{}
+	if e.PeerTTL != "" {
+		out["peer_ttl"] = e.PeerTTL
+	}
+	if len(e.Authorizers) > 0 {
+		authorizers := make([]map[string]any, 0, len(e.Authorizers))
+		for _, a := range e.Authorizers {
+			row := map[string]any{
+				"type": a.Type,
+				"name": a.Name,
+			}
+			if a.Audience != "" {
+				row["audience"] = a.Audience
+			}
+			if a.ProfileLabel != "" {
+				row["profile_label"] = a.ProfileLabel
+			}
+			if len(a.Allow) > 0 {
+				row["allow"] = dumpEnrollmentAllow(a.Allow)
+			}
+			authorizers = append(authorizers, row)
+		}
+		out["authorizer"] = authorizers
+	}
+	return out
+}
+
+func dumpEnrollmentAllow(rules []EnrollmentAllow) []map[string]any {
+	if len(rules) == 0 {
+		return nil
+	}
+	allow := make([]map[string]any, 0, len(rules))
+	for _, a := range rules {
+		row := map[string]any{}
+		if a.Namespace != "" {
+			row["namespace"] = a.Namespace
+		}
+		if a.ServiceAccount != "" {
+			row["service_account"] = a.ServiceAccount
+		}
+		if len(a.Profiles) > 0 {
+			row["profiles"] = a.Profiles
+		}
+		allow = append(allow, row)
+	}
+	return allow
 }
 
 func dumpDefaults(d *Defaults) map[string]any {

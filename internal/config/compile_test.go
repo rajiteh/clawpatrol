@@ -114,6 +114,112 @@ func TestCompile(t *testing.T) {
 	}
 }
 
+func TestEnrollmentConfigValidation(t *testing.T) {
+	const authBlock = `    authorizer "kubernetes_token_review" "agents" {
+      audience = "clawpatrol"
+      profile_label = "clawpatrol.dev/profile"
+      allow {
+        namespace = "agents"
+        service_account = "agent-runner"
+        profiles = ["default"]
+      }
+    }
+`
+	valid := `gateway {
+  state_dir = "/opt/clawpatrol"
+  wireguard {
+    subnet_cidr = "10.55.0.0/24"
+    endpoint = "clawpatrol-wg.clawpatrol.svc:51820"
+  }
+
+  enrollment {
+    peer_ttl = "2m"
+
+` + authBlock + `  }
+}
+
+profile "default" { credentials = [] }
+`
+	gw, diags := config.LoadBytes([]byte(valid), "k8s.hcl")
+	if diags.HasErrors() {
+		t.Fatalf("valid config diagnostics: %v", diags)
+	}
+	if !gw.IsEnrollmentEnabled() {
+		t.Fatal("enrollment should be enabled")
+	}
+	if ttl, err := gw.EnrollmentPeerTTL(); err != nil || ttl != 2*time.Minute {
+		t.Fatalf("peer ttl = %s, %v; want 2m", ttl, err)
+	}
+	if got := gw.Settings.Enrollment.Authorizers[0].Name; got != "agents" {
+		t.Fatalf("authorizer name = %q, want agents", got)
+	}
+	dump, err := gw.Dump()
+	if err != nil {
+		t.Fatalf("dump: %v", err)
+	}
+	if !strings.Contains(string(dump), `"enrollment"`) {
+		t.Fatalf("dump does not use enrollment shape:\n%s", dump)
+	}
+
+	cases := []struct {
+		name string
+		body string
+		want string
+	}{
+		{
+			name: "missing audience",
+			body: strings.Replace(valid, `      audience = "clawpatrol"`+"\n", "", 1),
+			want: "Missing enrollment.authorizer.audience",
+		},
+		{
+			name: "bad ttl",
+			body: strings.Replace(valid, `peer_ttl = "2m"`, `peer_ttl = "-1s"`, 1),
+			want: "Invalid enrollment.peer_ttl",
+		},
+		{
+			name: "missing authorizer",
+			body: strings.Replace(valid, authBlock, "", 1),
+			want: "Missing enrollment.authorizer",
+		},
+		{
+			name: "authorizer missing allow",
+			body: strings.Replace(valid, `      allow {
+        namespace = "agents"
+        service_account = "agent-runner"
+        profiles = ["default"]
+      }
+`, "", 1),
+			want: "Missing enrollment.authorizer.allow",
+		},
+		{
+			name: "allow missing profiles",
+			body: strings.Replace(valid, `        profiles = ["default"]`+"\n", "", 1),
+			want: "Invalid enrollment.authorizer.allow",
+		},
+		{
+			name: "duplicate authorizer",
+			body: strings.Replace(valid, authBlock, authBlock+authBlock, 1),
+			want: "Duplicate enrollment.authorizer",
+		},
+		{
+			name: "unsupported authorizer",
+			body: strings.Replace(valid, `authorizer "kubernetes_token_review" "agents"`, `authorizer "oidc_jwt" "agents"`, 1),
+			want: "Unsupported enrollment.authorizer",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, diags := config.LoadBytes([]byte(tc.body), tc.name+".hcl")
+			if !diags.HasErrors() {
+				t.Fatalf("expected diagnostics")
+			}
+			if !strings.Contains(diags.Error(), tc.want) {
+				t.Fatalf("diagnostics = %v, want %q", diags, tc.want)
+			}
+		})
+	}
+}
+
 // TestCompileWildcardHosts verifies that wildcard hosts are accepted,
 // land in HostPatterns (not HostIndex), and that malformed wildcards
 // or within-endpoint duplicates are rejected at load time.
