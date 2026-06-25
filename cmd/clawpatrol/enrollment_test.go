@@ -21,7 +21,7 @@ const (
 	keyB = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
 )
 
-func newDynamicPeerTestGateway(t *testing.T) *Gateway {
+func newEnrollmentTestGateway(t *testing.T) *Gateway {
 	t.Helper()
 	db, err := OpenDB(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
@@ -35,11 +35,11 @@ func newDynamicPeerTestGateway(t *testing.T) *Gateway {
 	return g
 }
 
-// startDynamicPeerTestWGServer starts a real userspace WGServer for tests
+// startEnrollmentTestWGServer starts a real userspace WGServer for tests
 // that exercise AddPeer / RevokePeerByIP / PeerStats. The sandbox cannot
 // always bind a UDP socket, so the test is skipped (not failed) when the
 // device won't start; CI runs it for real.
-func startDynamicPeerTestWGServer(t *testing.T, g *Gateway) *WGServer {
+func startEnrollmentTestWGServer(t *testing.T, g *Gateway) *WGServer {
 	t.Helper()
 	prevDB := globalDB
 	prevWG := globalWG
@@ -81,25 +81,25 @@ func seedEnrolledPeer(t *testing.T, g *Gateway, ip, pub, subject, replacement st
 		VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		pub, ip, time.Now().UnixNano(), subject, replacement,
 		"agents/x", "system:serviceaccount:agents:agent-runner", "default",
-		dynamicPeerAuthorizerKubernetesTokenRev, "agents", "{}"); err != nil {
+		enrollmentAuthorizerKubernetesTokenRev, "agents", "{}"); err != nil {
 		t.Fatalf("seed enrolled peer: %v", err)
 	}
 }
 
-type fakeDynamicPeerAuthorizer struct{ typ, name string }
+type fakeEnrollmentAuthorizer struct{ typ, name string }
 
-func (f fakeDynamicPeerAuthorizer) Type() string { return f.typ }
-func (f fakeDynamicPeerAuthorizer) Name() string { return f.name }
-func (f fakeDynamicPeerAuthorizer) Authorize(context.Context, string, json.RawMessage) (dynamicPeerIdentity, error) {
-	return dynamicPeerIdentity{}, nil
+func (f fakeEnrollmentAuthorizer) Type() string { return f.typ }
+func (f fakeEnrollmentAuthorizer) Name() string { return f.name }
+func (f fakeEnrollmentAuthorizer) Authorize(context.Context, string, json.RawMessage) (enrollmentIdentity, error) {
+	return enrollmentIdentity{}, nil
 }
 
 // registerFor drives registerEnrolledPeer with a synthesized identity, the
 // way the HTTP handler would after the authorizer ran. Requires a live
-// WGServer (AddPeer); callers start one via startDynamicPeerTestWGServer.
-func registerFor(t *testing.T, g *Gateway, subjectKey, replacementKey, pub string) (dynamicPeerRegisterResponse, error) {
+// WGServer (AddPeer); callers start one via startEnrollmentTestWGServer.
+func registerFor(t *testing.T, g *Gateway, subjectKey, replacementKey, pub string) (enrollmentRegisterResponse, error) {
 	t.Helper()
-	id := dynamicPeerIdentity{
+	id := enrollmentIdentity{
 		SubjectKey:     subjectKey,
 		ReplacementKey: replacementKey,
 		DisplayName:    "agents/x",
@@ -107,21 +107,21 @@ func registerFor(t *testing.T, g *Gateway, subjectKey, replacementKey, pub strin
 		Profile:        "default",
 		Metadata:       map[string]string{"subject": subjectKey},
 	}
-	auth := fakeDynamicPeerAuthorizer{typ: dynamicPeerAuthorizerKubernetesTokenRev, name: "agents"}
-	return g.registerEnrolledPeer(context.Background(), enabledDynamicPeersCfg(), auth, id, dynamicPeerRegisterRequest{
-		Transport:          dynamicPeerTransportWireGuard,
+	auth := fakeEnrollmentAuthorizer{typ: enrollmentAuthorizerKubernetesTokenRev, name: "agents"}
+	return g.registerEnrolledPeer(context.Background(), enabledEnrollmentCfg(), auth, id, enrollmentRegisterRequest{
+		Transport:          enrollmentTransportWireGuard,
 		WireGuardPublicKey: pub,
 	})
 }
 
 func TestRegisterEnrolledPeerFresh(t *testing.T) {
-	g := newDynamicPeerTestGateway(t)
-	startDynamicPeerTestWGServer(t, g)
+	g := newEnrollmentTestGateway(t)
+	startEnrollmentTestWGServer(t, g)
 	resp, err := registerFor(t, g, "kubernetes:agents:uid-1", "kubernetes:agents:agent-1", keyA)
 	if err != nil {
 		t.Fatalf("register: %v", err)
 	}
-	if resp.PeerIP == "" || resp.Transport != dynamicPeerTransportWireGuard {
+	if resp.PeerIP == "" || resp.Transport != enrollmentTransportWireGuard {
 		t.Fatalf("unexpected response %+v", resp)
 	}
 	if resp.APIToken == "" || resp.ServerPublicKey == "" || resp.Endpoint == "" {
@@ -146,8 +146,8 @@ func TestRegisterEnrolledPeerFresh(t *testing.T) {
 // WireGuard key. The same subject must reuse its own slot (reuse the IP, swap
 // the key) instead of being locked out.
 func TestRegisterEnrolledPeerSameSubjectNewKey(t *testing.T) {
-	g := newDynamicPeerTestGateway(t)
-	startDynamicPeerTestWGServer(t, g)
+	g := newEnrollmentTestGateway(t)
+	startEnrollmentTestWGServer(t, g)
 	first, err := registerFor(t, g, "kubernetes:agents:uid-1", "kubernetes:agents:agent-1", keyA)
 	if err != nil {
 		t.Fatalf("first register: %v", err)
@@ -173,13 +173,13 @@ func TestRegisterEnrolledPeerSameSubjectNewKey(t *testing.T) {
 
 // A different subject presenting a live peer's public key is a conflict.
 func TestRegisterEnrolledPeerPublicKeyConflict(t *testing.T) {
-	g := newDynamicPeerTestGateway(t)
-	startDynamicPeerTestWGServer(t, g)
+	g := newEnrollmentTestGateway(t)
+	startEnrollmentTestWGServer(t, g)
 	if _, err := registerFor(t, g, "kubernetes:agents:uid-other", "kubernetes:agents:other-pod", keyA); err != nil {
 		t.Fatalf("seed register: %v", err)
 	}
 	_, err := registerFor(t, g, "kubernetes:agents:uid-1", "kubernetes:agents:agent-1", keyA)
-	if !errors.Is(err, errDynamicPeerConflict) {
+	if !errors.Is(err, errEnrollmentConflict) {
 		t.Fatalf("err = %v, want conflict", err)
 	}
 }
@@ -189,8 +189,8 @@ func TestRegisterEnrolledPeerPublicKeyConflict(t *testing.T) {
 // freed IP may be handed straight back — the takeover is observable in the
 // revoked token and the swapped enrollment, not the address.
 func TestRegisterEnrolledPeerReplacementTakeover(t *testing.T) {
-	g := newDynamicPeerTestGateway(t)
-	startDynamicPeerTestWGServer(t, g)
+	g := newEnrollmentTestGateway(t)
+	startEnrollmentTestWGServer(t, g)
 	old, err := registerFor(t, g, "kubernetes:agents:uid-old", "kubernetes:agents:agent-1", keyA)
 	if err != nil {
 		t.Fatalf("seed register: %v", err)
@@ -220,8 +220,8 @@ func TestRegisterEnrolledPeerReplacementTakeover(t *testing.T) {
 // When persistence fails after the WireGuard peer is provisioned, the
 // register path rolls back the transport peer + API token so nothing leaks.
 func TestRegisterEnrolledPeerRollbackOnPersistFailure(t *testing.T) {
-	g := newDynamicPeerTestGateway(t)
-	startDynamicPeerTestWGServer(t, g)
+	g := newEnrollmentTestGateway(t)
+	startEnrollmentTestWGServer(t, g)
 	// Drop the token table so mintAndPersistPeerAPIToken fails after AddPeer
 	// has already provisioned the peer.
 	if _, err := g.db.Exec("DROP TABLE peer_api_tokens"); err != nil {
@@ -239,18 +239,18 @@ func TestRegisterEnrolledPeerRollbackOnPersistFailure(t *testing.T) {
 // not advanced within peer_ttl. We register a real peer, then backdate its
 // liveness tracker so the reaper sees no progress past the TTL.
 func TestReapStaleEnrolledPeers(t *testing.T) {
-	g := newDynamicPeerTestGateway(t)
-	g.cfg.Store(enabledDynamicPeersCfg()) // reaper reads peer_ttl from the live cfg
-	startDynamicPeerTestWGServer(t, g)
+	g := newEnrollmentTestGateway(t)
+	g.cfg.Store(enabledEnrollmentCfg()) // reaper reads peer_ttl from the live cfg
+	startEnrollmentTestWGServer(t, g)
 	resp, err := registerFor(t, g, "kubernetes:agents:uid-1", "kubernetes:agents:agent-1", keyA)
 	if err != nil {
 		t.Fatalf("register: %v", err)
 	}
 	// Backdate progress well beyond the default 3m TTL with a high lastRx so
 	// no real keepalive could have advanced past it during the test.
-	g.dynamicPeerMu.Lock()
+	g.enrollmentMu.Lock()
 	g.enrollLive[keyA] = enrollmentLiveness{lastRx: 1 << 40, lastProgress: time.Now().Add(-time.Hour)}
-	g.dynamicPeerMu.Unlock()
+	g.enrollmentMu.Unlock()
 
 	g.reapStaleEnrolledPeers(context.Background())
 
@@ -266,7 +266,7 @@ func TestReapStaleEnrolledPeers(t *testing.T) {
 }
 
 func TestReconcileEnrolledPeersRestoresRuntimeState(t *testing.T) {
-	g := newDynamicPeerTestGateway(t)
+	g := newEnrollmentTestGateway(t)
 	const ip = "10.55.0.22"
 	seedEnrolledPeer(t, g, ip, keyA, "kubernetes:agents:uid-1", "kubernetes:agents:agent-1")
 
@@ -299,29 +299,29 @@ func TestReconcileEnrolledPeersRestoresRuntimeState(t *testing.T) {
 	if !found {
 		t.Fatal("reconcile should seed agent registry")
 	}
-	g.dynamicPeerMu.Lock()
+	g.enrollmentMu.Lock()
 	_, tracked := g.enrollLive[keyA]
-	g.dynamicPeerMu.Unlock()
+	g.enrollmentMu.Unlock()
 	if !tracked {
 		t.Fatal("reconcile should seed liveness tracking")
 	}
 }
 
-func TestApiDynamicPeerList(t *testing.T) {
-	g := newDynamicPeerTestGateway(t)
+func TestApiEnrollmentList(t *testing.T) {
+	g := newEnrollmentTestGateway(t)
 	w := &webMux{g: g}
 
 	seedEnrolledPeer(t, g, "10.55.0.2", keyA, "kubernetes:agents:uid-1", "kubernetes:agents:agent-1")
 	seedEnrolledPeer(t, g, "10.55.0.3", keyB, "kubernetes:agents:uid-2", "kubernetes:agents:agent-2")
 
 	postRec := httptest.NewRecorder()
-	w.apiDynamicPeerList(postRec, httptest.NewRequest(http.MethodPost, "/api/dynamic-peers", nil))
+	w.apiEnrollmentList(postRec, httptest.NewRequest(http.MethodPost, "/api/enrollment/peers", nil))
 	if postRec.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("POST -> %d, want 405", postRec.Code)
 	}
 
 	rec := httptest.NewRecorder()
-	w.apiDynamicPeerList(rec, httptest.NewRequest(http.MethodGet, "/api/dynamic-peers", nil))
+	w.apiEnrollmentList(rec, httptest.NewRequest(http.MethodGet, "/api/enrollment/peers", nil))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("GET -> %d, want 200", rec.Code)
 	}
@@ -340,21 +340,21 @@ func TestApiDynamicPeerList(t *testing.T) {
 	if one.Profile != "default" || one.PublicKey != keyA {
 		t.Fatalf("unexpected view %+v", one)
 	}
-	if one.DisplayName != "agents/x" || one.AuthorizerType != dynamicPeerAuthorizerKubernetesTokenRev {
+	if one.DisplayName != "agents/x" || one.AuthorizerType != enrollmentAuthorizerKubernetesTokenRev {
 		t.Fatalf("unexpected metadata %+v", one)
 	}
-	if one.CreatedAt == "" || one.Transport != dynamicPeerTransportWireGuard {
+	if one.CreatedAt == "" || one.Transport != enrollmentTransportWireGuard {
 		t.Fatalf("missing fields %+v", one)
 	}
 }
 
-func enabledDynamicPeersCfg() *config.Gateway {
+func enabledEnrollmentCfg() *config.Gateway {
 	return &config.Gateway{Settings: &config.GatewaySettings{
 		PublicURL: "https://gateway.example.com",
 		WireGuard: &config.WireGuardBlock{SubnetCIDR: "10.55.0.0/24"},
 		Enrollment: &config.EnrollmentBlock{
 			Authorizers: []config.EnrollmentAuthorizerBlock{{
-				Type:         dynamicPeerAuthorizerKubernetesTokenRev,
+				Type:         enrollmentAuthorizerKubernetesTokenRev,
 				Name:         "agents",
 				Audience:     "clawpatrol",
 				ProfileLabel: "clawpatrol.dev/profile",
@@ -369,22 +369,22 @@ func enabledDynamicPeersCfg() *config.Gateway {
 }
 
 func doRegister(w *webMux, method, bearer, body string) *httptest.ResponseRecorder {
-	req := httptest.NewRequest(method, dynamicPeerRegisterPath, strings.NewReader(body))
+	req := httptest.NewRequest(method, enrollmentRegisterPath, strings.NewReader(body))
 	if bearer != "" {
 		req.Header.Set("Authorization", "Bearer "+bearer)
 	}
 	rec := httptest.NewRecorder()
-	w.apiDynamicPeerRegister(rec, req)
+	w.apiEnrollmentRegister(rec, req)
 	return rec
 }
 
-func TestApiDynamicPeerRegisterGuards(t *testing.T) {
-	g := newDynamicPeerTestGateway(t)
-	g.cfg.Store(enabledDynamicPeersCfg())
+func TestApiEnrollmentRegisterGuards(t *testing.T) {
+	g := newEnrollmentTestGateway(t)
+	g.cfg.Store(enabledEnrollmentCfg())
 	g.policy.Store(&config.CompiledPolicy{Profiles: map[string]*config.CompiledProfile{"default": {}}})
 	// Verifier resolves any token to a pod in the "ghost" profile, which is
 	// not declared in the policy above.
-	g.k8sVerifier = fakeK8sVerifier(func(_ context.Context, _ string, claims k8sDynamicPeerClaims, _ *config.EnrollmentAuthorizerBlock) (k8sVerifiedPod, error) {
+	g.k8sVerifier = fakeK8sVerifier(func(_ context.Context, _ string, claims k8sEnrollmentClaims, _ *config.EnrollmentAuthorizerBlock) (k8sVerifiedPod, error) {
 		return k8sVerifiedPod{
 			Namespace:      claims.PodNamespace,
 			Name:           claims.PodName,
@@ -428,9 +428,9 @@ func TestApiDynamicPeerRegisterGuards(t *testing.T) {
 
 // A regular onboarded peer carrying a peer API token must not be able to
 // drive the enrollment delete teardown when it holds no enrollment.
-func TestApiDynamicPeerDeleteRequiresEnrollment(t *testing.T) {
-	g := newDynamicPeerTestGateway(t)
-	g.cfg.Store(enabledDynamicPeersCfg())
+func TestApiEnrollmentDeleteRequiresEnrollment(t *testing.T) {
+	g := newEnrollmentTestGateway(t)
+	g.cfg.Store(enabledEnrollmentCfg())
 	w := &webMux{g: g}
 
 	const ip = "10.55.0.50"
@@ -441,10 +441,10 @@ func TestApiDynamicPeerDeleteRequiresEnrollment(t *testing.T) {
 		t.Fatalf("mint: %v", err)
 	}
 
-	req := httptest.NewRequest(http.MethodDelete, dynamicPeerRegisterPath, nil)
+	req := httptest.NewRequest(http.MethodDelete, enrollmentRegisterPath, nil)
 	req.Header.Set("Authorization", "Bearer "+token)
 	rec := httptest.NewRecorder()
-	w.apiDynamicPeerRegister(rec, req)
+	w.apiEnrollmentRegister(rec, req)
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("delete without enrollment -> %d, want 404", rec.Code)
 	}
@@ -456,10 +456,10 @@ func TestApiDynamicPeerDeleteRequiresEnrollment(t *testing.T) {
 	}
 }
 
-func TestApiDynamicPeerDeleteWithEnrollment(t *testing.T) {
-	g := newDynamicPeerTestGateway(t)
-	g.cfg.Store(enabledDynamicPeersCfg())
-	startDynamicPeerTestWGServer(t, g)
+func TestApiEnrollmentDeleteWithEnrollment(t *testing.T) {
+	g := newEnrollmentTestGateway(t)
+	g.cfg.Store(enabledEnrollmentCfg())
+	startEnrollmentTestWGServer(t, g)
 	w := &webMux{g: g}
 
 	resp, err := registerFor(t, g, "kubernetes:agents:uid-1", "kubernetes:agents:agent-1", keyA)
@@ -467,10 +467,10 @@ func TestApiDynamicPeerDeleteWithEnrollment(t *testing.T) {
 		t.Fatalf("register: %v", err)
 	}
 
-	req := httptest.NewRequest(http.MethodDelete, dynamicPeerRegisterPath, nil)
+	req := httptest.NewRequest(http.MethodDelete, enrollmentRegisterPath, nil)
 	req.Header.Set("Authorization", "Bearer "+resp.APIToken)
 	rec := httptest.NewRecorder()
-	w.apiDynamicPeerRegister(rec, req)
+	w.apiEnrollmentRegister(rec, req)
 	if rec.Code != http.StatusNoContent {
 		t.Fatalf("delete with enrollment -> %d, want 204", rec.Code)
 	}

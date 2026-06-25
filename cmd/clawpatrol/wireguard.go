@@ -906,7 +906,7 @@ func (w *wireguardOnboarder) iface() string {
 }
 
 // allocateIP grabs the next free IP from WGSubnetCIDR. It delegates to
-// the shared allocator so dashboard onboarding and dynamic-peer
+// the shared allocator so dashboard onboarding and enrollment
 // registration serialize on one lock and can't hand out the same /32
 // concurrently. The allocation set is derived from wg_peers (one row per
 // active peer); a fresh DB = a fresh subnet. AddPeer commits the

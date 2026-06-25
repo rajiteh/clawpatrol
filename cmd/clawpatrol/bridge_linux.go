@@ -28,10 +28,10 @@ import (
 // userspace WireGuard tunnel, routes the whole network namespace through the
 // gateway, writes the CA + env handoff for the sibling workload container,
 // and deregisters on SIGTERM. The enroll / deregister / claims logic is the
-// transport-agnostic enrollment client core (dynamic_peer_client.go);
+// transport-agnostic enrollment client core (enrollment_client.go);
 // everything here is the TUN-specific bring-up.
 func bridgeRun(ctx context.Context, opt bridgeOptions) error {
-	claims, credential, err := gatherDynamicPeerClaims(opt.AuthorizerType, opt.KubeTokenPath)
+	claims, credential, err := gatherEnrollmentClaims(opt.AuthorizerType, opt.KubeTokenPath)
 	if err != nil {
 		return err
 	}
@@ -49,8 +49,8 @@ func bridgeRun(ctx context.Context, opt bridgeOptions) error {
 	// route. We pin/replace v6 only in that case, so we never create a v6
 	// default that would blackhole traffic that previously had no route.
 	route6, have6 := defaultRoute6()
-	registerResp, err := dynamicPeerRegister(ctx, opt.GatewayURL, credential, dynamicPeerRegisterRequest{
-		Transport:          dynamicPeerTransportWireGuard,
+	registerResp, err := enrollmentRegister(ctx, opt.GatewayURL, credential, enrollmentRegisterRequest{
+		Transport:          enrollmentTransportWireGuard,
 		Authorizer:         opt.AuthorizerName,
 		WireGuardPublicKey: clientPubB64,
 		Claims:             claims,
@@ -68,7 +68,7 @@ func bridgeRun(ctx context.Context, opt bridgeOptions) error {
 	}
 	// Fail fast rather than silently skip pinning the API host routes —
 	// consistent with the fatal pin stance below; an unpinned API after the
-	// default-route swap would blackhole heartbeats.
+	// default-route swap would blackhole the env-pushdown + deregister calls.
 	apiIPs, err := lookupHostIPs(apiURL.Hostname())
 	if err != nil {
 		return fmt.Errorf("resolve gateway api host %q: %w", apiURL.Hostname(), err)
@@ -79,7 +79,7 @@ func bridgeRun(ctx context.Context, opt bridgeOptions) error {
 	}
 	// Keep the gateway API + WG endpoint reachable on the original path once
 	// the default route flips to the tunnel. A missed pin blackholes the
-	// handshake / heartbeat, so a pin failure is fatal. v6 addresses are
+	// handshake / API calls, so a pin failure is fatal. v6 addresses are
 	// pinned only when a v6 default route exists (the family we'll replace);
 	// otherwise they keep their existing routing.
 	for _, ip := range append(apiIPs, endpointIP) {
@@ -148,7 +148,7 @@ func bridgeRun(ctx context.Context, opt bridgeOptions) error {
 		})
 	}()
 
-	envVars, err := dynamicPeerFetchEnv(ctx, opt.GatewayURL, registerResp.APIToken)
+	envVars, err := enrollmentFetchEnv(ctx, opt.GatewayURL, registerResp.APIToken)
 	if err != nil {
 		return err
 	}
@@ -167,7 +167,7 @@ func bridgeRun(ctx context.Context, opt bridgeOptions) error {
 	// pod termination past the grace period (the gateway still reaps us).
 	delCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	dynamicPeerDeregister(delCtx, opt.GatewayURL, registerResp.APIToken)
+	enrollmentDeregister(delCtx, opt.GatewayURL, registerResp.APIToken)
 	return nil
 }
 

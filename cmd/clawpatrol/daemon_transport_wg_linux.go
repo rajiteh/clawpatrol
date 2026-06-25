@@ -109,7 +109,7 @@ func (t *wgTransport) Close() error {
 // startWGTransport reads the user wg.conf written by `clawpatrol join`
 // and brings up the transport. The device bring-up itself lives in
 // newWGTransportFromConf so it can also be driven from an in-memory
-// runConf (e.g. a dynamic-peer registration result) without a wg.conf
+// runConf (e.g. a enrollment registration result) without a wg.conf
 // on disk.
 func startWGTransport() (daemonTransport, error) {
 	confPath := defaultRunConf()
@@ -123,7 +123,7 @@ func startWGTransport() (daemonTransport, error) {
 // newWGTransportFromConf brings up a wireguard-go device + gVisor stack
 // from a parsed runConf and waits for the first handshake so the first
 // user flow doesn't race the initial wg negotiation. The config source
-// (persisted wg.conf vs runtime dynamic-peer registration) is the
+// (persisted wg.conf vs runtime enrollment registration) is the
 // caller's concern.
 func newWGTransportFromConf(cfg *runConf) (daemonTransport, error) {
 	addrs := splitWGAddresses(cfg.Address)

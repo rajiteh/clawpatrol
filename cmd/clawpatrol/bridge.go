@@ -64,7 +64,7 @@ func runBridge(args []string) {
 	fs.StringVar(&opt.CAOut, "ca-out", "/clawpatrol/ca.crt", "path to write the gateway CA bundle")
 	fs.StringVar(&opt.ReadyFile, "ready-file", "/clawpatrol/ready", "path to touch after network and env setup succeed")
 	fs.StringVar(&opt.Iface, "iface", "clawpatrol0", "TUN interface name")
-	fs.IntVar(&opt.MTU, "mtu", dynamicPeerDefaultMTU, "TUN MTU")
+	fs.IntVar(&opt.MTU, "mtu", enrollmentDefaultMTU, "TUN MTU")
 	_ = fs.Parse(args)
 
 	if len(fs.Args()) > 0 {
@@ -116,8 +116,8 @@ func parseBridgeAuthorizer(s string) (typ, name string, err error) {
 	if !ok || typ == "" || name == "" {
 		return "", "", fmt.Errorf("--authorizer %q must be <type>/<name>, e.g. kubernetes_token_review/agents", s)
 	}
-	if typ != dynamicPeerAuthorizerKubernetesTokenRev {
-		return "", "", fmt.Errorf("unsupported authorizer type %q (supported: %s)", typ, dynamicPeerAuthorizerKubernetesTokenRev)
+	if typ != enrollmentAuthorizerKubernetesTokenRev {
+		return "", "", fmt.Errorf("unsupported authorizer type %q (supported: %s)", typ, enrollmentAuthorizerKubernetesTokenRev)
 	}
 	return typ, name, nil
 }

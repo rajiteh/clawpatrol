@@ -6,7 +6,7 @@ unit for the WG interface, no `/etc/hosts` pinning on clients. The
 clawpatrol binary IS the WG endpoint and the L3 forwarder.
 
 For Kubernetes deployments where the gateway and stateless agent pods
-run in-cluster, see [Kubernetes WireGuard dynamic peer pods](kubernetes-wireguard.md).
+run in-cluster, see [Kubernetes WireGuard agent pods](kubernetes-wireguard.md).
 
 ## How it works
 

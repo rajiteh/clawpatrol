@@ -29,21 +29,21 @@ import (
 )
 
 const (
-	dynamicPeerRegisterPath                 = "/api/dynamic-peers/register"
-	dynamicPeerTransportWireGuard           = "wireguard"
-	dynamicPeerAuthorizerKubernetesTokenRev = "kubernetes_token_review"
-	dynamicPeerDefaultMTU                   = 1420
-	enrollmentReaperInterval                = 20 * time.Second
+	enrollmentRegisterPath                 = "/api/enrollment/register"
+	enrollmentTransportWireGuard           = "wireguard"
+	enrollmentAuthorizerKubernetesTokenRev = "kubernetes_token_review"
+	enrollmentDefaultMTU                   = 1420
+	enrollmentReaperInterval               = 20 * time.Second
 )
 
-type dynamicPeerRegisterRequest struct {
+type enrollmentRegisterRequest struct {
 	Transport          string          `json:"transport"`
 	Authorizer         string          `json:"authorizer"`
 	WireGuardPublicKey string          `json:"wireguard_public_key,omitempty"`
 	Claims             json.RawMessage `json:"claims,omitempty"`
 }
 
-type dynamicPeerRegisterResponse struct {
+type enrollmentRegisterResponse struct {
 	Transport       string   `json:"transport"`
 	PeerIP          string   `json:"peer_ip"`
 	PeerIPv6        string   `json:"peer_ipv6"`
@@ -55,10 +55,10 @@ type dynamicPeerRegisterResponse struct {
 	CAPEM           string   `json:"ca_pem,omitempty"`
 }
 
-// dynamicPeerIdentity is the normalized identity an authorizer returns
+// enrollmentIdentity is the normalized identity an authorizer returns
 // after verifying a workload. Profile is server-derived (e.g. from a Pod
 // label), never submitted by the client.
-type dynamicPeerIdentity struct {
+type enrollmentIdentity struct {
 	SubjectKey     string
 	ReplacementKey string
 	DisplayName    string
@@ -67,10 +67,10 @@ type dynamicPeerIdentity struct {
 	Metadata       map[string]string
 }
 
-type dynamicPeerAuthorizer interface {
+type enrollmentAuthorizer interface {
 	Type() string
 	Name() string
-	Authorize(ctx context.Context, token string, claims json.RawMessage) (dynamicPeerIdentity, error)
+	Authorize(ctx context.Context, token string, claims json.RawMessage) (enrollmentIdentity, error)
 }
 
 // enrolledPeer is the enrollment metadata stored alongside a WireGuard
@@ -114,15 +114,15 @@ type enrolledPeerView struct {
 	LastHandshake  string            `json:"last_handshake,omitempty"`
 }
 
-var errDynamicPeerConflict = errors.New("dynamic peer conflict")
+var errEnrollmentConflict = errors.New("enrollment conflict")
 
-func (w *webMux) apiDynamicPeerRegister(rw http.ResponseWriter, r *http.Request) {
+func (w *webMux) apiEnrollmentRegister(rw http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost && r.Method != http.MethodDelete {
 		http.Error(rw, "POST or DELETE", http.StatusMethodNotAllowed)
 		return
 	}
 	if r.Method == http.MethodDelete {
-		w.apiDynamicPeerDelete(rw, r)
+		w.apiEnrollmentDelete(rw, r)
 		return
 	}
 	cfg := w.g.cfg.Load()
@@ -135,12 +135,12 @@ func (w *webMux) apiDynamicPeerRegister(rw http.ResponseWriter, r *http.Request)
 		http.Error(rw, "missing bearer token", http.StatusUnauthorized)
 		return
 	}
-	var req dynamicPeerRegisterRequest
+	var req enrollmentRegisterRequest
 	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
 		http.Error(rw, "bad json", http.StatusBadRequest)
 		return
 	}
-	authorizer, err := w.g.dynamicPeerAuthorizerFor(cfg, req.Transport, req.Authorizer)
+	authorizer, err := w.g.enrollmentAuthorizerFor(cfg, req.Transport, req.Authorizer)
 	if err != nil {
 		http.Error(rw, err.Error(), http.StatusForbidden)
 		return
@@ -150,14 +150,14 @@ func (w *webMux) apiDynamicPeerRegister(rw http.ResponseWriter, r *http.Request)
 		http.Error(rw, err.Error(), http.StatusForbidden)
 		return
 	}
-	if err := w.g.dynamicPeerProfileExists(identity.Profile); err != nil {
+	if err := w.g.enrollmentProfileExists(identity.Profile); err != nil {
 		http.Error(rw, err.Error(), http.StatusForbidden)
 		return
 	}
 	resp, err := w.g.registerEnrolledPeer(r.Context(), cfg, authorizer, identity, req)
 	if err != nil {
 		status := http.StatusInternalServerError
-		if errors.Is(err, errDynamicPeerConflict) {
+		if errors.Is(err, errEnrollmentConflict) {
 			status = http.StatusConflict
 		}
 		http.Error(rw, err.Error(), status)
@@ -166,7 +166,7 @@ func (w *webMux) apiDynamicPeerRegister(rw http.ResponseWriter, r *http.Request)
 	writeJSON(rw, resp)
 }
 
-func (w *webMux) apiDynamicPeerDelete(rw http.ResponseWriter, r *http.Request) {
+func (w *webMux) apiEnrollmentDelete(rw http.ResponseWriter, r *http.Request) {
 	cfg := w.g.cfg.Load()
 	if cfg == nil || !cfg.IsEnrollmentEnabled() {
 		http.NotFound(rw, r)
@@ -178,8 +178,8 @@ func (w *webMux) apiDynamicPeerDelete(rw http.ResponseWriter, r *http.Request) {
 		http.Error(rw, "unknown or missing peer api token", http.StatusUnauthorized)
 		return
 	}
-	w.g.dynamicPeerMu.Lock()
-	defer w.g.dynamicPeerMu.Unlock()
+	w.g.enrollmentMu.Lock()
+	defer w.g.enrollmentMu.Unlock()
 	// Only a peer that actually holds an enrollment may drive this teardown.
 	// A regular onboarded device can also carry a peer API token; without
 	// this guard it could revoke its own WireGuard peer + forget its device
@@ -196,10 +196,10 @@ func (w *webMux) apiDynamicPeerDelete(rw http.ResponseWriter, r *http.Request) {
 	rw.WriteHeader(http.StatusNoContent)
 }
 
-// apiDynamicPeerList lists every enrolled peer for operator observability.
+// apiEnrollmentList lists every enrolled peer for operator observability.
 // Not gated on the feature flag — peers can still be draining after the
 // feature is turned off, and an empty list is a fine answer.
-func (w *webMux) apiDynamicPeerList(rw http.ResponseWriter, r *http.Request) {
+func (w *webMux) apiEnrollmentList(rw http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(rw, http.MethodGet, http.StatusMethodNotAllowed)
 		return
@@ -225,7 +225,7 @@ func (g *Gateway) listEnrolledPeerViews() ([]enrolledPeerView, error) {
 	for _, p := range peers {
 		v := enrolledPeerView{
 			PeerIP:         p.PeerIP,
-			Transport:      dynamicPeerTransportWireGuard,
+			Transport:      enrollmentTransportWireGuard,
 			AuthorizerType: p.AuthorizerType,
 			AuthorizerName: p.AuthorizerName,
 			SubjectKey:     p.SubjectKey,
@@ -246,12 +246,12 @@ func (g *Gateway) listEnrolledPeerViews() ([]enrolledPeerView, error) {
 	return views, nil
 }
 
-func (g *Gateway) dynamicPeerAuthorizerFor(cfg *config.Gateway, transport, name string) (dynamicPeerAuthorizer, error) {
-	if strings.TrimSpace(transport) != dynamicPeerTransportWireGuard {
-		return nil, fmt.Errorf("unsupported dynamic peer transport %q", transport)
+func (g *Gateway) enrollmentAuthorizerFor(cfg *config.Gateway, transport, name string) (enrollmentAuthorizer, error) {
+	if strings.TrimSpace(transport) != enrollmentTransportWireGuard {
+		return nil, fmt.Errorf("unsupported enrollment transport %q", transport)
 	}
 	if strings.TrimSpace(name) == "" {
-		return nil, fmt.Errorf("dynamic peer authorizer is required")
+		return nil, fmt.Errorf("enrollment authorizer is required")
 	}
 	if cfg == nil || !cfg.IsEnrollmentEnabled() {
 		return nil, fmt.Errorf("enrollment is not enabled")
@@ -262,22 +262,22 @@ func (g *Gateway) dynamicPeerAuthorizerFor(cfg *config.Gateway, transport, name 
 			continue
 		}
 		switch a.Type {
-		case dynamicPeerAuthorizerKubernetesTokenRev:
+		case enrollmentAuthorizerKubernetesTokenRev:
 			return &kubernetesTokenReviewAuthorizer{
 				name:     a.Name,
 				cfg:      a,
 				verifier: g.k8sVerifier,
 			}, nil
 		default:
-			return nil, fmt.Errorf("unsupported dynamic peer authorizer type %q", a.Type)
+			return nil, fmt.Errorf("unsupported enrollment authorizer type %q", a.Type)
 		}
 	}
-	return nil, fmt.Errorf("dynamic peer authorizer %q is not configured", name)
+	return nil, fmt.Errorf("enrollment authorizer %q is not configured", name)
 }
 
-func (g *Gateway) dynamicPeerProfileExists(profile string) error {
+func (g *Gateway) enrollmentProfileExists(profile string) error {
 	if profile == "" {
-		return fmt.Errorf("dynamic peer profile is empty")
+		return fmt.Errorf("enrollment profile is empty")
 	}
 	policy := g.Policy()
 	if policy == nil {
@@ -291,24 +291,24 @@ func (g *Gateway) dynamicPeerProfileExists(profile string) error {
 
 // registerEnrolledPeer provisions (or reuses) a WireGuard peer for a
 // verified identity and records the enrollment on its wg_peers row.
-func (g *Gateway) registerEnrolledPeer(ctx context.Context, cfg *config.Gateway, authorizer dynamicPeerAuthorizer, identity dynamicPeerIdentity, req dynamicPeerRegisterRequest) (dynamicPeerRegisterResponse, error) {
+func (g *Gateway) registerEnrolledPeer(ctx context.Context, cfg *config.Gateway, authorizer enrollmentAuthorizer, identity enrollmentIdentity, req enrollmentRegisterRequest) (enrollmentRegisterResponse, error) {
 	pubHex, err := normalizeWGPublicKey(req.WireGuardPublicKey)
 	if err != nil {
-		return dynamicPeerRegisterResponse{}, err
+		return enrollmentRegisterResponse{}, err
 	}
 	if identity.SubjectKey == "" || identity.ReplacementKey == "" || identity.Profile == "" {
-		return dynamicPeerRegisterResponse{}, fmt.Errorf("dynamic peer authorizer returned incomplete identity")
+		return enrollmentRegisterResponse{}, fmt.Errorf("enrollment authorizer returned incomplete identity")
 	}
 	if globalWG == nil {
-		return dynamicPeerRegisterResponse{}, fmt.Errorf("wireguard server not started")
+		return enrollmentRegisterResponse{}, fmt.Errorf("wireguard server not started")
 	}
 
-	g.dynamicPeerMu.Lock()
-	defer g.dynamicPeerMu.Unlock()
+	g.enrollmentMu.Lock()
+	defer g.enrollmentMu.Unlock()
 
 	existing, err := g.findEnrolledPeers(identity.ReplacementKey, pubHex)
 	if err != nil {
-		return dynamicPeerRegisterResponse{}, err
+		return enrollmentRegisterResponse{}, err
 	}
 	var reuseIP string
 	for _, p := range existing {
@@ -323,7 +323,7 @@ func (g *Gateway) registerEnrolledPeer(ctx context.Context, cfg *config.Gateway,
 			g.cleanupEnrolledPeerLocked(ctx, p.PeerIP)
 		case p.PubKeyHex == pubHex:
 			// A different subject is holding this public key.
-			return dynamicPeerRegisterResponse{}, fmt.Errorf("%w: wireguard public key is already registered to another enrolled peer", errDynamicPeerConflict)
+			return enrollmentRegisterResponse{}, fmt.Errorf("%w: wireguard public key is already registered to another enrolled peer", errEnrollmentConflict)
 		}
 	}
 
@@ -331,11 +331,11 @@ func (g *Gateway) registerEnrolledPeer(ctx context.Context, cfg *config.Gateway,
 	if peerIP == "" {
 		peerIP, err = allocateWGPeerIP(cfg.Join())
 		if err != nil {
-			return dynamicPeerRegisterResponse{}, err
+			return enrollmentRegisterResponse{}, err
 		}
 	}
 	if err := globalWG.AddPeer(pubHex, peerIP); err != nil {
-		return dynamicPeerRegisterResponse{}, fmt.Errorf("wg add peer: %w", err)
+		return enrollmentRegisterResponse{}, fmt.Errorf("wg add peer: %w", err)
 	}
 	// Roll back the transport peer + token on any failure before the
 	// enrollment row is committed.
@@ -350,14 +350,14 @@ func (g *Gateway) registerEnrolledPeer(ctx context.Context, cfg *config.Gateway,
 	deletePeerAPITokensForIP(g.db, peerIP)
 	apiToken, err := mintAndPersistPeerAPIToken(g.db, peerIP)
 	if err != nil {
-		return dynamicPeerRegisterResponse{}, err
+		return enrollmentRegisterResponse{}, err
 	}
 
 	metaJSON := "{}"
 	if len(identity.Metadata) > 0 {
 		meta, err := json.Marshal(identity.Metadata)
 		if err != nil {
-			return dynamicPeerRegisterResponse{}, err
+			return enrollmentRegisterResponse{}, err
 		}
 		metaJSON = string(meta)
 	}
@@ -373,7 +373,7 @@ func (g *Gateway) registerEnrolledPeer(ctx context.Context, cfg *config.Gateway,
 		AuthorizerName: authorizer.Name(),
 		MetadataJSON:   metaJSON,
 	}); err != nil {
-		return dynamicPeerRegisterResponse{}, err
+		return enrollmentRegisterResponse{}, err
 	}
 	committed = true
 	g.noteEnrolledLiveLocked(pubHex)
@@ -388,24 +388,24 @@ func (g *Gateway) registerEnrolledPeer(ctx context.Context, cfg *config.Gateway,
 
 	serverPubHex, err := globalWG.PublicKey()
 	if err != nil {
-		return dynamicPeerRegisterResponse{}, fmt.Errorf("wg server pub: %w", err)
+		return enrollmentRegisterResponse{}, fmt.Errorf("wg server pub: %w", err)
 	}
 	serverPubB64, err := hexToB64(serverPubHex)
 	if err != nil {
-		return dynamicPeerRegisterResponse{}, err
+		return enrollmentRegisterResponse{}, err
 	}
 	endpoint, err := wgClientEndpoint(cfg.Join().WGEndpoint, cfg.PublicURL(), cfg.Join().WGListenPort)
 	if err != nil {
-		return dynamicPeerRegisterResponse{}, err
+		return enrollmentRegisterResponse{}, err
 	}
-	resp := dynamicPeerRegisterResponse{
-		Transport:       dynamicPeerTransportWireGuard,
+	resp := enrollmentRegisterResponse{
+		Transport:       enrollmentTransportWireGuard,
 		PeerIP:          peerIP,
 		PeerIPv6:        wg6FromV4(netip.MustParseAddr(peerIP)).String(),
 		ServerPublicKey: serverPubB64,
 		Endpoint:        endpoint,
 		AllowedIPs:      []string{"0.0.0.0/0", "::/0"},
-		MTU:             dynamicPeerDefaultMTU,
+		MTU:             enrollmentDefaultMTU,
 		APIToken:        apiToken,
 	}
 	if g.certs != nil {
@@ -496,7 +496,7 @@ func markEnrolledPeer(db *sql.DB, p enrolledPeer) error {
 
 // cleanupEnrolledPeerLocked revokes the WireGuard peer (which also deletes
 // its wg_peers row, clearing the enrollment), its API tokens, and its
-// device/agent registry entries. Caller holds dynamicPeerMu.
+// device/agent registry entries. Caller holds enrollmentMu.
 func (g *Gateway) cleanupEnrolledPeerLocked(_ context.Context, peerIP string) {
 	if peerIP == "" {
 		return
@@ -555,8 +555,8 @@ func (g *Gateway) reapStaleEnrolledPeers(_ context.Context) {
 	}
 	stats := globalWG.PeerStats()
 
-	g.dynamicPeerMu.Lock()
-	defer g.dynamicPeerMu.Unlock()
+	g.enrollmentMu.Lock()
+	defer g.enrollmentMu.Unlock()
 	peers, err := g.listEnrolledPeers()
 	if err != nil {
 		return
@@ -614,8 +614,8 @@ func (g *Gateway) reconcileEnrolledPeers(_ context.Context) (int, error) {
 	if len(peers) == 0 {
 		return 0, nil
 	}
-	g.dynamicPeerMu.Lock()
-	defer g.dynamicPeerMu.Unlock()
+	g.enrollmentMu.Lock()
+	defer g.enrollmentMu.Unlock()
 	if g.enrollLive == nil {
 		g.enrollLive = map[string]enrollmentLiveness{}
 	}
@@ -719,7 +719,7 @@ func normalizeWGPublicKey(s string) (string, error) {
 
 // --- kubernetes_token_review authorizer --------------------------------
 
-type k8sDynamicPeerClaims struct {
+type k8sEnrollmentClaims struct {
 	PodName      string `json:"pod_name"`
 	PodNamespace string `json:"pod_namespace"`
 	PodUID       string `json:"pod_uid"`
@@ -736,7 +736,7 @@ type k8sVerifiedPod struct {
 }
 
 type k8sRegistrationVerifier interface {
-	VerifyPod(ctx context.Context, token string, claims k8sDynamicPeerClaims, cfg *config.EnrollmentAuthorizerBlock) (k8sVerifiedPod, error)
+	VerifyPod(ctx context.Context, token string, claims k8sEnrollmentClaims, cfg *config.EnrollmentAuthorizerBlock) (k8sVerifiedPod, error)
 }
 
 type kubernetesTokenReviewAuthorizer struct {
@@ -746,36 +746,36 @@ type kubernetesTokenReviewAuthorizer struct {
 }
 
 func (a *kubernetesTokenReviewAuthorizer) Type() string {
-	return dynamicPeerAuthorizerKubernetesTokenRev
+	return enrollmentAuthorizerKubernetesTokenRev
 }
 func (a *kubernetesTokenReviewAuthorizer) Name() string { return a.name }
 
-func (a *kubernetesTokenReviewAuthorizer) Authorize(ctx context.Context, token string, claims json.RawMessage) (dynamicPeerIdentity, error) {
-	var parsed k8sDynamicPeerClaims
+func (a *kubernetesTokenReviewAuthorizer) Authorize(ctx context.Context, token string, claims json.RawMessage) (enrollmentIdentity, error) {
+	var parsed k8sEnrollmentClaims
 	if len(claims) == 0 {
-		return dynamicPeerIdentity{}, fmt.Errorf("claims are required")
+		return enrollmentIdentity{}, fmt.Errorf("claims are required")
 	}
 	if err := json.Unmarshal(claims, &parsed); err != nil {
-		return dynamicPeerIdentity{}, fmt.Errorf("claims decode: %w", err)
+		return enrollmentIdentity{}, fmt.Errorf("claims decode: %w", err)
 	}
 	if parsed.PodName == "" || parsed.PodNamespace == "" || parsed.PodUID == "" {
-		return dynamicPeerIdentity{}, fmt.Errorf("pod_name, pod_namespace, and pod_uid are required")
+		return enrollmentIdentity{}, fmt.Errorf("pod_name, pod_namespace, and pod_uid are required")
 	}
 	verifier := a.verifier
 	if verifier == nil {
 		v, err := newInClusterK8sClient()
 		if err != nil {
-			return dynamicPeerIdentity{}, err
+			return enrollmentIdentity{}, err
 		}
 		verifier = v
 	}
 	pod, err := verifier.VerifyPod(ctx, token, parsed, a.cfg)
 	if err != nil {
-		return dynamicPeerIdentity{}, err
+		return enrollmentIdentity{}, err
 	}
 	displayName := pod.Namespace + "/" + pod.Name
 	owner := "system:serviceaccount:" + pod.Namespace + ":" + pod.ServiceAccount
-	return dynamicPeerIdentity{
+	return enrollmentIdentity{
 		SubjectKey:     "kubernetes:" + pod.Namespace + ":" + pod.UID,
 		ReplacementKey: "kubernetes:" + pod.Namespace + ":" + pod.Name,
 		DisplayName:    displayName,
@@ -826,7 +826,7 @@ func newInClusterK8sClient() (*inClusterK8sClient, error) {
 	}, nil
 }
 
-func (c *inClusterK8sClient) VerifyPod(ctx context.Context, token string, claims k8sDynamicPeerClaims, cfg *config.EnrollmentAuthorizerBlock) (k8sVerifiedPod, error) {
+func (c *inClusterK8sClient) VerifyPod(ctx context.Context, token string, claims k8sEnrollmentClaims, cfg *config.EnrollmentAuthorizerBlock) (k8sVerifiedPod, error) {
 	user, err := c.tokenReview(ctx, token, cfg.Audience)
 	if err != nil {
 		return k8sVerifiedPod{}, err

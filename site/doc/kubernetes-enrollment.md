@@ -1,4 +1,4 @@
-# Kubernetes Dynamic Peers
+# Kubernetes Enrollment
 
 Claw Patrol can run inside Kubernetes with one long-lived gateway pod
 and stateless agent pods that appear only for the lifetime of a job.
@@ -87,7 +87,7 @@ submit its own profile.
 `peer_ttl` is the liveness window the gateway enforces (default `3m`).
 
 The complete standalone HCL example lives at
-[`examples/wireguard-dynamic-peers-kubernetes.hcl`](https://github.com/denoland/clawpatrol/blob/main/examples/wireguard-dynamic-peers-kubernetes.hcl).
+[`examples/wireguard-enrollment-kubernetes.hcl`](https://github.com/denoland/clawpatrol/blob/main/examples/wireguard-enrollment-kubernetes.hcl).
 
 ## Agent pod contract
 
@@ -171,7 +171,7 @@ On startup, the sidecar:
 
 1. generates a WireGuard private key locally,
 2. sends only the public key and Kubernetes pod claims to
-   `POST /api/dynamic-peers/register`,
+   `POST /api/enrollment/register`,
 3. receives WireGuard client config, CA PEM, and a peer API token,
 4. brings up the TUN device and routes pod traffic through it with
    persistent keepalive,
@@ -187,7 +187,7 @@ deregisters; either way the gateway revokes the transient WireGuard peer
 and clears its enrolled `wg_peers` row.
 
 Enrolled peers show up in the dashboard as regular devices — there is no
-separate dynamic-peers surface.
+separate enrollment surface.
 
 ## Local e2e
 

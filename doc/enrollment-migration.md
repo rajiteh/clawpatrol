@@ -123,11 +123,14 @@ container that reads the handoff files.
 1. Apply the new gateway config and restart the gateway pod. The DB
    migration runs on startup; existing onboarded devices are untouched.
 2. Update the agent pod spec (or its template / admission injector) to
-   the new args. New pods enroll through the same
-   `POST /api/dynamic-peers/register` endpoint.
+   the new args and the new image. The bridge sidecar enrolls
+   automatically; note the register endpoint moved from
+   `/api/dynamic-peers/register` to `/api/enrollment/register`, so the
+   gateway and the sidecar image must be upgraded together.
 3. Old agent pods running `run --tun` keep working against their
-   existing peer until they terminate; on the new gateway they are kept
-   alive by their keepalive traffic and reaped normally when they stop.
+   existing peer until they terminate (the WireGuard peer persists and
+   their keepalive traffic keeps it live); they will not re-enroll
+   against the new gateway, so roll them once the gateway is upgraded.
 
 ## What was removed
 

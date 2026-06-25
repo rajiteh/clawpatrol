@@ -50,15 +50,15 @@ func TestK8sServiceAccountAndAllowlist(t *testing.T) {
 	}
 }
 
-type fakeK8sVerifier func(context.Context, string, k8sDynamicPeerClaims, *config.EnrollmentAuthorizerBlock) (k8sVerifiedPod, error)
+type fakeK8sVerifier func(context.Context, string, k8sEnrollmentClaims, *config.EnrollmentAuthorizerBlock) (k8sVerifiedPod, error)
 
-func (f fakeK8sVerifier) VerifyPod(ctx context.Context, token string, claims k8sDynamicPeerClaims, cfg *config.EnrollmentAuthorizerBlock) (k8sVerifiedPod, error) {
+func (f fakeK8sVerifier) VerifyPod(ctx context.Context, token string, claims k8sEnrollmentClaims, cfg *config.EnrollmentAuthorizerBlock) (k8sVerifiedPod, error) {
 	return f(ctx, token, claims, cfg)
 }
 
 func TestKubernetesTokenReviewAuthorizerIdentity(t *testing.T) {
 	cfg := &config.EnrollmentAuthorizerBlock{Name: "agents"}
-	claims, err := json.Marshal(k8sDynamicPeerClaims{
+	claims, err := json.Marshal(k8sEnrollmentClaims{
 		PodName:      "agent-1",
 		PodNamespace: "agents",
 		PodUID:       "uid-1",
@@ -70,7 +70,7 @@ func TestKubernetesTokenReviewAuthorizerIdentity(t *testing.T) {
 	auth := &kubernetesTokenReviewAuthorizer{
 		name: "agents",
 		cfg:  cfg,
-		verifier: fakeK8sVerifier(func(_ context.Context, token string, got k8sDynamicPeerClaims, _ *config.EnrollmentAuthorizerBlock) (k8sVerifiedPod, error) {
+		verifier: fakeK8sVerifier(func(_ context.Context, token string, got k8sEnrollmentClaims, _ *config.EnrollmentAuthorizerBlock) (k8sVerifiedPod, error) {
 			if token != "pod-token" {
 				t.Fatalf("token = %q, want pod-token", token)
 			}
@@ -106,8 +106,8 @@ func TestKubernetesTokenReviewAuthorizerIdentity(t *testing.T) {
 // the WireGuard peer (and its wg_peers row), the API token, and the
 // device/agent registry entries.
 func TestCleanupEnrolledPeer(t *testing.T) {
-	g := newDynamicPeerTestGateway(t)
-	startDynamicPeerTestWGServer(t, g)
+	g := newEnrollmentTestGateway(t)
+	startEnrollmentTestWGServer(t, g)
 
 	resp, err := registerFor(t, g, "kubernetes:agents:uid-1", "kubernetes:agents:agent-1", keyA)
 	if err != nil {
@@ -117,9 +117,9 @@ func TestCleanupEnrolledPeer(t *testing.T) {
 		t.Fatalf("precondition: enrolled peer not present: %v", err)
 	}
 
-	g.dynamicPeerMu.Lock()
+	g.enrollmentMu.Lock()
 	g.cleanupEnrolledPeerLocked(context.Background(), resp.PeerIP)
-	g.dynamicPeerMu.Unlock()
+	g.enrollmentMu.Unlock()
 
 	if _, err := g.enrolledPeerByIP(resp.PeerIP); err == nil {
 		t.Fatal("enrolled peer still present after cleanup")

@@ -370,14 +370,14 @@ type Gateway struct {
 	blobs runtime.BlobStore
 	// pluginMgr supervises the external plugin subprocesses; the
 	// dashboard reads it for the Plugins page.
-	pluginMgr     *extplugin.Manager
-	oauth         *OAuthRegistry
-	agents        *AgentRegistry
-	hitl          *HITLRegistry
-	onboard       *onboardRegistry
-	dynamicPeerMu sync.Mutex
+	pluginMgr    *extplugin.Manager
+	oauth        *OAuthRegistry
+	agents       *AgentRegistry
+	hitl         *HITLRegistry
+	onboard      *onboardRegistry
+	enrollmentMu sync.Mutex
 	// enrollLive tracks per-peer WireGuard rx_bytes progress for the
-	// enrollment liveness reaper. Guarded by dynamicPeerMu.
+	// enrollment liveness reaper. Guarded by enrollmentMu.
 	enrollLive map[string]enrollmentLiveness
 	// k8sVerifier lets tests inject a fake Kubernetes verifier. In
 	// production it stays nil and each register request builds a

@@ -8,4 +8,4 @@ testing notes. The audience is people reading or changing the code.
 <https://clawpatrol.dev/docs/>.
 
 - [WireGuard mode](wireguard.md)
-- [Kubernetes WireGuard dynamic peer pods](kubernetes-wireguard.md)
+- [Kubernetes WireGuard agent pods](kubernetes-wireguard.md)

@@ -94,14 +94,14 @@ the same NAT shares the public v4, so pinning isn’t a standalone
 defence; it’s a blast-radius limiter for credentials that have
 already escaped.
 
-## Kubernetes dynamic peer pods
+## Kubernetes enrollment (agent pods)
 
-Kubernetes dynamic peers are a remote-mode variant for stateless
+Kubernetes enrollment is a remote-mode variant for stateless
 agent pods. The gateway and agents run in the same cluster, and each
 agent pod self-registers as a short-lived WireGuard peer using a
 projected ServiceAccount token. There is no durable join credential
 and no human approval step for each pod; authorization comes from
-Kubernetes TokenReview plus the gateway's dynamic-peer allowlist.
+Kubernetes TokenReview plus the gateway's enrollment allowlist.
 
 The pod has two different trust zones:
 
@@ -125,7 +125,7 @@ This is still a pod-level network boundary: the sidecar changes routes
 for the whole pod network namespace, so the agent's traffic goes
 through the tunnel once setup is complete. The security bar is that
 the execution container does not receive the Kubernetes token, routing
-capabilities, dynamic-peer API token, WireGuard private key, gateway
+capabilities, peer API token, WireGuard private key, gateway
 state, or upstream credentials. Management APIs remain protected by
 the same app-layer dashboard auth described below.
 

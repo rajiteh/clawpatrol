@@ -17,40 +17,40 @@ import (
 // the WireGuard device (rx_bytes), so keepalive traffic is the liveness
 // signal.
 
-func dynamicPeerRegister(ctx context.Context, gatewayURL, token string, reqBody dynamicPeerRegisterRequest) (dynamicPeerRegisterResponse, error) {
+func enrollmentRegister(ctx context.Context, gatewayURL, token string, reqBody enrollmentRegisterRequest) (enrollmentRegisterResponse, error) {
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(reqBody); err != nil {
-		return dynamicPeerRegisterResponse{}, err
+		return enrollmentRegisterResponse{}, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(gatewayURL, "/")+dynamicPeerRegisterPath, &buf)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(gatewayURL, "/")+enrollmentRegisterPath, &buf)
 	if err != nil {
-		return dynamicPeerRegisterResponse{}, err
+		return enrollmentRegisterResponse{}, err
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return dynamicPeerRegisterResponse{}, fmt.Errorf("register: %w", err)
+		return enrollmentRegisterResponse{}, fmt.Errorf("register: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return dynamicPeerRegisterResponse{}, fmt.Errorf("register status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return enrollmentRegisterResponse{}, fmt.Errorf("register status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
-	var out dynamicPeerRegisterResponse
+	var out enrollmentRegisterResponse
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&out); err != nil {
-		return dynamicPeerRegisterResponse{}, fmt.Errorf("register decode: %w", err)
+		return enrollmentRegisterResponse{}, fmt.Errorf("register decode: %w", err)
 	}
-	if out.Transport != dynamicPeerTransportWireGuard {
-		return dynamicPeerRegisterResponse{}, fmt.Errorf("register response has unsupported transport %q", out.Transport)
+	if out.Transport != enrollmentTransportWireGuard {
+		return enrollmentRegisterResponse{}, fmt.Errorf("register response has unsupported transport %q", out.Transport)
 	}
 	if out.PeerIP == "" || out.ServerPublicKey == "" || out.Endpoint == "" || out.APIToken == "" {
-		return dynamicPeerRegisterResponse{}, fmt.Errorf("register response missing peer_ip, server_public_key, endpoint, or api_token")
+		return enrollmentRegisterResponse{}, fmt.Errorf("register response missing peer_ip, server_public_key, endpoint, or api_token")
 	}
 	return out, nil
 }
 
-func dynamicPeerFetchEnv(ctx context.Context, gatewayURL, apiToken string) ([]pushdownEnvVar, error) {
+func enrollmentFetchEnv(ctx context.Context, gatewayURL, apiToken string) ([]pushdownEnvVar, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(gatewayURL, "/")+"/api/env-pushdown", nil)
 	if err != nil {
 		return nil, err
@@ -71,8 +71,8 @@ func dynamicPeerFetchEnv(ctx context.Context, gatewayURL, apiToken string) ([]pu
 	return parseEnvPushdownJSON(raw)
 }
 
-func dynamicPeerDeregister(ctx context.Context, gatewayURL, apiToken string) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, strings.TrimRight(gatewayURL, "/")+dynamicPeerRegisterPath, nil)
+func enrollmentDeregister(ctx context.Context, gatewayURL, apiToken string) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, strings.TrimRight(gatewayURL, "/")+enrollmentRegisterPath, nil)
 	if err != nil {
 		return
 	}
@@ -84,16 +84,16 @@ func dynamicPeerDeregister(ctx context.Context, gatewayURL, apiToken string) {
 	}
 }
 
-// gatherDynamicPeerClaims dispatches on the authorizer type — mirroring
+// gatherEnrollmentClaims dispatches on the authorizer type — mirroring
 // the gateway's `authorizer "<type>" "<name>"` block — to the matching
 // client claims provider. Returns the JSON claims plus the credential to
 // present on the wire. v1 ships one provider.
-func gatherDynamicPeerClaims(authorizerType, kubeTokenPath string) (json.RawMessage, string, error) {
+func gatherEnrollmentClaims(authorizerType, kubeTokenPath string) (json.RawMessage, string, error) {
 	switch authorizerType {
-	case dynamicPeerAuthorizerKubernetesTokenRev:
+	case enrollmentAuthorizerKubernetesTokenRev:
 		return kubernetesProviderClaims(kubeTokenPath)
 	default:
-		return nil, "", fmt.Errorf("unsupported dynamic peer authorizer type %q", authorizerType)
+		return nil, "", fmt.Errorf("unsupported enrollment authorizer type %q", authorizerType)
 	}
 }
 
@@ -112,7 +112,7 @@ func kubernetesProviderClaims(kubeTokenPath string) (json.RawMessage, string, er
 	if err != nil {
 		return nil, "", fmt.Errorf("read serviceaccount token: %w", err)
 	}
-	claims, err := json.Marshal(k8sDynamicPeerClaims{
+	claims, err := json.Marshal(k8sEnrollmentClaims{
 		PodName:      podName,
 		PodNamespace: podNamespace,
 		PodUID:       podUID,

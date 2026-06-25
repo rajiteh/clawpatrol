@@ -35,7 +35,7 @@ the configured server authorizer.
    audience is `clawpatrol`.
 2. The sidecar generates a WireGuard private key locally and sends only
    the public key plus Kubernetes pod claims to
-   `POST /api/dynamic-peers/register`.
+   `POST /api/enrollment/register`.
 3. The gateway selects the `wireguard` transport and the named
    `kubernetes_token_review` authorizer. The authorizer verifies the token
    with Kubernetes TokenReview, reads the live Pod object, resolves the pod
@@ -184,7 +184,7 @@ enrolled peer gets a full `peer_ttl` grace window before it is eligible for
 reaping.
 
 - On SIGTERM the sidecar best-effort deletes its registration with
-  `DELETE /api/dynamic-peers/register`, which revokes the WireGuard peer,
+  `DELETE /api/enrollment/register`, which revokes the WireGuard peer,
   drops the enrolled `wg_peers` row, and deletes its peer API tokens.
 - If the pod dies without cleanup, the reaper notices that the peer's
   `rx_bytes` has stopped advancing past `peer_ttl` and revokes it the same

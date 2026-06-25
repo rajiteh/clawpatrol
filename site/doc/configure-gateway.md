@@ -48,7 +48,7 @@ Both blocks can coexist — peers from either transport land in the
 same MITM handler. Drop either block to disable that transport.
 
 For same-cluster Kubernetes deployments with stateless agent pods, use
-[Kubernetes Dynamic Peers](/docs/kubernetes-dynamic-peers/). That mode
+[Kubernetes Enrollment](/docs/kubernetes-enrollment/). That mode
 lets each pod self-register as a short-lived WireGuard peer using
 Kubernetes TokenReview while the execution container remains restricted.
 
