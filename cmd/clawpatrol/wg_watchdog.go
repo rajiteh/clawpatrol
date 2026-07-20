@@ -30,6 +30,20 @@ import (
 	"golang.zx2c4.com/wireguard/device"
 )
 
+const (
+	// wgWatchdogPoll is how often the handshake-recovery watchdog samples
+	// the peer's last_handshake_time_sec + tx_bytes. The watchdog only
+	// acts once the handshake is older than wgWatchdogStuckTimeout, so a
+	// few seconds between polls is plenty and stays cheap.
+	wgWatchdogPoll = 5 * time.Second
+	// wgWatchdogStuckTimeout mirrors WireGuard's RejectAfterTime (180s):
+	// below this a stale last_handshake is normal because no rekey was due.
+	wgWatchdogStuckTimeout = 3 * time.Minute
+	// wgWatchdogResetCooldown holds off back-to-back rebuilds so a fresh
+	// initiation has time to complete before the watchdog fires again.
+	wgWatchdogResetCooldown = time.Minute
+)
+
 // wgPeerStats is the per-peer subset of IpcGet output we care about.
 type wgPeerStats struct {
 	lastHandshake time.Time

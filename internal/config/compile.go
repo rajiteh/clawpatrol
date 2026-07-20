@@ -52,6 +52,13 @@ type CompiledPolicy struct {
 	// pointers into the same Entity records, no copies.
 	Approvers   map[string]*Entity
 	Credentials map[string]*Entity
+
+	// Kubernetes enrollment policy is compiled separately from endpoint
+	// routing: it authorizes a new WireGuard peer into a profile, not a
+	// request to an endpoint. K8sEnrollmentsByName indexes by the
+	// enrollment block's <name> label (the runtime's authorizer name).
+	K8sEnrollments       []*CompiledK8sEnrollment
+	K8sEnrollmentsByName map[string]*CompiledK8sEnrollment
 }
 
 // CompiledProfile binds an identity to the endpoint set its requests
@@ -295,6 +302,8 @@ func Compile(gw *Gateway) (*CompiledPolicy, error) {
 		Tunnels:        map[string]*CompiledTunnel{},
 		Approvers:      p.Approvers,
 		Credentials:    p.Credentials,
+
+		K8sEnrollmentsByName: map[string]*CompiledK8sEnrollment{},
 	}
 
 	// Compile tunnels first so endpoint compilation can resolve
@@ -447,6 +456,10 @@ func Compile(gw *Gateway) (*CompiledPolicy, error) {
 		dedupePatterns(&profile.HostPatterns)
 		sortHostPatterns(profile.HostPatterns)
 		cp.Profiles[name] = profile
+	}
+
+	if err := compileK8sEnrollments(cp, p); err != nil {
+		return nil, err
 	}
 
 	return cp, nil

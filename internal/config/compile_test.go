@@ -114,6 +114,172 @@ func TestCompile(t *testing.T) {
 	}
 }
 
+func TestEnrollmentConfigValidation(t *testing.T) {
+	// Enrollment is a top-level block (sibling of profile/credential), not
+	// nested in gateway { ... }.
+	const enrollBlock = `enrollment "kubernetes_token_review" "agents" {
+  audience = "clawpatrol"
+
+  match {
+    namespace       = "agents"
+    service_account = "agent-runner"
+    profile_label   = "clawpatrol.dev/profile"
+    profiles        = ["default"]
+  }
+
+  liveness_timeout = "2m"
+  max_ttl          = "24h"
+}
+`
+	valid := `gateway {
+  state_dir = "/opt/clawpatrol"
+  wireguard {
+    subnet_cidr = "10.55.0.0/24"
+    endpoint = "clawpatrol-wg.clawpatrol.svc:51820"
+  }
+}
+
+` + enrollBlock + `
+profile "default" { credentials = [] }
+`
+	gw, diags := config.LoadBytes([]byte(valid), "k8s.hcl")
+	if diags.HasErrors() {
+		t.Fatalf("valid config diagnostics: %v", diags)
+	}
+	if !gw.IsEnrollmentEnabled() {
+		t.Fatal("enrollment should be enabled")
+	}
+	ent, ok := gw.Policy.Enrollments["agents"]
+	if !ok {
+		t.Fatalf("enrollment %q not loaded; have %v", "agents", gw.Policy.Enrollments)
+	}
+	if ent.Plugin.Type != "kubernetes_token_review" {
+		t.Fatalf("enrollment type = %q, want kubernetes_token_review", ent.Plugin.Type)
+	}
+	ke, ok := ent.Body.(*config.K8sEnrollment)
+	if !ok {
+		t.Fatalf("enrollment body = %T, want *config.K8sEnrollment", ent.Body)
+	}
+	if ke.LivenessTimeout != "2m" || ke.MaxTTL != "24h" {
+		t.Fatalf("liveness/max = %q/%q, want 2m/24h", ke.LivenessTimeout, ke.MaxTTL)
+	}
+	if len(ke.Matches) != 1 || ke.Matches[0].ProfileLabel != "clawpatrol.dev/profile" {
+		t.Fatalf("unexpected matches: %+v", ke.Matches)
+	}
+
+	// The compiled policy exposes the parsed, profile-resolved form.
+	cp, err := config.Compile(gw)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	enr := cp.K8sEnrollmentsByName["agents"]
+	if enr == nil {
+		t.Fatalf("compiled enrollment %q missing", "agents")
+	}
+	if enr.LivenessTimeout != 2*time.Minute || enr.MaxTTL != 24*time.Hour {
+		t.Fatalf("compiled liveness/max = %s/%s, want 2m/24h", enr.LivenessTimeout, enr.MaxTTL)
+	}
+
+	dump, err := gw.Dump()
+	if err != nil {
+		t.Fatalf("dump: %v", err)
+	}
+	if !strings.Contains(string(dump), `"enrollments"`) {
+		t.Fatalf("dump does not use enrollment shape:\n%s", dump)
+	}
+
+	// profile_label defaults to clawpatrol.dev/profile when omitted.
+	noLabel := strings.Replace(valid, `    profile_label   = "clawpatrol.dev/profile"`+"\n", "", 1)
+	gw2, diags := config.LoadBytes([]byte(noLabel), "k8s-nolabel.hcl")
+	if diags.HasErrors() {
+		t.Fatalf("no-label config diagnostics: %v", diags)
+	}
+	ke2 := gw2.Policy.Enrollments["agents"].Body.(*config.K8sEnrollment)
+	if ke2.Matches[0].ProfileLabel != config.K8sDefaultProfileLabel {
+		t.Fatalf("default profile_label = %q, want %q", ke2.Matches[0].ProfileLabel, config.K8sDefaultProfileLabel)
+	}
+
+	cases := []struct {
+		name string
+		body string
+		want string
+	}{
+		{
+			name: "missing audience",
+			body: strings.Replace(valid, `  audience = "clawpatrol"`+"\n", "", 1),
+			want: "Missing enrollment audience",
+		},
+		{
+			name: "bad liveness_timeout",
+			body: strings.Replace(valid, `liveness_timeout = "2m"`, `liveness_timeout = "-1s"`, 1),
+			want: "Invalid enrollment liveness_timeout",
+		},
+		{
+			name: "bad max_ttl",
+			body: strings.Replace(valid, `max_ttl          = "24h"`, `max_ttl          = "nope"`, 1),
+			want: "Invalid enrollment max_ttl",
+		},
+		{
+			name: "missing match",
+			body: strings.Replace(valid, `  match {
+    namespace       = "agents"
+    service_account = "agent-runner"
+    profile_label   = "clawpatrol.dev/profile"
+    profiles        = ["default"]
+  }
+`, "", 1),
+			want: "Missing enrollment match",
+		},
+		{
+			name: "match missing profiles",
+			body: strings.Replace(valid, `    profiles        = ["default"]`+"\n", "", 1),
+			want: "Invalid enrollment match",
+		},
+		{
+			name: "unknown profile",
+			body: strings.Replace(valid, `profiles        = ["default"]`, `profiles        = ["ghost"]`, 1),
+			want: "Unknown enrollment profile",
+		},
+		{
+			name: "no wireguard",
+			body: strings.Replace(valid, `  wireguard {
+    subnet_cidr = "10.55.0.0/24"
+    endpoint = "clawpatrol-wg.clawpatrol.svc:51820"
+  }
+`, "", 1),
+			want: "enrollment requires a wireguard block",
+		},
+		{
+			name: "duplicate enrollment",
+			body: strings.Replace(valid, enrollBlock, enrollBlock+enrollBlock, 1),
+			want: "Duplicate enrollment name",
+		},
+		{
+			name: "unsupported type",
+			body: strings.Replace(valid, `enrollment "kubernetes_token_review" "agents"`, `enrollment "oidc_jwt" "agents"`, 1),
+			want: "Unknown enrollment type",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, diags := config.LoadBytes([]byte(tc.body), tc.name+".hcl")
+			if !diags.HasErrors() {
+				t.Fatalf("expected diagnostics")
+			}
+			found := false
+			for _, d := range diags {
+				if strings.Contains(d.Summary, tc.want) || strings.Contains(d.Detail, tc.want) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				t.Fatalf("diagnostics = %v, want %q", diags, tc.want)
+			}
+		})
+	}
+}
+
 // TestCompileWildcardHosts verifies that wildcard hosts are accepted,
 // land in HostPatterns (not HostIndex), and that malformed wildcards
 // or within-endpoint duplicates are rejected at load time.

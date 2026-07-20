@@ -2,7 +2,7 @@
 
 A clawpatrol gateway config mixes **operational** settings in the
 required top-level `gateway { ... }` block with **policy** blocks.
-Policy blocks (`approver`, `credential`, `tunnel`, `endpoint`, `rule`)
+Policy blocks (`approver`, `credential`, `tunnel`, `endpoint`, `enrollment`, `rule`)
 dispatch to a plugin chosen by the block's first label.
 
 ## How to read this page
@@ -19,12 +19,12 @@ Each block section lists the attributes the loader accepts, with:
 - **Required** — `yes` if the loader rejects the block when the
   attribute is missing.
 
-Plugin-dispatched kinds (`approver`, `credential`, `tunnel`, `endpoint`, `rule`)
+Plugin-dispatched kinds (`approver`, `credential`, `tunnel`, `endpoint`, `enrollment`, `rule`)
 list one subsection per registered type.
 
 ## Top-level blocks
 
-Operational settings live under the required top-level `gateway { ... }` block. The optional `defaults { ... }` block carries policy fallbacks. Labeled policy blocks (`profile`, `approver`, `credential`, `endpoint`, `rule`, `tunnel`) are documented in their own sections.
+Operational settings live under the required top-level `gateway { ... }` block. The optional `defaults { ... }` block carries policy fallbacks. Labeled policy blocks (`profile`, `approver`, `credential`, `endpoint`, `enrollment`, `rule`, `tunnel`) are documented in their own sections.
 
 | Attribute | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -594,6 +594,42 @@ Family: `ssh`.
 endpoint "ssh" "example" {
   hosts = ["api.example.com"]
 }
+```
+
+## `enrollment` blocks
+
+Block syntax: `enrollment "<type>" "<name>" { ... }`
+
+Registered types: [`kubernetes_token_review`](#enrollment-kubernetestokenreview).
+
+### `enrollment "kubernetes_token_review" "<name>"`
+
+The body of an `enrollment
+"kubernetes_token_review" "<name>"` block. It authorizes Kubernetes
+workloads to self-enroll as transient WireGuard peers by verifying a
+projected ServiceAccount token with the Kubernetes TokenReview API.
+
+| Attribute | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `audience` | `string` | no | Passed to Kubernetes TokenReview and must match the projected ServiceAccount token's audience. Required. |
+| `match` | `block` | no | The repeated `match { ... }` rules. Each binds one namespace + service_account identity to a profile allowlist. At least one is required. |
+| `liveness_timeout` | `string` | no | The WireGuard-quiet grace window before an enrolled peer is reaped (time.ParseDuration). Optional; defaults to ~75s (3x the keepalive interval). Liveness is observed from the WG device (rx_bytes progress), not an app-level heartbeat. |
+| `max_ttl` | `string` | no | An optional hard lifetime for enrolled peers (time.ParseDuration). Parsed and stored; enforcement is future work. Validated as a positive duration when set. |
+
+**Nested block `match {}`:**
+
+One identity → profile-binding rule inside a
+kubernetes_token_review enrollment.
+
+| Attribute | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `namespace` | `string` | no | The pod must run in. Required. |
+| `service_account` | `string` | no | The pod's token must belong to. Required. |
+| `profile_label` | `string` | no | The Pod label the clawpatrol profile is read from. Optional; defaults to "clawpatrol.dev/profile". |
+| `profiles` | `[]string` | no | The allowlist of profiles a matched pod may bind. The value of the profile_label pod label must appear here. Required (at least one), and each must be a declared `profile "<name>"`. |
+
+```hcl
+enrollment "kubernetes_token_review" "example" {}
 ```
 
 ## `rule` blocks

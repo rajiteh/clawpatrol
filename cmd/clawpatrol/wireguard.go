@@ -625,6 +625,28 @@ func relayUDP(c net.Conn, dstIP string, dstPort uint16) {
 	<-done
 }
 
+// wgDevPeerStat is the per-peer liveness subset of the device's IpcGet
+// output: received bytes (advanced by persistent-keepalive traffic) and
+// the last handshake time (diagnostic only — it moves on rekey, not on
+// every keepalive). The enrollment reaper drives liveness off rx_bytes.
+type wgDevPeerStat struct {
+	rxBytes       uint64
+	lastHandshake time.Time
+}
+
+// PeerStats returns per-peer receive + handshake stats keyed by hex public
+// key, parsed from the device's UAPI dump. nil when the device is down.
+func (s *WGServer) PeerStats() map[string]wgDevPeerStat {
+	if s == nil || s.dev == nil {
+		return nil
+	}
+	uapi, err := s.dev.IpcGet()
+	if err != nil {
+		return nil
+	}
+	return parseAllPeerStats(uapi)
+}
+
 func (s *WGServer) loadPeers() map[string]string {
 	out := map[string]string{}
 	if s.db == nil {
@@ -764,7 +786,6 @@ func hexToB64(h string) (string, error) {
 
 type wireguardOnboarder struct {
 	ts JoinConfig
-	mu sync.Mutex
 }
 
 // wgClientEndpoint returns the host:port string clients should put in
@@ -884,38 +905,12 @@ func (w *wireguardOnboarder) iface() string {
 	return "clawpatrol"
 }
 
-// allocateIP grabs the next free IP from WGSubnetCIDR. The allocation
-// set is derived from wg_peers (one row per active peer); a fresh DB
-// = a fresh subnet. AddPeer commits the (pubkey, ip) row.
+// allocateIP grabs the next free IP from WGSubnetCIDR. It delegates to
+// the shared allocator so dashboard onboarding and enrollment
+// registration serialize on one lock and can't hand out the same /32
+// concurrently. The allocation set is derived from wg_peers (one row per
+// active peer); a fresh DB = a fresh subnet. AddPeer commits the
+// (pubkey, ip) row.
 func (w *wireguardOnboarder) allocateIP() (string, error) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	used := map[string]bool{}
-	if globalDB != nil {
-		rows, err := globalDB.Query("SELECT ip FROM wg_peers")
-		if err == nil {
-			defer func() { _ = rows.Close() }()
-			for rows.Next() {
-				var ip string
-				if rows.Scan(&ip) == nil {
-					used[ip] = true
-				}
-			}
-			if err := rows.Err(); err != nil {
-				used = map[string]bool{}
-			}
-		}
-	}
-	_, cidr, err := net.ParseCIDR(w.ts.WGSubnetCIDR)
-	if err != nil {
-		return "", err
-	}
-	first := cidr.IP.To4()
-	for i := 2; i < 255; i++ {
-		ip := net.IPv4(first[0], first[1], first[2], byte(i)).String()
-		if !used[ip] {
-			return ip, nil
-		}
-	}
-	return "", fmt.Errorf("wireguard subnet %s exhausted", w.ts.WGSubnetCIDR)
+	return allocateWGPeerIP(w.ts)
 }
