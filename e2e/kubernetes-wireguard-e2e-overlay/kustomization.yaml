@@ -74,6 +74,6 @@ patches:
     patch: |-
       - { op: replace, path: /metadata/namespace, value: agents-e2e }
       - op: replace
-        path: /spec/initContainers/0/args/2
+        path: /spec/initContainers/0/args/1
         value: --gateway-url=http://clawpatrol-api.clawpatrol-e2e.svc:8080
       - { op: replace, path: /spec/containers/0/image, value: ghcr.io/denoland/clawpatrol:latest }
