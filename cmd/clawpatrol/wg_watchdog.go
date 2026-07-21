@@ -62,6 +62,19 @@ type wgWatchdogConfig struct {
 	stuckTimeout  time.Duration
 	resetCooldown time.Duration
 	now           func() time.Time
+
+	// rx-liveness escalation (enrolled bridge peers only, where the gateway
+	// keepalives back so rx_bytes advances every keepalive). When the peer's
+	// rx_bytes stays flat this long, the far side has stopped responding —
+	// a stuck local state machine or a gateway-side reap. rxResetAfter tries
+	// a local rebuild first (cheap; fixes a wedge); if rx is still flat at
+	// rxExitAfter the enrollment is gone and only a fresh one recovers it,
+	// so the loop calls exit() to let the kubelet restart the sidecar and
+	// re-enroll. Both zero (run daemon, or timeout_multiplier=0) leaves this
+	// path inert and only the handshake-wedge recovery above runs.
+	rxResetAfter time.Duration
+	rxExitAfter  time.Duration
+	exit         func()
 }
 
 func runWGWatchdogLoop(ctx context.Context, c wgWatchdogConfig) {
@@ -70,12 +83,16 @@ func runWGWatchdogLoop(ctx context.Context, c wgWatchdogConfig) {
 		lastTx        uint64
 		lastResetAt   time.Time
 		forced        bool
+		rxTracking    bool
+		lastRx        uint64
+		lastRxAt      time.Time
 	)
 	logf := func(format string, args ...any) {
 		if c.log != nil && c.log.Errorf != nil {
 			c.log.Errorf(format, args...)
 		}
 	}
+	rxEnabled := c.rxResetAfter > 0 || c.rxExitAfter > 0
 	for {
 		select {
 		case <-ctx.Done():
@@ -92,6 +109,41 @@ func runWGWatchdogLoop(ctx context.Context, c wgWatchdogConfig) {
 		if !s.lastHandshake.IsZero() {
 			seenHandshake = true
 		}
+
+		// rx-liveness escalation. Only meaningful once the first handshake
+		// has completed (before that a flat rx is a setup problem, not a
+		// reap) and when the gateway keepalives back. On a healthy tunnel
+		// rx advances every keepalive, so lastRxAt keeps moving and neither
+		// threshold trips.
+		if rxEnabled && seenHandshake {
+			switch {
+			case !rxTracking:
+				rxTracking, lastRx, lastRxAt = true, s.rxBytes, c.now()
+			case s.rxBytes > lastRx:
+				lastRx, lastRxAt = s.rxBytes, c.now()
+			default:
+				quiet := c.now().Sub(lastRxAt)
+				if c.rxExitAfter > 0 && quiet > c.rxExitAfter {
+					logf("watchdog: no WG rx for %s (> %s) — peer reaped or partitioned; exiting to re-enroll",
+						quiet.Round(time.Second), c.rxExitAfter)
+					if c.exit != nil {
+						c.exit()
+					}
+					return
+				}
+				if c.rxResetAfter > 0 && quiet > c.rxResetAfter &&
+					(lastResetAt.IsZero() || c.now().Sub(lastResetAt) >= c.resetCooldown) {
+					logf("watchdog: no WG rx for %s (> %s) — rebuilding peer",
+						quiet.Round(time.Second), c.rxResetAfter)
+					if err := c.reset(); err != nil {
+						logf("watchdog: peer reset failed: %v", err)
+					} else {
+						lastResetAt = c.now()
+					}
+				}
+			}
+		}
+
 		// Don't reset before the very first handshake completes. A
 		// missing initial handshake is a config/network problem, not
 		// the state-machine race; rebuilding the peer won't fix it

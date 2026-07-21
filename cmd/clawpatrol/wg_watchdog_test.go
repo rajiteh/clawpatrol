@@ -295,3 +295,123 @@ func TestWatchdogWaitsForInitialHandshake(t *testing.T) {
 	cancel()
 	<-done
 }
+
+// TestWatchdogRxLivenessEscalates drives the enrolled-peer path: a flat
+// rx_bytes (gateway stopped responding) first triggers a local reset at
+// rxResetAfter, then a hard exit at rxExitAfter when the reset didn't help.
+func TestWatchdogRxLivenessEscalates(t *testing.T) {
+	clk := &fakeClock{}
+	t0 := time.Unix(3_000_000, 0)
+	clk.Set(t0)
+
+	tick := make(chan time.Time, 4)
+	forceReset := make(chan struct{}, 1)
+
+	// Handshake completed at t0 and stays well within stuckTimeout, so the
+	// handshake-wedge path never fires — rx is the only trigger. rx is flat.
+	stats := func() *wgPeerStats {
+		return &wgPeerStats{lastHandshake: t0, txBytes: 500, rxBytes: 1000}
+	}
+
+	resetCalls := make(chan struct{}, 8)
+	reset := func() error { resetCalls <- struct{}{}; return nil }
+	exitCalls := make(chan struct{}, 1)
+	exit := func() {
+		select {
+		case exitCalls <- struct{}{}:
+		default:
+		}
+	}
+
+	log, _ := loggerWithLines()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		runWGWatchdogLoop(ctx, wgWatchdogConfig{
+			stats: stats, reset: reset, log: log, forceReset: forceReset,
+			tick: tick, stuckTimeout: 3 * time.Minute, resetCooldown: time.Minute,
+			now: clk.Now, rxResetAfter: 50 * time.Second, rxExitAfter: 75 * time.Second,
+			exit: exit,
+		})
+		close(done)
+	}()
+
+	// Tick 1 seeds rx tracking (first sight) — no action.
+	tick <- clk.Now()
+	select {
+	case <-resetCalls:
+		t.Fatal("reset on first rx sample")
+	case <-exitCalls:
+		t.Fatal("exit on first rx sample")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// Advance past rxResetAfter (60s > 50s) with rx still flat → reset.
+	clk.Set(t0.Add(60 * time.Second))
+	tick <- clk.Now()
+	select {
+	case <-resetCalls:
+	case <-time.After(time.Second):
+		t.Fatal("watchdog did not reset at rxResetAfter")
+	}
+
+	// Advance past rxExitAfter (80s > 75s), rx still flat → hard exit.
+	clk.Set(t0.Add(80 * time.Second))
+	tick <- clk.Now()
+	select {
+	case <-exitCalls:
+	case <-time.After(time.Second):
+		t.Fatal("watchdog did not exit at rxExitAfter")
+	}
+	<-done // loop returns after exit()
+}
+
+// TestWatchdogRxLivenessDisabled confirms a flat rx never resets or exits
+// when the escalation thresholds are zero (run daemon / timeout_multiplier=0).
+func TestWatchdogRxLivenessDisabled(t *testing.T) {
+	clk := &fakeClock{}
+	t0 := time.Unix(4_000_000, 0)
+	clk.Set(t0)
+
+	tick := make(chan time.Time, 4)
+	forceReset := make(chan struct{}, 1)
+	// Keep the handshake fresh (relative to the current clock) so the
+	// handshake-wedge path stays quiet and this test isolates the rx path,
+	// which is disabled here (rxResetAfter/rxExitAfter zero).
+	stats := func() *wgPeerStats {
+		return &wgPeerStats{lastHandshake: clk.Now(), txBytes: 500, rxBytes: 1000}
+	}
+	resetCalls := make(chan struct{}, 8)
+	reset := func() error { resetCalls <- struct{}{}; return nil }
+	exited := false
+	exit := func() { exited = true }
+
+	log, _ := loggerWithLines()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		runWGWatchdogLoop(ctx, wgWatchdogConfig{
+			stats: stats, reset: reset, log: log, forceReset: forceReset,
+			tick: tick, stuckTimeout: 3 * time.Minute, resetCooldown: time.Minute,
+			now:  clk.Now, // rxResetAfter/rxExitAfter zero → inert
+			exit: exit,
+		})
+		close(done)
+	}()
+
+	tick <- clk.Now()
+	clk.Set(t0.Add(10 * time.Minute)) // long flat rx
+	tick <- clk.Now()
+	select {
+	case <-resetCalls:
+		t.Fatal("reset fired with rx escalation disabled")
+	case <-time.After(80 * time.Millisecond):
+	}
+	if exited {
+		t.Fatal("exit fired with rx escalation disabled")
+	}
+	cancel()
+	<-done
+}
