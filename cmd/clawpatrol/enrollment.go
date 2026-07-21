@@ -35,12 +35,12 @@ const (
 	enrollmentDefaultMTU                   = 1420
 	// enrollmentReaperInterval is how often the reaper wakes to sample each
 	// enrolled peer's WireGuard rx and revoke peers past their liveness
-	// window. It doubles as the liveness-sample cadence: the sampled
-	// lastProgress is what the dashboard reads, so this is kept close to the
-	// dashboard poll interval rather than a coarse reap-only tick. The reap
-	// decision is window-based, so sampling more often only shortens
-	// detection latency.
-	enrollmentReaperInterval = 5 * time.Second
+	// window. The sampled lastProgress also backs the dashboard's "last
+	// heartbeat", but the dashboard tolerates this coarse cadence: keepalive
+	// is clamped to a 10s minimum and this interval is 2× that, so a healthy
+	// peer's observed miss count never exceeds 1 — which is why the UI only
+	// flags "stale" at the 2nd missed beat.
+	enrollmentReaperInterval = 20 * time.Second
 	// enrollmentDefaultLiveness is the fallback WireGuard-quiet grace
 	// window used only when a peer's authorizer can no longer be resolved
 	// (e.g. removed from the policy on reload) — orphaned peers still get

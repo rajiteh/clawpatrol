@@ -7,11 +7,16 @@ import type { EnrolledPeer } from "../lib/api";
 import { fmtAge, fmtDateTime } from "../lib/format";
 import { Tag } from "./Tag";
 
-// missedHeartbeats derives how many keepalive intervals have elapsed
-// since the gateway last saw the peer's rx advance. 0 == live; >=1 ==
-// stale (heartbeats lapsing). A peer that misses the whole liveness
-// window is reaped by the gateway and drops out of the list entirely,
-// so this only ever renders small values in practice.
+// The gateway samples rx on the reaper's 20s cadence, and keepalive is
+// clamped to a 10s minimum — so on a healthy peer the observed miss count
+// can be as high as 1 purely from sampling jitter. We therefore only flag
+// "stale" from the 2nd missed beat, which never triggers on a live peer at
+// any valid keepalive. A peer that misses its whole window is reaped by the
+// gateway and drops out of the list, so this renders small values only.
+const staleMissedThreshold = 2;
+
+// missedHeartbeats derives how many keepalive intervals have elapsed since
+// the gateway last saw the peer's rx advance.
 function missedHeartbeats(p: EnrolledPeer): number {
   const ka = p.keepalive_interval_seconds ?? 0;
   const last = p.last_rx_at ? Date.parse(p.last_rx_at) : 0;
@@ -26,7 +31,7 @@ function ago(t: string | undefined): string {
 
 export function EnrollmentPanel({ peer }: { peer: EnrolledPeer }) {
   const missed = missedHeartbeats(peer);
-  const stale = missed >= 1;
+  const stale = missed >= staleMissedThreshold;
   const ka = peer.keepalive_interval_seconds ?? 0;
   const reap = peer.reap_count ?? 0;
   // Liveness window is derived, not sent: keepalive × reap_count.
@@ -77,7 +82,7 @@ export function EnrollmentPanel({ peer }: { peer: EnrolledPeer }) {
         </Field>
         <Field label="Last heartbeat">
           <span className="tabular-nums">{peer.last_rx_at ? ago(peer.last_rx_at) : "—"}</span>
-          {missed >= 1 && (
+          {stale && (
             <Tag tone="warning" className="ml-1.5">
               {missed} missed
             </Tag>
