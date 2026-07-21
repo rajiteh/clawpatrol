@@ -24,12 +24,17 @@ const k8sEnrollmentType = "kubernetes_token_review"
 type K8sEnrollment struct {
 	Audience string     `json:"audience"`
 	Matches  []K8sMatch `json:"match"`
-	// LivenessTimeout / MaxTTL are raw time.ParseDuration strings, empty
-	// when the operator omitted them. Both are validated as positive
-	// durations at load time; the runtime applies the default liveness
-	// window when LivenessTimeout is empty.
-	LivenessTimeout string `json:"liveness_timeout,omitempty"`
-	MaxTTL          string `json:"max_ttl,omitempty"`
+	// KeepaliveInterval is the raw time.ParseDuration string for the
+	// WireGuard persistent-keepalive interval, empty when omitted (defaults
+	// to EnrollmentDefaultKeepalive). KeepaliveReapCount is the missed-
+	// keepalive count before an enrolled peer is reaped, nil when omitted
+	// (defaults to EnrollmentDefaultReapCount); 0 disables reaping. The
+	// liveness window is derived (keepalive × reap count), never set directly.
+	KeepaliveInterval  string `json:"keepalive_interval,omitempty"`
+	KeepaliveReapCount *int   `json:"keepalive_reap_count,omitempty"`
+	// MaxTTL is a raw time.ParseDuration string, empty when omitted.
+	// Validated as a positive duration at load time.
+	MaxTTL string `json:"max_ttl,omitempty"`
 }
 
 // K8sMatch is one identity → profile-binding rule. A Pod is matched on
@@ -54,11 +59,18 @@ type k8sEnrollmentBody struct {
 	// namespace + service_account identity to a profile allowlist. At
 	// least one is required.
 	Matches []k8sMatchBody `hcl:"match,block"`
-	// LivenessTimeout is the WireGuard-quiet grace window before an
-	// enrolled peer is reaped (time.ParseDuration). Optional; defaults to
-	// ~75s (3x the keepalive interval). Liveness is observed from the WG
-	// device (rx_bytes progress), not an app-level heartbeat.
-	LivenessTimeout string `hcl:"liveness_timeout,optional"`
+	// KeepaliveInterval is the WireGuard persistent-keepalive interval
+	// (time.ParseDuration) applied to enrolled peers in both directions and
+	// pushed to the sidecar at enroll. Optional; defaults to 25s, and must
+	// be at least 10s.
+	KeepaliveInterval string `hcl:"keepalive_interval,optional"`
+	// KeepaliveReapCount is how many missed keepalives elapse before an
+	// enrolled peer is reaped; the liveness window is keepalive_interval ×
+	// keepalive_reap_count. Expressing it as a count keeps the safety ratio
+	// an integer that can't be misconfigured. Optional; defaults to 3. Set to
+	// 0 to disable reaping (and the sidecar's self-heal escalation) entirely;
+	// any other value must be 2 or greater.
+	KeepaliveReapCount *int `hcl:"keepalive_reap_count,optional"`
 	// MaxTTL is an optional hard lifetime for enrolled peers
 	// (time.ParseDuration). Parsed and stored; enforcement is future
 	// work. Validated as a positive duration when set.
@@ -92,42 +104,34 @@ func init() {
 	})
 }
 
-func k8sEnrollmentDiag(ctx *BuildCtx, summary, detail string) *hcl.Diagnostic {
-	d := &hcl.Diagnostic{Severity: hcl.DiagError, Summary: summary, Detail: detail}
-	if ctx != nil && ctx.Block != nil {
-		d.Subject = &ctx.Block.DefRange
-	}
-	return d
-}
-
 func validateK8sEnrollment(decoded any, name string, ctx *BuildCtx) hcl.Diagnostics {
 	body := decoded.(*k8sEnrollmentBody)
 	var diags hcl.Diagnostics
 
 	if strings.TrimSpace(body.Audience) == "" {
-		diags = append(diags, k8sEnrollmentDiag(ctx, "Missing enrollment audience",
+		diags = append(diags, enrollmentDiag(ctx, "Missing enrollment audience",
 			fmt.Sprintf("enrollment %q requires `audience` so projected ServiceAccount tokens are scoped to clawpatrol.", name)))
 	}
 	if len(body.Matches) == 0 {
-		diags = append(diags, k8sEnrollmentDiag(ctx, "Missing enrollment match",
+		diags = append(diags, enrollmentDiag(ctx, "Missing enrollment match",
 			fmt.Sprintf("enrollment %q requires at least one `match { namespace = ..., service_account = ..., profiles = [...] }` block.", name)))
 	}
 	for i, m := range body.Matches {
 		if strings.TrimSpace(m.Namespace) == "" {
-			diags = append(diags, k8sEnrollmentDiag(ctx, "Invalid enrollment match",
+			diags = append(diags, enrollmentDiag(ctx, "Invalid enrollment match",
 				fmt.Sprintf("enrollment %q match[%d] is missing `namespace`.", name, i)))
 		}
 		if strings.TrimSpace(m.ServiceAccount) == "" {
-			diags = append(diags, k8sEnrollmentDiag(ctx, "Invalid enrollment match",
+			diags = append(diags, enrollmentDiag(ctx, "Invalid enrollment match",
 				fmt.Sprintf("enrollment %q match[%d] is missing `service_account`.", name, i)))
 		}
 		if len(m.Profiles) == 0 {
-			diags = append(diags, k8sEnrollmentDiag(ctx, "Invalid enrollment match",
+			diags = append(diags, enrollmentDiag(ctx, "Invalid enrollment match",
 				fmt.Sprintf("enrollment %q match[%d] is missing at least one profile.", name, i)))
 		}
 		for j, prof := range m.Profiles {
 			if strings.TrimSpace(prof) == "" {
-				diags = append(diags, k8sEnrollmentDiag(ctx, "Invalid enrollment match",
+				diags = append(diags, enrollmentDiag(ctx, "Invalid enrollment match",
 					fmt.Sprintf("enrollment %q match[%d].profiles[%d] is empty.", name, i, j)))
 				continue
 			}
@@ -135,13 +139,14 @@ func validateK8sEnrollment(decoded any, name string, ctx *BuildCtx) hcl.Diagnost
 			// `profile "<name>"` — resolved through the symbol table like
 			// the OIDC enrollment plugin resolves its target profile.
 			if ctx != nil && ctx.Symbols != nil && ctx.Symbols.Get(KindProfile, prof) == nil {
-				diags = append(diags, k8sEnrollmentDiag(ctx, "Unknown enrollment profile",
+				diags = append(diags, enrollmentDiag(ctx, "Unknown enrollment profile",
 					fmt.Sprintf("enrollment %q match[%d] targets profile %q which is not declared.", name, i, prof)))
 			}
 		}
 	}
 
-	diags = append(diags, validateK8sEnrollmentDuration(ctx, name, "liveness_timeout", body.LivenessTimeout)...)
+	diags = append(diags, validateEnrollmentKeepaliveInterval(ctx, name, body.KeepaliveInterval)...)
+	diags = append(diags, validateEnrollmentReapCount(ctx, name, body.KeepaliveReapCount)...)
 	diags = append(diags, validateK8sEnrollmentDuration(ctx, name, "max_ttl", body.MaxTTL)...)
 	return diags
 }
@@ -154,7 +159,7 @@ func validateK8sEnrollmentDuration(ctx *BuildCtx, name, attr, raw string) hcl.Di
 	}
 	d, err := time.ParseDuration(raw)
 	if err != nil || d <= 0 {
-		return hcl.Diagnostics{k8sEnrollmentDiag(ctx, "Invalid enrollment "+attr,
+		return hcl.Diagnostics{enrollmentDiag(ctx, "Invalid enrollment "+attr,
 			fmt.Sprintf("enrollment %q %s = %q must be a positive Go duration string such as \"3m\".", name, attr, raw))}
 	}
 	return nil
@@ -163,9 +168,10 @@ func validateK8sEnrollmentDuration(ctx *BuildCtx, name, attr, raw string) hcl.Di
 func buildK8sEnrollment(decoded any, _ string, _ *BuildCtx) (any, hcl.Diagnostics) {
 	body := decoded.(*k8sEnrollmentBody)
 	out := &K8sEnrollment{
-		Audience:        body.Audience,
-		LivenessTimeout: body.LivenessTimeout,
-		MaxTTL:          body.MaxTTL,
+		Audience:           body.Audience,
+		KeepaliveInterval:  body.KeepaliveInterval,
+		KeepaliveReapCount: body.KeepaliveReapCount,
+		MaxTTL:             body.MaxTTL,
 	}
 	for _, m := range body.Matches {
 		label := strings.TrimSpace(m.ProfileLabel)
@@ -194,8 +200,11 @@ func emitK8sEnrollment(body any, _ string, b *hclwrite.Body) {
 		}
 		mb.SetAttributeValue("profiles", StringListVal(m.Profiles))
 	}
-	if ke.LivenessTimeout != "" {
-		b.SetAttributeValue("liveness_timeout", cty.StringVal(ke.LivenessTimeout))
+	if ke.KeepaliveInterval != "" {
+		b.SetAttributeValue("keepalive_interval", cty.StringVal(ke.KeepaliveInterval))
+	}
+	if ke.KeepaliveReapCount != nil {
+		b.SetAttributeValue("keepalive_reap_count", cty.NumberIntVal(int64(*ke.KeepaliveReapCount)))
 	}
 	if ke.MaxTTL != "" {
 		b.SetAttributeValue("max_ttl", cty.StringVal(ke.MaxTTL))

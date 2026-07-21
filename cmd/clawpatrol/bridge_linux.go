@@ -5,7 +5,9 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"math/rand"
 	"net"
 	"net/netip"
 	"net/url"
@@ -54,6 +56,10 @@ func bridgeRun(ctx context.Context, opt bridgeOptions) error {
 		Authorizer:         opt.AuthorizerName,
 		WireGuardPublicKey: clientPubB64,
 		Claims:             claims,
+		// The bridge hosts a resident tunnel and runs the liveness watchdog,
+		// so it needs the gateway to keepalive back (symmetric) for its
+		// rx-based self-heal to work.
+		Keepalive: true,
 	})
 	if err != nil {
 		return err
@@ -100,18 +106,36 @@ func bridgeRun(ctx context.Context, opt bridgeOptions) error {
 	if err != nil {
 		return fmt.Errorf("tun name: %w", err)
 	}
-	forceReset := make(chan struct{}, 1)
-	logger := wrapWGLogger(
-		device.NewLogger(device.LogLevelError, "[clawpatrol tun wg] "),
-		forceReset,
-	)
+	logger := device.NewLogger(device.LogLevelError, "[clawpatrol tun wg] ")
 	dev := device.NewDevice(tunDev, conn.NewDefaultBind(), logger)
 	defer dev.Close()
 
 	if err := setupTunDevice(ifaceName, opt.MTU, registerResp.PeerIP, registerResp.PeerIPv6); err != nil {
 		return err
 	}
-	ipc, err := buildTunWGIpc(clientPrivB64, registerResp.ServerPublicKey, endpointAddr)
+	// The gateway dictates keepalive + reap horizon at enroll. Mirror the
+	// keepalive onto our tunnel and size the watchdog's rx-liveness
+	// thresholds from the same numbers so the client escalates in lock-step
+	// with the gateway's reaper.
+	keepaliveSecs := registerResp.KeepaliveIntervalSeconds
+	if keepaliveSecs <= 0 {
+		keepaliveSecs = 25
+	}
+	keepalive := time.Duration(keepaliveSecs) * time.Second
+	var rxResetAfter, rxExitAfter time.Duration
+	if mult := registerResp.KeepaliveReapCount; mult >= 2 {
+		// Local rebuild after the client's configured missed-keepalive count
+		// (default 2, disabled at 0 or when it meets/exceeds the reap
+		// horizon); full restart at the reap horizon (mult missed). Positive
+		// jitter (≤ half a keepalive) never fires early and staggers a mass
+		// reap so sidecars don't all re-enroll at once.
+		if rm := watchdogResetMisses(opt.LocalResetMisses, mult); rm > 0 {
+			rxResetAfter = keepalive * time.Duration(rm)
+		}
+		jitter := time.Duration(rand.Int63n(int64(keepalive/2) + 1))
+		rxExitAfter = keepalive*time.Duration(mult) + jitter
+	}
+	ipc, err := buildTunWGIpc(clientPrivB64, registerResp.ServerPublicKey, endpointAddr, keepaliveSecs)
 	if err != nil {
 		return err
 	}
@@ -127,6 +151,11 @@ func bridgeRun(ctx context.Context, opt bridgeOptions) error {
 
 	watchdogCtx, stopWatchdog := context.WithCancel(context.Background())
 	defer stopWatchdog()
+	// selfHeal fires when the watchdog gives up on this enrollment (rx quiet
+	// past the exit threshold). We handle it on the main goroutine rather
+	// than os.Exit from the watchdog so the netns is cleaned up first — see
+	// the wait below.
+	selfHeal := make(chan struct{}, 1)
 	watchdogTicker := time.NewTicker(wgWatchdogPoll)
 	go func() {
 		defer watchdogTicker.Stop()
@@ -140,11 +169,17 @@ func bridgeRun(ctx context.Context, opt bridgeOptions) error {
 			},
 			reset:         func() error { return dev.IpcSet(ipc) },
 			log:           logger,
-			forceReset:    forceReset,
 			tick:          watchdogTicker.C,
-			stuckTimeout:  wgWatchdogStuckTimeout,
 			resetCooldown: wgWatchdogResetCooldown,
 			now:           time.Now,
+			rxResetAfter:  rxResetAfter,
+			rxExitAfter:   rxExitAfter,
+			exit: func() {
+				select {
+				case selfHeal <- struct{}{}:
+				default:
+				}
+			},
 		})
 	}()
 
@@ -160,18 +195,39 @@ func bridgeRun(ctx context.Context, opt bridgeOptions) error {
 	// Stay up for the netns lifetime. WireGuard persistent-keepalive keeps
 	// the tunnel live and lets the gateway observe liveness (rx_bytes); the
 	// gateway reaps the peer if we go quiet. No app-level heartbeat.
-	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
+	sigCtx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	<-ctx.Done()
-	// Best-effort deregister, bounded so a hung gateway/DNS call can't delay
-	// pod termination past the grace period (the gateway still reaps us).
-	delCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	enrollmentDeregister(delCtx, opt.GatewayURL, registerResp.APIToken)
-	return nil
+	select {
+	case <-sigCtx.Done():
+		// Graceful shutdown: the pod is terminating, so best-effort
+		// deregister (bounded so a hung gateway/DNS call can't delay pod
+		// termination past the grace period). The netns is torn down with
+		// the pod, so there is nothing to restore.
+		delCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		enrollmentDeregister(delCtx, opt.GatewayURL, registerResp.APIToken)
+		return nil
+	case <-selfHeal:
+		// The watchdog gave up on this enrollment (peer reaped or
+		// partitioned). The pod keeps running, so restore the original
+		// default route before exiting — otherwise the kubelet-restarted
+		// sidecar inherits a netns whose only default vanished with
+		// clawpatrol0 and can't bootstrap the next tunnel. Skip deregister:
+		// the peer is already gone. Exit non-zero so the kubelet restarts us
+		// (native sidecar) to re-enroll with a fresh key.
+		stopWatchdog()
+		restoreDefaultRoutes(route4, route6, have6)
+		return errBridgeSelfHeal
+	}
 }
 
-func buildTunWGIpc(privateKeyB64, serverPublicKeyB64, endpoint string) (string, error) {
+// errBridgeSelfHeal is returned by bridgeRun when the watchdog decides the
+// enrollment is gone and the sidecar must restart to re-enroll. It is an
+// expected, non-fatal outcome (the kubelet restarts the native sidecar), not
+// a crash — but it exits non-zero to trigger that restart.
+var errBridgeSelfHeal = errors.New("bridge: peer liveness lost; restarting to re-enroll")
+
+func buildTunWGIpc(privateKeyB64, serverPublicKeyB64, endpoint string, keepaliveSeconds int) (string, error) {
 	privHex, err := base64DecodeToHex(privateKeyB64)
 	if err != nil {
 		return "", fmt.Errorf("private key: %w", err)
@@ -185,7 +241,14 @@ func buildTunWGIpc(privateKeyB64, serverPublicKeyB64, endpoint string) (string, 
 	fmt.Fprintf(&b, "replace_peers=true\n")
 	fmt.Fprintf(&b, "public_key=%s\n", pubRaw)
 	fmt.Fprintf(&b, "endpoint=%s\n", endpoint)
-	fmt.Fprintf(&b, "persistent_keepalive_interval=25\n")
+	// The gateway dictates the keepalive cadence at enroll and keeps its own
+	// side in sync; fall back to 25s only if the response omitted it (older
+	// gateway). Keepalive drives the gateway's rx_bytes liveness in one
+	// direction and the sidecar's watchdog in the other.
+	if keepaliveSeconds <= 0 {
+		keepaliveSeconds = 25
+	}
+	fmt.Fprintf(&b, "persistent_keepalive_interval=%d\n", keepaliveSeconds)
 	fmt.Fprintf(&b, "allowed_ip=0.0.0.0/0\n")
 	fmt.Fprintf(&b, "allowed_ip=::/0\n")
 	return b.String(), nil
@@ -211,6 +274,33 @@ func setupTunDevice(iface string, mtu int, peerIP, peerIPv6 string) error {
 		}
 	}
 	return nil
+}
+
+// restoreDefaultRoutes re-installs the pod's original default route(s) after
+// the tunnel is torn down, so a kubelet-restarted sidecar (self-heal) finds a
+// normal netns to bootstrap from instead of one whose only default route
+// vanished with clawpatrol0. Best-effort: on failure the next start hits the
+// same "no default route" it would have anyway, and CrashLoopBackOff bounds
+// the retries. `ip route replace` overrides the current (clawpatrol0) default
+// before the interface is closed, so the restored route survives teardown.
+func restoreDefaultRoutes(r4, r6 linuxDefaultRoute, have6 bool) {
+	restore := func(family string, r linuxDefaultRoute) {
+		if r.Dev == "" {
+			return
+		}
+		args := []string{"ip", family, "route", "replace", "default"}
+		if r.Via != "" {
+			args = append(args, "via", r.Via)
+		}
+		args = append(args, "dev", r.Dev)
+		if err := runIP(args...); err != nil {
+			fmt.Fprintf(os.Stderr, "[clawpatrol] bridge: restore %s default route: %v\n", family, err)
+		}
+	}
+	restore("-4", r4)
+	if have6 {
+		restore("-6", r6)
+	}
 }
 
 func replaceDefaultRoutes(iface string, replace6 bool) error {

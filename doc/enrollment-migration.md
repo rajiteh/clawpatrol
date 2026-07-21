@@ -11,9 +11,9 @@ labeled `enrollment "<type>" "<name>"` blocks — siblings of `profile` /
 > [§1b](#1b-interim-enrollment-shape) for the small change: the whole
 > block moves out of `gateway { ... }` to the top level, the `authorizer`
 > sub-block's two labels move up onto `enrollment` itself, `allow { ... }`
-> rules become `match { ... }` blocks, `peer_ttl` becomes the
-> per-authorizer `liveness_timeout`, and an optional `max_ttl` slot is
-> now accepted.
+> rules become `match { ... }` blocks, `peer_ttl` is replaced by the
+> derived liveness window (`keepalive_interval × keepalive_reap_count`), and
+> an optional `max_ttl` slot is now accepted.
 
 No data migration is needed: the storage migration
 (`0020_wg_peer_enrollment.sql`) runs automatically on gateway startup
@@ -27,8 +27,9 @@ Move the block out of `gateway.wireguard` and up to a top-level
 like `profile` / `credential`). Drop `enabled` (presence of at least one
 enrollment block is what enables it). The old `authorizer "<type>"
 "<name>"` sub-block's two labels move onto the `enrollment` block itself;
-each `allow { ... }` rule becomes a `match { ... }` block; `lease_ttl`
-becomes the per-authorizer `liveness_timeout`.
+each `allow { ... }` rule becomes a `match { ... }` block; `lease_ttl` is
+replaced by the derived liveness window (`keepalive_interval ×
+keepalive_reap_count`).
 
 **Before:**
 
@@ -79,17 +80,20 @@ enrollment "kubernetes_token_review" "agents" {
     profiles        = ["default"]
   }
 
-  liveness_timeout = "3m"
+  # Liveness is derived: keepalive_interval × keepalive_reap_count (60s×3 = 3m).
+  keepalive_interval = "60s"
+  keepalive_reap_count = 3
   # max_ttl = "24h"   # optional; parsed + stored, not enforced yet
 }
 ```
 
 Notes:
-- `liveness_timeout` is the per-authorizer liveness window (default
-  ~75s, 3x the keepalive interval). It is not a heartbeat TTL — the
-  gateway reaps a peer once its WireGuard `rx_bytes` has been quiet for
-  longer than this. Keep it comfortably above the keepalive interval
-  (25s); `2m`–`3m` is fine.
+- The liveness window is derived, not set directly: `keepalive_interval`
+  (default 25s, min 10s) × `keepalive_reap_count` (default 3; `0` disables
+  reaping). It is not a heartbeat TTL — the gateway reaps a peer once its
+  WireGuard `rx_bytes` has been quiet for that long. Because the window is
+  a whole number of keepalives, the reap-vs-keepalive safety ratio can't be
+  misconfigured; the old `peer_ttl = "3m"` maps to `60s × 3`.
 - `profile_label` is optional per `match` (default
   `clawpatrol.dev/profile`). The pod's profile is read from that label
   and must be in the match's `profiles` allowlist.
@@ -110,7 +114,8 @@ If you already migrated off `dynamic_peers` onto the interim
   `enrollment { ... }` container or a nested `authorizer` block).
 - each `allow { namespace, service_account, profiles }` →
   `match { namespace, service_account, profile_label?, profiles }`.
-- the enrollment-wide `peer_ttl` → per-block `liveness_timeout`.
+- the enrollment-wide `peer_ttl` → per-block `keepalive_interval` ×
+  `keepalive_reap_count` (derived liveness window).
 - new optional `max_ttl` slot (parsed + stored, not yet enforced).
 
 Multiple authorizers that used to be sibling `authorizer` blocks under
@@ -174,8 +179,8 @@ container that reads the handoff files.
 
 - The `dynamic_peers { enabled = ... }` nested block and the `enabled`
   flag.
-- `lease_ttl` / the interim `peer_ttl` (replaced by the per-authorizer
-  `liveness_timeout`).
+- `lease_ttl` / the interim `peer_ttl` (replaced by the derived liveness
+  window, `keepalive_interval × keepalive_reap_count`).
 - The interim nested `authorizer "<type>" "<name>"` block and its
   `allow { ... }` rules (replaced by labels on `enrollment` and
   `match { ... }` blocks).
@@ -192,8 +197,9 @@ container that reads the handoff files.
 - [ ] Lift the `authorizer "<type>" "<name>"` labels onto the
       `enrollment` block; drop the now-empty `authorizer` wrapper.
 - [ ] Turn each `allow { ... }` rule into a `match { ... }` block.
-- [ ] Rename `lease_ttl` / `peer_ttl` → `liveness_timeout` (and bump to
-      ≥ `2m` if it was shorter than the keepalive interval).
+- [ ] Replace `lease_ttl` / `peer_ttl` with `keepalive_interval` +
+      `keepalive_reap_count` (liveness = interval × multiplier; e.g.
+      `3m` → `60s × 3`).
 - [ ] In every agent pod spec: replace the `run` + `--tun` args with a
       single `bridge` arg.
 - [ ] Rename `--dynamic-peer-authorizer=` → `--authorizer=`.

@@ -375,7 +375,14 @@ func StartWGServer(ts JoinConfig) (*WGServer, error) {
 // only one /32-owner exists. Accumulated ghost peers from previous
 // onboards otherwise win the trie race on restart and silently drop
 // the current client's traffic.
-func (s *WGServer) AddPeer(pubkeyHex, peerIP string) error {
+// AddPeer installs (or updates) a WireGuard peer. When keepalive > 0 the
+// gateway sends persistent-keepalive toward the peer at that interval, so
+// the peer's receive counter advances even when idle — this lets the
+// sidecar's watchdog observe liveness symmetrically (enrolled peers), the
+// same signal the gateway's reaper uses in the other direction. keepalive
+// == 0 leaves the peer without gateway-initiated keepalive (onboarded
+// devices, which drive keepalive from the client side).
+func (s *WGServer) AddPeer(pubkeyHex, peerIP string, keepalive time.Duration) error {
 	if s.db != nil {
 		rows, err := s.db.Query("SELECT pubkey FROM wg_peers WHERE ip = ? AND pubkey != ?", peerIP, pubkeyHex)
 		if err == nil {
@@ -397,10 +404,14 @@ func (s *WGServer) AddPeer(pubkeyHex, peerIP string) error {
 		}
 	}
 	peerIP6 := wg6FromV4(netip.MustParseAddr(peerIP))
-	if err := s.dev.IpcSet(fmt.Sprintf(
+	ipc := fmt.Sprintf(
 		"public_key=%s\nreplace_allowed_ips=true\nallowed_ip=%s/32\nallowed_ip=%s/128\n",
 		pubkeyHex, peerIP, peerIP6.String(),
-	)); err != nil {
+	)
+	if keepalive > 0 {
+		ipc += fmt.Sprintf("persistent_keepalive_interval=%d\n", int(keepalive.Seconds()))
+	}
+	if err := s.dev.IpcSet(ipc); err != nil {
 		return err
 	}
 	if s.db != nil {
@@ -866,7 +877,7 @@ func (w *wireguardOnboarder) MintKey(_ context.Context, reuseIP string, _ bool) 
 			return "", "", "", err
 		}
 	}
-	if err := globalWG.AddPeer(clientPubHex, ip); err != nil {
+	if err := globalWG.AddPeer(clientPubHex, ip, 0); err != nil {
 		return "", "", "", fmt.Errorf("wg add peer: %w", err)
 	}
 	serverPub, err := globalWG.PublicKey()

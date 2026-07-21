@@ -14,12 +14,14 @@ type CompiledK8sEnrollment struct {
 	Type     string
 	Audience string
 	Matches  []CompiledK8sMatch
-	// LivenessTimeout is the parsed `liveness_timeout`, or 0 when the
-	// operator omitted it (the reaper applies its default in that case).
-	LivenessTimeout time.Duration
 	// MaxTTL is the parsed `max_ttl`, or 0 when unset. Parsed and stored
 	// for a future hard-expiry enforcement pass; not enforced today.
 	MaxTTL time.Duration
+	// The keepalive/reap tuning is not stored here — it is cross-cutting
+	// across enrollment types and lives on CompiledPolicy.EnrollmentLivenessByName
+	// (see enrollment_liveness.go), where the reaper and register-time
+	// keepalive passdown resolve it by authorizer name without knowing the
+	// type.
 }
 
 // CompiledK8sMatch is one identity → profile-binding rule.
@@ -48,20 +50,23 @@ func compileK8sEnrollments(cp *CompiledPolicy, p *Policy) error {
 		if !ok {
 			return fmt.Errorf("enrollment %q: unexpected body %T", name, ent.Body)
 		}
-		liveness, err := parseOptionalDuration(ke.LivenessTimeout)
+		// Keepalive/reap tuning is shared across enrollment types: resolve it
+		// into the common EnrollmentLiveness and index it by authorizer name
+		// so the reaper and keepalive passdown find it without a type switch.
+		liveness, err := resolveEnrollmentLiveness(ke.KeepaliveInterval, ke.KeepaliveReapCount)
 		if err != nil {
-			return fmt.Errorf("enrollment %q liveness_timeout: %w", name, err)
+			return fmt.Errorf("enrollment %q keepalive_interval: %w", name, err)
 		}
+		cp.EnrollmentLivenessByName[name] = liveness
 		maxTTL, err := parseOptionalDuration(ke.MaxTTL)
 		if err != nil {
 			return fmt.Errorf("enrollment %q max_ttl: %w", name, err)
 		}
 		compiled := &CompiledK8sEnrollment{
-			Name:            name,
-			Type:            ent.Plugin.Type,
-			Audience:        ke.Audience,
-			LivenessTimeout: liveness,
-			MaxTTL:          maxTTL,
+			Name:     name,
+			Type:     ent.Plugin.Type,
+			Audience: ke.Audience,
+			MaxTTL:   maxTTL,
 		}
 		for _, m := range ke.Matches {
 			for _, prof := range m.Profiles {

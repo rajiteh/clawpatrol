@@ -70,7 +70,9 @@ enrollment "kubernetes_token_review" "agents" {
     profiles        = ["default"]
   }
 
-  liveness_timeout = "3m"
+  # Liveness is derived: keepalive_interval × keepalive_reap_count (60s×3 = 3m).
+  keepalive_interval = "60s"
+  keepalive_reap_count = 3
 }
 
 profile "default" {
@@ -88,9 +90,14 @@ Patrol profile from the pod label named by that match's `profile_label`
 `profiles` allowlist. The client does not get to submit its own profile.
 Add more `match { ... }` blocks to bind additional identities.
 
-`liveness_timeout` is the per-authorizer liveness window the gateway
-enforces (default ~75s). `max_ttl` is optional, parsed and stored for a
-future hard-expiry pass; it is not enforced yet.
+`keepalive_interval` (default 25s, min 10s) is the WireGuard
+persistent-keepalive cadence applied to enrolled peers in both directions;
+`keepalive_reap_count` (default 3, or 0 to disable) is how many missed
+keepalives elapse before the reaper revokes a peer. The liveness window is
+derived — `keepalive_interval × keepalive_reap_count` — so the safety ratio is
+an integer that can't be misconfigured, and the resolved keepalive is pushed
+to the sidecar at enroll so both ends stay in sync. `max_ttl` is optional,
+parsed and stored for a future hard-expiry pass; it is not enforced yet.
 
 The complete standalone HCL example lives at
 [`examples/wireguard-enrollment-kubernetes.hcl`](https://github.com/denoland/clawpatrol/blob/main/examples/wireguard-enrollment-kubernetes.hcl).
@@ -186,11 +193,12 @@ On startup, the sidecar:
 
 There is no application heartbeat. The gateway observes liveness from
 the WireGuard device: persistent keepalive advances the peer's
-`rx_bytes` roughly every 25s, and a peer whose `rx_bytes` stops
-advancing past `liveness_timeout` is reaped. A freshly enrolled peer gets a full
-`liveness_timeout` grace window first. On shutdown the sidecar best-effort
-deregisters; either way the gateway revokes the transient WireGuard peer
-and clears its enrolled `wg_peers` row.
+`rx_bytes` every `keepalive_interval`, and a peer whose `rx_bytes` stops
+advancing past the liveness window (`keepalive_interval ×
+keepalive_reap_count`) is reaped. A freshly enrolled peer gets a full
+liveness window first. On shutdown the sidecar best-effort deregisters;
+either way the gateway revokes the transient WireGuard peer and clears its
+enrolled `wg_peers` row.
 
 Enrolled peers show up in the dashboard as regular devices — there is no
 separate enrollment surface.
@@ -207,8 +215,9 @@ Kustomize base plus an e2e overlay:
 The test builds the current workspace image, loads it into kind,
 applies the e2e overlay, waits for the agent handoff, verifies the
 restricted agent contract, checks traffic through the tunnel, confirms
-rx_bytes liveness holds a live peer past `liveness_timeout`, and verifies peer
-cleanup.
+rx_bytes liveness holds a live peer past the derived liveness window,
+exercises the sidecar self-heal (sever keepalive → hard-exit → restart →
+re-enroll with a fresh key), and verifies peer cleanup.
 
 ## Limitations
 

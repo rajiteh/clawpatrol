@@ -26,7 +26,10 @@ enrollment "kubernetes_token_review" "agents" {
     profiles        = ["default"]
   }
 
-  liveness_timeout = "3m"
+  # Liveness is derived: keepalive_interval × keepalive_reap_count. A peer is
+  # reaped after `keepalive_reap_count` missed keepalives. Here: 60s × 3 = 3m.
+  keepalive_interval = "60s"
+  keepalive_reap_count = 3
 }
 
 profile "default" {

@@ -1,24 +1,28 @@
 package main
 
-// Recovery path for a stuck wireguard-go handshake state machine.
+// Liveness self-heal for an enrolled bridge peer's WireGuard tunnel.
 //
-// What goes wrong: when a rekey races on the wire (initiation+response
-// collide, or the response is dropped on the way back), the peer can
-// land in `handshakeInitiationCreated` with no path out. Inside
-// wireguard-go, `Peer.BeginSymmetricSession` then refuses to derive a
-// keypair ("invalid state for keypair derivation: handshakeInitiationCreated")
-// and the timers don't always pry the state machine back into a usable
-// state. From the operator's seat: `clawpatrol run` survives one
-// session lifetime (~3-4 hours), then every flow through the MITM
-// proxy fails with `ConnectionRefused` and the process never recovers.
+// Enrolled peers run with symmetric persistent-keepalive: the gateway
+// keepalives back (see AddPeer), so the peer's rx_bytes advances every
+// keepalive interval on a healthy tunnel — with no application traffic and
+// no app-level heartbeat. When rx_bytes stalls, the far side has stopped
+// responding: the gateway reaped or is partitioned from the peer, or the
+// local wireguard-go handshake state machine wedged. Either way the tunnel
+// is dead and won't recover on its own.
 //
-// What this watchdog does: poll the device's `last_handshake_time_sec`
-// + `tx_bytes` via IpcGet, and when the gap exceeds RejectAfterTime
-// (180s) while traffic is still being staged, rebuild the peer with
-// the original IpcSet config. That wipes the handshake trie cleanly
-// and forces a fresh initiation. A logger hook (forceReset) lets the
-// "Failed to derive keypair" error short-circuit the poll cadence so
-// recovery starts within milliseconds of the race firing.
+// The watchdog samples rx_bytes and escalates in two steps, sized from the
+// gateway-pushed keepalive cadence and timeout multiplier:
+//
+//   - at rxResetAfter (one keepalive before the reap horizon): rebuild the
+//     peer in place with the original IpcSet config. This is cheap and
+//     clears a transient local wedge without dropping the enrollment.
+//   - at rxExitAfter (the reap horizon + jitter): the enrollment is gone or
+//     unrecoverable in place, so exit() — the kubelet restarts the native
+//     sidecar, which re-enrolls with a fresh key (a fresh keypair also
+//     sidesteps a wedged handshake state machine).
+//
+// The loop is inert (thresholds zero) for clients that don't run symmetric
+// keepalive, so a flat rx is never mistaken for a dead tunnel there.
 
 import (
 	"bufio"
@@ -31,45 +35,65 @@ import (
 )
 
 const (
-	// wgWatchdogPoll is how often the handshake-recovery watchdog samples
-	// the peer's last_handshake_time_sec + tx_bytes. The watchdog only
-	// acts once the handshake is older than wgWatchdogStuckTimeout, so a
-	// few seconds between polls is plenty and stays cheap.
+	// wgWatchdogPoll is how often the watchdog samples the peer's
+	// rx_bytes. Several samples per keepalive interval keeps detection
+	// prompt while staying cheap.
 	wgWatchdogPoll = 5 * time.Second
-	// wgWatchdogStuckTimeout mirrors WireGuard's RejectAfterTime (180s):
-	// below this a stale last_handshake is normal because no rekey was due.
-	wgWatchdogStuckTimeout = 3 * time.Minute
-	// wgWatchdogResetCooldown holds off back-to-back rebuilds so a fresh
-	// initiation has time to complete before the watchdog fires again.
+	// wgWatchdogResetCooldown holds off back-to-back in-place rebuilds so a
+	// reset has time to take effect before the next one fires.
 	wgWatchdogResetCooldown = time.Minute
+	// wgWatchdogResetMisses is the default for the client-configurable
+	// local-reset threshold: how many missed keepalives trigger the cheap
+	// in-place rebuild before the (server-dictated) full restart. Independent
+	// of the timeout multiplier, so even a tolerant reap horizon still gets
+	// an early recovery attempt.
+	wgWatchdogResetMisses = 2
 )
 
-// wgPeerStats is the per-peer subset of IpcGet output we care about.
+// wgPeerStats is the per-peer subset of IpcGet output the watchdog reads.
+// lastHandshake is only used to gate escalation on the first handshake
+// completing (a tunnel that never came up is a setup problem, not a reap).
 type wgPeerStats struct {
 	lastHandshake time.Time
-	txBytes       uint64
 	rxBytes       uint64
 }
 
-// wgWatchdogConfig captures the runWGWatchdogLoop dependencies so the
-// loop is testable without standing up a real wireguard-go device.
+// wgWatchdogConfig captures the runWGWatchdogLoop dependencies so the loop
+// is testable without a real wireguard-go device.
 type wgWatchdogConfig struct {
 	stats         func() *wgPeerStats
 	reset         func() error
+	exit          func()
 	log           *device.Logger
-	forceReset    <-chan struct{}
 	tick          <-chan time.Time
-	stuckTimeout  time.Duration
 	resetCooldown time.Duration
-	now           func() time.Time
+	// rxResetAfter / rxExitAfter are the rx-quiet thresholds for the local
+	// rebuild and the hard exit. Both zero leaves the loop inert.
+	rxResetAfter time.Duration
+	rxExitAfter  time.Duration
+	now          func() time.Time
+}
+
+// watchdogResetMisses resolves the client-configured local-reset threshold
+// (missed keepalives) against the server's restart horizon (mult), returning
+// the missed-keepalive count that should trigger the in-place rebuild, or 0
+// to disable it. 0 disables it explicitly; a value at or above mult also
+// disables it (the reset would never beat the full restart at the reap
+// horizon, so it is not scheduled). Otherwise the configured value is used.
+func watchdogResetMisses(configured, mult int) int {
+	if configured <= 0 || configured >= mult {
+		return 0
+	}
+	return configured
 }
 
 func runWGWatchdogLoop(ctx context.Context, c wgWatchdogConfig) {
 	var (
 		seenHandshake bool
-		lastTx        uint64
+		rxTracking    bool
+		lastRx        uint64
+		lastRxAt      time.Time
 		lastResetAt   time.Time
-		forced        bool
 	)
 	logf := func(format string, args ...any) {
 		if c.log != nil && c.log.Errorf != nil {
@@ -81,8 +105,6 @@ func runWGWatchdogLoop(ctx context.Context, c wgWatchdogConfig) {
 		case <-ctx.Done():
 			return
 		case <-c.tick:
-		case <-c.forceReset:
-			forced = true
 		}
 
 		s := c.stats()
@@ -92,70 +114,39 @@ func runWGWatchdogLoop(ctx context.Context, c wgWatchdogConfig) {
 		if !s.lastHandshake.IsZero() {
 			seenHandshake = true
 		}
-		// Don't reset before the very first handshake completes. A
-		// missing initial handshake is a config/network problem, not
-		// the state-machine race; rebuilding the peer won't fix it
-		// and only adds noise.
-		if !seenHandshake && !forced {
-			lastTx = s.txBytes
-			continue
-		}
-		if !lastResetAt.IsZero() && c.now().Sub(lastResetAt) < c.resetCooldown {
+		// Don't escalate before the first handshake: a tunnel that never
+		// came up is a config/network problem that a rebuild or restart
+		// won't fix any faster, and would only crash-loop.
+		if !seenHandshake {
 			continue
 		}
 
-		if !forced {
-			age := c.now().Sub(s.lastHandshake)
-			if age <= c.stuckTimeout {
-				lastTx = s.txBytes
-				continue
+		switch {
+		case !rxTracking:
+			rxTracking, lastRx, lastRxAt = true, s.rxBytes, c.now()
+		case s.rxBytes > lastRx:
+			lastRx, lastRxAt = s.rxBytes, c.now()
+		default:
+			quiet := c.now().Sub(lastRxAt)
+			if c.rxExitAfter > 0 && quiet > c.rxExitAfter {
+				logf("watchdog: no WG rx for %s (> %s) — peer reaped or partitioned; exiting to re-enroll",
+					quiet.Round(time.Second), c.rxExitAfter)
+				if c.exit != nil {
+					c.exit()
+				}
+				return
 			}
-			// Idle tunnels can legitimately have a stale lastHandshake
-			// — nothing triggered a rekey because nothing's been sent.
-			// Only act when the device is trying to push traffic.
-			if s.txBytes == lastTx {
-				lastTx = s.txBytes
-				continue
-			}
-		}
-
-		age := "n/a"
-		if !s.lastHandshake.IsZero() {
-			age = c.now().Sub(s.lastHandshake).Round(time.Second).String()
-		}
-		logf("watchdog: WG handshake stuck (last %s ago) — rebuilding peer", age)
-		if err := c.reset(); err != nil {
-			logf("watchdog: peer reset failed: %v", err)
-			continue
-		}
-		lastResetAt = c.now()
-		lastTx = s.txBytes
-		forced = false
-	}
-}
-
-// wrapWGLogger returns a device.Logger that delegates to base and
-// signals forceReset whenever wireguard-go logs the keypair-derivation
-// failure. The channel is buffered to one element so concurrent
-// failures coalesce into a single reset request — the watchdog only
-// needs the wake-up, not a per-event count.
-func wrapWGLogger(base *device.Logger, forceReset chan<- struct{}) *device.Logger {
-	if base == nil {
-		base = &device.Logger{Errorf: device.DiscardLogf, Verbosef: device.DiscardLogf}
-	}
-	return &device.Logger{
-		Verbosef: base.Verbosef,
-		Errorf: func(format string, args ...any) {
-			if base.Errorf != nil {
-				base.Errorf(format, args...)
-			}
-			if strings.Contains(format, "Failed to derive keypair") {
-				select {
-				case forceReset <- struct{}{}:
-				default:
+			if c.rxResetAfter > 0 && quiet > c.rxResetAfter &&
+				(lastResetAt.IsZero() || c.now().Sub(lastResetAt) >= c.resetCooldown) {
+				logf("watchdog: no WG rx for %s (> %s) — rebuilding peer",
+					quiet.Round(time.Second), c.rxResetAfter)
+				if err := c.reset(); err != nil {
+					logf("watchdog: peer reset failed: %v", err)
+				} else {
+					lastResetAt = c.now()
 				}
 			}
-		},
+		}
 	}
 }
 
@@ -173,9 +164,6 @@ func parsePeerStats(uapi string) *wgPeerStats {
 			secs, _ = strconv.ParseInt(v, 10, 64)
 		case "last_handshake_time_nsec":
 			nsec, _ = strconv.ParseInt(v, 10, 64)
-		case "tx_bytes":
-			x, _ := strconv.ParseUint(v, 10, 64)
-			s.txBytes = x
 		case "rx_bytes":
 			x, _ := strconv.ParseUint(v, 10, 64)
 			s.rxBytes = x
