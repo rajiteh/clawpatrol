@@ -23,7 +23,9 @@ enrollment "kubernetes_token_review" "agents" {
     profiles        = ["default"]
   }
 
-  liveness_timeout = "30s"
+  # Fast reap for the e2e: 10s keepalive × 3 missed = 30s liveness window.
+  keepalive_interval = "10s"
+  timeout_multiplier = 3
 }
 
 profile "default" {

@@ -77,7 +77,10 @@ enrollment "kubernetes_token_review" "agents" {
     profiles        = ["default"]
   }
 
-  liveness_timeout = "3m"
+  # Liveness is derived: keepalive_interval × timeout_multiplier.
+  # Here 60s × 3 = a 3m reap window.
+  keepalive_interval = "60s"
+  timeout_multiplier = 3
 }
 ```
 
@@ -90,10 +93,15 @@ Each
 `match` block is one identity → profile-binding rule: a pod is matched on
 `namespace` + `service_account`, its profile is read from the pod label
 named by `profile_label` (default `clawpatrol.dev/profile`), and that value
-must be in the match's `profiles` allowlist. `liveness_timeout` is the
-per-authorizer liveness window the reaper enforces (default ~75s, 3x the
-keepalive interval). `max_ttl` is accepted and stored for a future
-hard-expiry pass; it is not enforced yet.
+must be in the match's `profiles` allowlist. `keepalive_interval` (default
+25s, min 10s) is the WireGuard persistent-keepalive cadence applied to
+enrolled peers in both directions; `timeout_multiplier` (default 3, or 0 to
+disable reaping) is how many missed keepalives elapse before the reaper
+revokes a peer. The liveness window is derived — `keepalive_interval ×
+timeout_multiplier` — so the reap-vs-keepalive safety ratio is an integer
+that can't be misconfigured, and the gateway pushes the resolved keepalive
+to the sidecar at enroll so both ends stay in sync. `max_ttl` is accepted
+and stored for a future hard-expiry pass; it is not enforced yet.
 
 ## Security boundary
 
@@ -161,7 +169,7 @@ workload namespace, plus the minimal TokenReview and pod-read RBAC.
 
 The local e2e overlay is checked in separately and patches the base to use
 isolated `*-e2e` namespaces, the local kind image tag, and a shorter
-`liveness_timeout`:
+liveness window (a small `keepalive_interval` so reaping happens quickly):
 
 ```bash
 kubectl kustomize e2e/kubernetes-wireguard-e2e-overlay
@@ -186,17 +194,18 @@ required, and nothing in the enrollment path depends on it.
 
 Kubernetes pod peers are transient. There is no application heartbeat: the
 gateway observes liveness from the WireGuard device, where persistent
-keepalive advances each peer's `rx_bytes` roughly every 25s. A freshly
-enrolled peer gets a full `liveness_timeout` grace window before it is eligible for
+keepalive advances each peer's `rx_bytes` every `keepalive_interval`. A
+freshly enrolled peer gets a full liveness window
+(`keepalive_interval × timeout_multiplier`) before it is eligible for
 reaping.
 
 - On SIGTERM the sidecar best-effort deletes its registration with
   `DELETE /api/enrollment/register`, which revokes the WireGuard peer,
   drops the enrolled `wg_peers` row, and deletes its peer API tokens.
 - If the pod dies without cleanup, the reaper notices that the peer's
-  `rx_bytes` has stopped advancing past `liveness_timeout` and revokes it the same
-  way. `last_handshake` is surfaced as a diagnostic only (it moves on
-  rekey, not on every keepalive), so liveness is never driven off it.
+  `rx_bytes` has stopped advancing past the liveness window and revokes it
+  the same way. `last_handshake` is surfaced as a diagnostic only (it moves
+  on rekey, not on every keepalive), so liveness is never driven off it.
 
 The reaper only ever touches enrolled rows (`enrolled = 1`), so durably
 onboarded devices are never reaped.

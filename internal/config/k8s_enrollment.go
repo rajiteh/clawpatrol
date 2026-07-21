@@ -17,6 +17,26 @@ const K8sDefaultProfileLabel = "clawpatrol.dev/profile"
 // k8sEnrollmentType is the enrollment plugin type label.
 const k8sEnrollmentType = "kubernetes_token_review"
 
+// Enrollment liveness knobs. The reap horizon is expressed as a multiple
+// of the WireGuard persistent-keepalive interval rather than an absolute
+// duration, so the safety ratio (reap only after N missed keepalives) is
+// an integer invariant that can't be misconfigured. Liveness is derived:
+// keepalive_interval × timeout_multiplier.
+const (
+	// K8sDefaultKeepalive is the persistent-keepalive interval applied to
+	// enrolled peers (both directions) when keepalive_interval is omitted.
+	K8sDefaultKeepalive = 25 * time.Second
+	// K8sMinKeepalive is the floor for keepalive_interval — below this the
+	// keepalive traffic is pure overhead with no liveness benefit.
+	K8sMinKeepalive = 10 * time.Second
+	// K8sDefaultTimeoutMultiplier is the number of missed keepalives before
+	// an enrolled peer is reaped when timeout_multiplier is omitted.
+	K8sDefaultTimeoutMultiplier = 3
+	// K8sMinTimeoutMultiplier is the smallest non-zero multiplier. Below 2 a
+	// single dropped keepalive would reap a live peer; 0 disables reaping.
+	K8sMinTimeoutMultiplier = 2
+)
+
 // K8sEnrollment is the built (canonical) form of a
 // `enrollment "kubernetes_token_review" "<name>" { ... }` block. It is
 // what the plugin's Build returns and what the runtime and emit paths
@@ -24,12 +44,17 @@ const k8sEnrollmentType = "kubernetes_token_review"
 type K8sEnrollment struct {
 	Audience string     `json:"audience"`
 	Matches  []K8sMatch `json:"match"`
-	// LivenessTimeout / MaxTTL are raw time.ParseDuration strings, empty
-	// when the operator omitted them. Both are validated as positive
-	// durations at load time; the runtime applies the default liveness
-	// window when LivenessTimeout is empty.
-	LivenessTimeout string `json:"liveness_timeout,omitempty"`
-	MaxTTL          string `json:"max_ttl,omitempty"`
+	// KeepaliveInterval is the raw time.ParseDuration string for the
+	// WireGuard persistent-keepalive interval, empty when omitted (defaults
+	// to K8sDefaultKeepalive). TimeoutMultiplier is the missed-keepalive
+	// count before an enrolled peer is reaped, nil when omitted (defaults to
+	// K8sDefaultTimeoutMultiplier); 0 disables reaping. The liveness window
+	// is derived (keepalive × multiplier), never set directly.
+	KeepaliveInterval string `json:"keepalive_interval,omitempty"`
+	TimeoutMultiplier *int   `json:"timeout_multiplier,omitempty"`
+	// MaxTTL is a raw time.ParseDuration string, empty when omitted.
+	// Validated as a positive duration at load time.
+	MaxTTL string `json:"max_ttl,omitempty"`
 }
 
 // K8sMatch is one identity → profile-binding rule. A Pod is matched on
@@ -54,11 +79,18 @@ type k8sEnrollmentBody struct {
 	// namespace + service_account identity to a profile allowlist. At
 	// least one is required.
 	Matches []k8sMatchBody `hcl:"match,block"`
-	// LivenessTimeout is the WireGuard-quiet grace window before an
-	// enrolled peer is reaped (time.ParseDuration). Optional; defaults to
-	// ~75s (3x the keepalive interval). Liveness is observed from the WG
-	// device (rx_bytes progress), not an app-level heartbeat.
-	LivenessTimeout string `hcl:"liveness_timeout,optional"`
+	// KeepaliveInterval is the WireGuard persistent-keepalive interval
+	// (time.ParseDuration) applied to enrolled peers in both directions and
+	// pushed to the sidecar at enroll. Optional; defaults to 25s, and must
+	// be at least 10s.
+	KeepaliveInterval string `hcl:"keepalive_interval,optional"`
+	// TimeoutMultiplier is how many missed keepalives elapse before an
+	// enrolled peer is reaped; the liveness window is keepalive_interval ×
+	// timeout_multiplier. Expressing it as a count keeps the safety ratio an
+	// integer that can't be misconfigured. Optional; defaults to 3. Set to 0
+	// to disable reaping (and the sidecar's self-heal escalation) entirely;
+	// any other value must be 2 or greater.
+	TimeoutMultiplier *int `hcl:"timeout_multiplier,optional"`
 	// MaxTTL is an optional hard lifetime for enrolled peers
 	// (time.ParseDuration). Parsed and stored; enforcement is future
 	// work. Validated as a positive duration when set.
@@ -141,9 +173,42 @@ func validateK8sEnrollment(decoded any, name string, ctx *BuildCtx) hcl.Diagnost
 		}
 	}
 
-	diags = append(diags, validateK8sEnrollmentDuration(ctx, name, "liveness_timeout", body.LivenessTimeout)...)
+	diags = append(diags, validateK8sKeepaliveInterval(ctx, name, body.KeepaliveInterval)...)
+	diags = append(diags, validateK8sTimeoutMultiplier(ctx, name, body.TimeoutMultiplier)...)
 	diags = append(diags, validateK8sEnrollmentDuration(ctx, name, "max_ttl", body.MaxTTL)...)
 	return diags
+}
+
+// validateK8sKeepaliveInterval accepts an empty string (attr omitted) or a
+// Go duration ≥ K8sMinKeepalive.
+func validateK8sKeepaliveInterval(ctx *BuildCtx, name, raw string) hcl.Diagnostics {
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d <= 0 {
+		return hcl.Diagnostics{k8sEnrollmentDiag(ctx, "Invalid enrollment keepalive_interval",
+			fmt.Sprintf("enrollment %q keepalive_interval = %q must be a positive Go duration string such as \"25s\".", name, raw))}
+	}
+	if d < K8sMinKeepalive {
+		return hcl.Diagnostics{k8sEnrollmentDiag(ctx, "Invalid enrollment keepalive_interval",
+			fmt.Sprintf("enrollment %q keepalive_interval = %q is below the %s minimum.", name, raw, K8sMinKeepalive))}
+	}
+	return nil
+}
+
+// validateK8sTimeoutMultiplier accepts nil (attr omitted), 0 (reaping
+// disabled), or an integer ≥ K8sMinTimeoutMultiplier. A multiplier of 1
+// would reap a peer after a single missed keepalive, so it is rejected.
+func validateK8sTimeoutMultiplier(ctx *BuildCtx, name string, m *int) hcl.Diagnostics {
+	if m == nil || *m == 0 {
+		return nil
+	}
+	if *m < K8sMinTimeoutMultiplier {
+		return hcl.Diagnostics{k8sEnrollmentDiag(ctx, "Invalid enrollment timeout_multiplier",
+			fmt.Sprintf("enrollment %q timeout_multiplier = %d must be 0 (disable reaping) or ≥ %d; a smaller value would reap a live peer after a single missed keepalive.", name, *m, K8sMinTimeoutMultiplier))}
+	}
+	return nil
 }
 
 // validateK8sEnrollmentDuration accepts an empty string (attr omitted)
@@ -163,9 +228,10 @@ func validateK8sEnrollmentDuration(ctx *BuildCtx, name, attr, raw string) hcl.Di
 func buildK8sEnrollment(decoded any, _ string, _ *BuildCtx) (any, hcl.Diagnostics) {
 	body := decoded.(*k8sEnrollmentBody)
 	out := &K8sEnrollment{
-		Audience:        body.Audience,
-		LivenessTimeout: body.LivenessTimeout,
-		MaxTTL:          body.MaxTTL,
+		Audience:          body.Audience,
+		KeepaliveInterval: body.KeepaliveInterval,
+		TimeoutMultiplier: body.TimeoutMultiplier,
+		MaxTTL:            body.MaxTTL,
 	}
 	for _, m := range body.Matches {
 		label := strings.TrimSpace(m.ProfileLabel)
@@ -194,8 +260,11 @@ func emitK8sEnrollment(body any, _ string, b *hclwrite.Body) {
 		}
 		mb.SetAttributeValue("profiles", StringListVal(m.Profiles))
 	}
-	if ke.LivenessTimeout != "" {
-		b.SetAttributeValue("liveness_timeout", cty.StringVal(ke.LivenessTimeout))
+	if ke.KeepaliveInterval != "" {
+		b.SetAttributeValue("keepalive_interval", cty.StringVal(ke.KeepaliveInterval))
+	}
+	if ke.TimeoutMultiplier != nil {
+		b.SetAttributeValue("timeout_multiplier", cty.NumberIntVal(int64(*ke.TimeoutMultiplier)))
 	}
 	if ke.MaxTTL != "" {
 		b.SetAttributeValue("max_ttl", cty.StringVal(ke.MaxTTL))

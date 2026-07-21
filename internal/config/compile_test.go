@@ -127,8 +127,9 @@ func TestEnrollmentConfigValidation(t *testing.T) {
     profiles        = ["default"]
   }
 
-  liveness_timeout = "2m"
-  max_ttl          = "24h"
+  keepalive_interval = "40s"
+  timeout_multiplier = 3
+  max_ttl            = "24h"
 }
 `
 	valid := `gateway {
@@ -160,8 +161,8 @@ profile "default" { credentials = [] }
 	if !ok {
 		t.Fatalf("enrollment body = %T, want *config.K8sEnrollment", ent.Body)
 	}
-	if ke.LivenessTimeout != "2m" || ke.MaxTTL != "24h" {
-		t.Fatalf("liveness/max = %q/%q, want 2m/24h", ke.LivenessTimeout, ke.MaxTTL)
+	if ke.KeepaliveInterval != "40s" || ke.TimeoutMultiplier == nil || *ke.TimeoutMultiplier != 3 || ke.MaxTTL != "24h" {
+		t.Fatalf("keepalive/multiplier/max = %q/%v/%q, want 40s/3/24h", ke.KeepaliveInterval, ke.TimeoutMultiplier, ke.MaxTTL)
 	}
 	if len(ke.Matches) != 1 || ke.Matches[0].ProfileLabel != "clawpatrol.dev/profile" {
 		t.Fatalf("unexpected matches: %+v", ke.Matches)
@@ -176,8 +177,11 @@ profile "default" { credentials = [] }
 	if enr == nil {
 		t.Fatalf("compiled enrollment %q missing", "agents")
 	}
-	if enr.LivenessTimeout != 2*time.Minute || enr.MaxTTL != 24*time.Hour {
-		t.Fatalf("compiled liveness/max = %s/%s, want 2m/24h", enr.LivenessTimeout, enr.MaxTTL)
+	// Liveness is derived: keepalive_interval × timeout_multiplier = 40s×3 = 2m.
+	if enr.KeepaliveInterval != 40*time.Second || enr.TimeoutMultiplier != 3 ||
+		enr.LivenessTimeout != 2*time.Minute || enr.MaxTTL != 24*time.Hour {
+		t.Fatalf("compiled keepalive/mult/liveness/max = %s/%d/%s/%s, want 40s/3/2m/24h",
+			enr.KeepaliveInterval, enr.TimeoutMultiplier, enr.LivenessTimeout, enr.MaxTTL)
 	}
 
 	dump, err := gw.Dump()
@@ -210,13 +214,18 @@ profile "default" { credentials = [] }
 			want: "Missing enrollment audience",
 		},
 		{
-			name: "bad liveness_timeout",
-			body: strings.Replace(valid, `liveness_timeout = "2m"`, `liveness_timeout = "-1s"`, 1),
-			want: "Invalid enrollment liveness_timeout",
+			name: "keepalive_interval below minimum",
+			body: strings.Replace(valid, `keepalive_interval = "40s"`, `keepalive_interval = "5s"`, 1),
+			want: "Invalid enrollment keepalive_interval",
+		},
+		{
+			name: "timeout_multiplier of 1 rejected",
+			body: strings.Replace(valid, `timeout_multiplier = 3`, `timeout_multiplier = 1`, 1),
+			want: "Invalid enrollment timeout_multiplier",
 		},
 		{
 			name: "bad max_ttl",
-			body: strings.Replace(valid, `max_ttl          = "24h"`, `max_ttl          = "nope"`, 1),
+			body: strings.Replace(valid, `max_ttl            = "24h"`, `max_ttl            = "nope"`, 1),
 			want: "Invalid enrollment max_ttl",
 		},
 		{
@@ -669,5 +678,84 @@ func TestCompileFullSpec(t *testing.T) {
 	}
 	if totalRules < 50 {
 		t.Errorf("expected ~50+ rule attachments, got %d", totalRules)
+	}
+}
+
+// TestEnrollmentLivenessDerivation covers the derived liveness window:
+// defaults when the knobs are omitted, and timeout_multiplier = 0 disabling
+// reaping (LivenessTimeout == 0).
+func TestEnrollmentLivenessDerivation(t *testing.T) {
+	base := func(knobs string) string {
+		return `gateway {
+  state_dir = "/opt/clawpatrol"
+  wireguard {
+    subnet_cidr = "10.55.0.0/24"
+    endpoint    = "clawpatrol-wg.clawpatrol.svc:51820"
+  }
+}
+
+enrollment "kubernetes_token_review" "agents" {
+  audience = "clawpatrol"
+  match {
+    namespace       = "agents"
+    service_account = "agent-runner"
+    profiles        = ["default"]
+  }
+` + knobs + `}
+
+profile "default" { credentials = [] }
+`
+	}
+
+	cases := []struct {
+		name           string
+		knobs          string
+		wantKeepalive  time.Duration
+		wantMultiplier int
+		wantLiveness   time.Duration
+	}{
+		{
+			name:           "defaults",
+			knobs:          "",
+			wantKeepalive:  config.K8sDefaultKeepalive,
+			wantMultiplier: config.K8sDefaultTimeoutMultiplier,
+			wantLiveness:   config.K8sDefaultKeepalive * config.K8sDefaultTimeoutMultiplier,
+		},
+		{
+			name:           "explicit",
+			knobs:          "  keepalive_interval = \"20s\"\n  timeout_multiplier = 5\n",
+			wantKeepalive:  20 * time.Second,
+			wantMultiplier: 5,
+			wantLiveness:   100 * time.Second,
+		},
+		{
+			name:           "disabled",
+			knobs:          "  timeout_multiplier = 0\n",
+			wantKeepalive:  config.K8sDefaultKeepalive,
+			wantMultiplier: 0,
+			wantLiveness:   0, // reaping disabled
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			gw, diags := config.LoadBytes([]byte(base(tc.knobs)), "k8s.hcl")
+			if diags.HasErrors() {
+				t.Fatalf("diagnostics: %v", diags)
+			}
+			cp, err := config.Compile(gw)
+			if err != nil {
+				t.Fatalf("compile: %v", err)
+			}
+			enr := cp.K8sEnrollmentsByName["agents"]
+			if enr == nil {
+				t.Fatal("compiled enrollment missing")
+			}
+			if enr.KeepaliveInterval != tc.wantKeepalive || enr.TimeoutMultiplier != tc.wantMultiplier || enr.LivenessTimeout != tc.wantLiveness {
+				t.Fatalf("keepalive/mult/liveness = %s/%d/%s, want %s/%d/%s",
+					enr.KeepaliveInterval, enr.TimeoutMultiplier, enr.LivenessTimeout,
+					tc.wantKeepalive, tc.wantMultiplier, tc.wantLiveness)
+			}
+		})
 	}
 }

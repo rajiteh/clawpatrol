@@ -14,8 +14,16 @@ type CompiledK8sEnrollment struct {
 	Type     string
 	Audience string
 	Matches  []CompiledK8sMatch
-	// LivenessTimeout is the parsed `liveness_timeout`, or 0 when the
-	// operator omitted it (the reaper applies its default in that case).
+	// KeepaliveInterval is the resolved WireGuard persistent-keepalive
+	// interval (default K8sDefaultKeepalive), applied to peers both
+	// directions and pushed to the sidecar at enroll.
+	KeepaliveInterval time.Duration
+	// TimeoutMultiplier is the resolved missed-keepalive count before reap
+	// (default K8sDefaultTimeoutMultiplier); 0 means reaping is disabled.
+	TimeoutMultiplier int
+	// LivenessTimeout is the derived reap window (KeepaliveInterval ×
+	// TimeoutMultiplier), or 0 when reaping is disabled (TimeoutMultiplier
+	// == 0). Never set directly by the operator.
 	LivenessTimeout time.Duration
 	// MaxTTL is the parsed `max_ttl`, or 0 when unset. Parsed and stored
 	// for a future hard-expiry enforcement pass; not enforced today.
@@ -48,20 +56,36 @@ func compileK8sEnrollments(cp *CompiledPolicy, p *Policy) error {
 		if !ok {
 			return fmt.Errorf("enrollment %q: unexpected body %T", name, ent.Body)
 		}
-		liveness, err := parseOptionalDuration(ke.LivenessTimeout)
+		keepalive, err := parseOptionalDuration(ke.KeepaliveInterval)
 		if err != nil {
-			return fmt.Errorf("enrollment %q liveness_timeout: %w", name, err)
+			return fmt.Errorf("enrollment %q keepalive_interval: %w", name, err)
+		}
+		if keepalive == 0 {
+			keepalive = K8sDefaultKeepalive
+		}
+		multiplier := K8sDefaultTimeoutMultiplier
+		if ke.TimeoutMultiplier != nil {
+			multiplier = *ke.TimeoutMultiplier
+		}
+		// Liveness is derived, never set: keepalive × multiplier. A zero
+		// multiplier disables reaping, so the window is 0 (the reaper skips
+		// peers whose window is non-positive).
+		var liveness time.Duration
+		if multiplier > 0 {
+			liveness = keepalive * time.Duration(multiplier)
 		}
 		maxTTL, err := parseOptionalDuration(ke.MaxTTL)
 		if err != nil {
 			return fmt.Errorf("enrollment %q max_ttl: %w", name, err)
 		}
 		compiled := &CompiledK8sEnrollment{
-			Name:            name,
-			Type:            ent.Plugin.Type,
-			Audience:        ke.Audience,
-			LivenessTimeout: liveness,
-			MaxTTL:          maxTTL,
+			Name:              name,
+			Type:              ent.Plugin.Type,
+			Audience:          ke.Audience,
+			KeepaliveInterval: keepalive,
+			TimeoutMultiplier: multiplier,
+			LivenessTimeout:   liveness,
+			MaxTTL:            maxTTL,
 		}
 		for _, m := range ke.Matches {
 			for _, prof := range m.Profiles {
