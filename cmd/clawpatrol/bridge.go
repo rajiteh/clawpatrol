@@ -45,6 +45,13 @@ type bridgeOptions struct {
 
 	Iface string
 	MTU   int
+
+	// LocalResetMisses is how many missed keepalives trigger an in-place
+	// tunnel rebuild before the (server-dictated) full-restart horizon. A
+	// client-side knob — the reap horizon comes from the gateway, but how
+	// eagerly to attempt a cheap local recovery first is the sidecar's call.
+	// Capped below the restart horizon; 0 disables the local rebuild.
+	LocalResetMisses int
 }
 
 // runBridge parses the `clawpatrol bridge` flags and dispatches to the
@@ -65,6 +72,8 @@ func runBridge(args []string) {
 	fs.StringVar(&opt.ReadyFile, "ready-file", "/clawpatrol/ready", "path to touch after network and env setup succeed")
 	fs.StringVar(&opt.Iface, "iface", "clawpatrol0", "TUN interface name")
 	fs.IntVar(&opt.MTU, "mtu", enrollmentDefaultMTU, "TUN MTU")
+	fs.IntVar(&opt.LocalResetMisses, "local-reset-missed", wgWatchdogResetMisses,
+		"missed keepalives before an in-place tunnel rebuild; 0 disables it, and a value at or above the gateway's restart threshold never fires (the restart happens instead)")
 	_ = fs.Parse(args)
 
 	if len(fs.Args()) > 0 {

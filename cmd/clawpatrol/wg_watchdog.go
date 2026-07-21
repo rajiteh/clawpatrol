@@ -42,6 +42,12 @@ const (
 	// wgWatchdogResetCooldown holds off back-to-back in-place rebuilds so a
 	// reset has time to take effect before the next one fires.
 	wgWatchdogResetCooldown = time.Minute
+	// wgWatchdogResetMisses is the default for the client-configurable
+	// local-reset threshold: how many missed keepalives trigger the cheap
+	// in-place rebuild before the (server-dictated) full restart. Independent
+	// of the timeout multiplier, so even a tolerant reap horizon still gets
+	// an early recovery attempt.
+	wgWatchdogResetMisses = 2
 )
 
 // wgPeerStats is the per-peer subset of IpcGet output the watchdog reads.
@@ -66,6 +72,19 @@ type wgWatchdogConfig struct {
 	rxResetAfter time.Duration
 	rxExitAfter  time.Duration
 	now          func() time.Time
+}
+
+// watchdogResetMisses resolves the client-configured local-reset threshold
+// (missed keepalives) against the server's restart horizon (mult), returning
+// the missed-keepalive count that should trigger the in-place rebuild, or 0
+// to disable it. 0 disables it explicitly; a value at or above mult also
+// disables it (the reset would never beat the full restart at the reap
+// horizon, so it is not scheduled). Otherwise the configured value is used.
+func watchdogResetMisses(configured, mult int) int {
+	if configured <= 0 || configured >= mult {
+		return 0
+	}
+	return configured
 }
 
 func runWGWatchdogLoop(ctx context.Context, c wgWatchdogConfig) {

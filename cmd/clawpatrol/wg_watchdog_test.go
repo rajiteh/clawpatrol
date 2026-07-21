@@ -212,3 +212,22 @@ func TestWatchdogRxLivenessDisabled(t *testing.T) {
 	cancel()
 	<-done
 }
+
+// TestWatchdogResetMisses checks the client-configured local-reset threshold
+// resolved against the server restart horizon: used as-is below the horizon,
+// disabled (0) at/above it or when non-positive.
+func TestWatchdogResetMisses(t *testing.T) {
+	for _, c := range []struct{ configured, mult, want int }{
+		{2, 3, 2},  // default: 2 missed → reset, 3 → restart
+		{2, 5, 2},  // large horizon still gets an early local reset at 2
+		{4, 10, 4}, // custom value honored below the horizon
+		{2, 2, 0},  // == horizon → never fires; restart handles it
+		{5, 3, 0},  // > horizon → clamped off
+		{0, 3, 0},  // explicitly disabled
+		{-1, 3, 0}, // guard non-positive
+	} {
+		if got := watchdogResetMisses(c.configured, c.mult); got != c.want {
+			t.Errorf("watchdogResetMisses(%d, %d) = %d, want %d", c.configured, c.mult, got, c.want)
+		}
+	}
+}

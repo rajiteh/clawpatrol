@@ -124,11 +124,14 @@ func bridgeRun(ctx context.Context, opt bridgeOptions) error {
 	keepalive := time.Duration(keepaliveSecs) * time.Second
 	var rxResetAfter, rxExitAfter time.Duration
 	if mult := registerResp.TimeoutMultiplier; mult >= 2 {
-		// Reset (local rebuild) one keepalive before the reap horizon; if rx
-		// is still quiet at the horizon the enrollment is gone, so exit and
-		// re-enroll. Positive jitter (≤ half a keepalive) never fires early
-		// and staggers a mass reap so sidecars don't all re-enroll at once.
-		rxResetAfter = keepalive * time.Duration(mult-1)
+		// Local rebuild after the client's configured missed-keepalive count
+		// (default 2, disabled at 0 or when it meets/exceeds the reap
+		// horizon); full restart at the reap horizon (mult missed). Positive
+		// jitter (≤ half a keepalive) never fires early and staggers a mass
+		// reap so sidecars don't all re-enroll at once.
+		if rm := watchdogResetMisses(opt.LocalResetMisses, mult); rm > 0 {
+			rxResetAfter = keepalive * time.Duration(rm)
+		}
 		jitter := time.Duration(rand.Int63n(int64(keepalive/2) + 1))
 		rxExitAfter = keepalive*time.Duration(mult) + jitter
 	}
