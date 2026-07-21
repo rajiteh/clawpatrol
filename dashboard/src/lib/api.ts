@@ -445,10 +445,35 @@ export type UpdateBanner = {
   advisory?: string;
 };
 
+// EnrolledPeer mirrors the backend enrolledPeerView bundled into
+// /api/state. Enrolled (self-registered) WireGuard peers are keyed by
+// their wg IP, same as an Agent — join on peer_ip === agent.ip. The
+// liveness window (keepalive_interval_seconds × reap_count) and the
+// missed-heartbeat count are derived in the UI; last_rx_at is when the
+// gateway last saw the peer's rx advance (its heartbeat).
+export type EnrolledPeer = {
+  peer_ip: string;
+  transport: string;
+  authorizer_type: string;
+  authorizer_name: string;
+  subject_key: string;
+  display_name: string;
+  owner: string;
+  profile: string;
+  public_key?: string;
+  metadata?: Record<string, string>;
+  created_at: string;
+  last_handshake?: string;
+  keepalive_interval_seconds?: number;
+  reap_count?: number;
+  last_rx_at?: string;
+};
+
 type StateResp = {
   whoami: Whoami;
   integrations: Integration[];
   agents: Agent[];
+  enrolled_peers?: EnrolledPeer[];
   update?: UpdateBanner | null;
   // Basename of the gateway config file (e.g. "gateway.hcl",
   // "dev.hcl"). Surfaced in UI hints so operators see the actual
