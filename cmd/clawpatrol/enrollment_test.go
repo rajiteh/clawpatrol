@@ -505,3 +505,49 @@ func TestApiEnrollmentDeleteWithEnrollment(t *testing.T) {
 		t.Fatal("device row should be forgotten after delete")
 	}
 }
+
+// TestRegisterEnrolledPeerKeepaliveGating verifies that symmetric keepalive
+// (and the watchdog passdown) is only enabled when the client requests it —
+// i.e. the clawpatrol bridge (Keepalive: true), not other enrollment clients.
+func TestRegisterEnrolledPeerKeepaliveGating(t *testing.T) {
+	g := newEnrollmentTestGateway(t)
+	startEnrollmentTestWGServer(t, g)
+	auth := fakeEnrollmentAuthorizer{typ: enrollmentAuthorizerKubernetesTokenRev, name: "agents"}
+	id := func(uid, name string) enrollmentIdentity {
+		return enrollmentIdentity{
+			SubjectKey:     "kubernetes:agents:" + uid,
+			ReplacementKey: "kubernetes:agents:" + name,
+			DisplayName:    "agents/" + name,
+			Owner:          "system:serviceaccount:agents:agent-runner",
+			Profile:        "default",
+		}
+	}
+
+	// Bridge: requests keepalive → gateway echoes the derived cadence (the
+	// package defaults, since the test policy sets no explicit knobs).
+	bridge, err := g.registerEnrolledPeer(context.Background(), enabledEnrollmentCfg(), auth,
+		id("uid-bridge", "bridge"), enrollmentRegisterRequest{
+			Transport: enrollmentTransportWireGuard, WireGuardPublicKey: keyA, Keepalive: true,
+		})
+	if err != nil {
+		t.Fatalf("bridge register: %v", err)
+	}
+	wantKA := int(config.K8sDefaultKeepalive.Seconds())
+	if bridge.KeepaliveIntervalSeconds != wantKA || bridge.TimeoutMultiplier != config.K8sDefaultTimeoutMultiplier {
+		t.Fatalf("bridge keepalive passdown = %ds/%d, want %ds/%d",
+			bridge.KeepaliveIntervalSeconds, bridge.TimeoutMultiplier, wantKA, config.K8sDefaultTimeoutMultiplier)
+	}
+
+	// Non-bridge: no request flag → no gateway keepalive, no passdown.
+	other, err := g.registerEnrolledPeer(context.Background(), enabledEnrollmentCfg(), auth,
+		id("uid-other", "other"), enrollmentRegisterRequest{
+			Transport: enrollmentTransportWireGuard, WireGuardPublicKey: keyB,
+		})
+	if err != nil {
+		t.Fatalf("non-bridge register: %v", err)
+	}
+	if other.KeepaliveIntervalSeconds != 0 || other.TimeoutMultiplier != 0 {
+		t.Fatalf("non-bridge keepalive passdown = %ds/%d, want 0/0",
+			other.KeepaliveIntervalSeconds, other.TimeoutMultiplier)
+	}
+}

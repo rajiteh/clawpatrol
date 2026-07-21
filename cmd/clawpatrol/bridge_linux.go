@@ -56,6 +56,10 @@ func bridgeRun(ctx context.Context, opt bridgeOptions) error {
 		Authorizer:         opt.AuthorizerName,
 		WireGuardPublicKey: clientPubB64,
 		Claims:             claims,
+		// The bridge hosts a resident tunnel and runs the liveness watchdog,
+		// so it needs the gateway to keepalive back (symmetric) for its
+		// rx-based self-heal to work.
+		Keepalive: true,
 	})
 	if err != nil {
 		return err

@@ -47,6 +47,11 @@ type enrollmentRegisterRequest struct {
 	Authorizer         string          `json:"authorizer"`
 	WireGuardPublicKey string          `json:"wireguard_public_key,omitempty"`
 	Claims             json.RawMessage `json:"claims,omitempty"`
+	// Keepalive is set by resident tunnel hosts (clawpatrol bridge) that run
+	// a liveness watchdog, to request symmetric gateway→peer keepalive. Other
+	// enrollment clients leave it false and get no gateway-initiated
+	// keepalive (nothing on their end consumes it).
+	Keepalive bool `json:"keepalive,omitempty"`
 }
 
 type enrollmentRegisterResponse struct {
@@ -350,11 +355,17 @@ func (g *Gateway) registerEnrolledPeer(ctx context.Context, cfg *config.Gateway,
 			return enrollmentRegisterResponse{}, err
 		}
 	}
-	// Resolve the keepalive/liveness knobs for this authorizer. The gateway
-	// keepalives toward the peer at this interval (symmetric with the
-	// client) and echoes both values back so the sidecar's watchdog uses the
-	// same cadence and reap horizon the gateway enforces.
-	keepalive, multiplier := enrollmentKeepaliveConfig(g.Policy(), authorizer.Name())
+	// Symmetric keepalive is only for resident tunnel hosts (clawpatrol
+	// bridge) that run a liveness watchdog and request it. When requested,
+	// the gateway keepalives toward the peer at the authorizer's interval and
+	// echoes the cadence + reap horizon back so the sidecar's watchdog stays
+	// in sync. Other enrollment clients get neither (keepalive stays 0, so
+	// AddPeer installs no gateway-initiated keepalive).
+	var keepalive time.Duration
+	var multiplier int
+	if req.Keepalive {
+		keepalive, multiplier = enrollmentKeepaliveConfig(g.Policy(), authorizer.Name())
+	}
 	if err := globalWG.AddPeer(pubHex, peerIP, keepalive); err != nil {
 		return enrollmentRegisterResponse{}, fmt.Errorf("wg add peer: %w", err)
 	}
