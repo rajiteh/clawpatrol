@@ -33,7 +33,14 @@ const (
 	enrollmentTransportWireGuard           = "wireguard"
 	enrollmentAuthorizerKubernetesTokenRev = "kubernetes_token_review"
 	enrollmentDefaultMTU                   = 1420
-	enrollmentReaperInterval               = 20 * time.Second
+	// enrollmentReaperInterval is how often the reaper wakes to sample each
+	// enrolled peer's WireGuard rx and revoke peers past their liveness
+	// window. It doubles as the liveness-sample cadence: the sampled
+	// lastProgress is what the dashboard reads, so this is kept close to the
+	// dashboard poll interval rather than a coarse reap-only tick. The reap
+	// decision is window-based, so sampling more often only shortens
+	// detection latency.
+	enrollmentReaperInterval = 5 * time.Second
 	// enrollmentDefaultLiveness is the fallback WireGuard-quiet grace
 	// window used only when a peer's authorizer can no longer be resolved
 	// (e.g. removed from the policy on reload) — orphaned peers still get
@@ -251,15 +258,13 @@ func (g *Gateway) listEnrolledPeerViews() ([]enrolledPeerView, error) {
 		stats = globalWG.PeerStats()
 	}
 	policy := g.Policy()
-	now := time.Now()
 
-	// Refresh the rx-progress trackers off the same snapshot the reaper
-	// uses, so the dashboard's "last heartbeat" stays fresh at the poll
-	// rate instead of lagging the reaper's coarser interval. Read the
-	// resulting lastProgress back out under the lock.
+	// Read-only snapshot of the reaper-maintained liveness trackers. The
+	// reaper is the sole writer of enrollLive (sampled on its own loop); we
+	// only copy lastProgress out, so the critical section is a handful of
+	// map lookups with no I/O held under the lock.
 	live := make(map[string]time.Time, len(peers))
 	g.enrollmentMu.Lock()
-	g.observeEnrollmentLivenessLocked(peers, stats, now)
 	for _, p := range peers {
 		if l, ok := g.enrollLive[p.PubKeyHex]; ok {
 			live[p.PubKeyHex] = l.lastProgress
@@ -650,46 +655,26 @@ func (g *Gateway) reapStaleEnrolledPeers(_ context.Context) {
 		return
 	}
 	policy := g.Policy()
+	// Both reads are kept OUT of the critical section: PeerStats does a
+	// wireguard-go UAPI dump and listEnrolledPeers is a DB query, neither
+	// of which should be held under enrollmentMu.
 	stats := globalWG.PeerStats()
-
-	g.enrollmentMu.Lock()
-	defer g.enrollmentMu.Unlock()
 	peers, err := g.listEnrolledPeers()
 	if err != nil {
 		return
 	}
 	now := time.Now()
-	g.observeEnrollmentLivenessLocked(peers, stats, now)
-	var stale []string
-	for _, p := range peers {
-		live, tracked := g.enrollLive[p.PubKeyHex]
-		if !tracked {
-			continue
-		}
-		// A non-positive window means reaping is disabled for this
-		// authorizer (keepalive_reap_count = 0) — never reap.
-		if to := enrollmentLivenessTimeout(policy, p.AuthorizerName); to > 0 && now.Sub(live.lastProgress) > to {
-			stale = append(stale, p.PeerIP)
-		}
-	}
-	for _, ip := range stale {
-		g.cleanupEnrolledPeerLocked(context.Background(), ip)
-	}
-}
 
-// observeEnrollmentLivenessLocked refreshes the per-peer rx-progress trackers
-// from a fresh PeerStats snapshot: it seeds newly seen peers with a full grace
-// window (lastProgress = now), advances lastProgress whenever a peer's rx has
-// moved since the last observation, and drops trackers for peers that no
-// longer exist. Caller holds enrollmentMu. Shared by the reaper (which then
-// tests each peer against its liveness window) and the dashboard view builder
-// (which reads lastProgress back out), so a peer's "last heartbeat" reflects
-// the most recent observation from either caller rather than only the reaper's
-// coarser tick.
-func (g *Gateway) observeEnrollmentLivenessLocked(peers []enrolledPeer, stats map[string]wgDevPeerStat, now time.Time) {
+	g.enrollmentMu.Lock()
+	defer g.enrollmentMu.Unlock()
 	if g.enrollLive == nil {
 		g.enrollLive = map[string]enrollmentLiveness{}
 	}
+	// Observe rx progress: seed newly seen peers with a full grace window
+	// (lastProgress = now), advance lastProgress whenever a peer's rx has
+	// moved since the last sample, and drop trackers for peers that are
+	// gone. This sampled lastProgress is also what the dashboard reads, so
+	// this loop is the single writer of enrollLive.
 	seen := make(map[string]bool, len(peers))
 	for _, p := range peers {
 		seen[p.PubKeyHex] = true
@@ -706,11 +691,23 @@ func (g *Gateway) observeEnrollmentLivenessLocked(peers []enrolledPeer, stats ma
 			g.enrollLive[p.PubKeyHex] = enrollmentLiveness{lastRx: st.rxBytes, lastProgress: now}
 		}
 	}
-	// Drop trackers for peers that no longer exist.
 	for pub := range g.enrollLive {
 		if !seen[pub] {
 			delete(g.enrollLive, pub)
 		}
+	}
+	// Reap peers whose rx has been quiet past their liveness window.
+	var stale []string
+	for _, p := range peers {
+		live := g.enrollLive[p.PubKeyHex]
+		// A non-positive window means reaping is disabled for this
+		// authorizer (keepalive_reap_count = 0) — never reap.
+		if to := enrollmentLivenessTimeout(policy, p.AuthorizerName); to > 0 && now.Sub(live.lastProgress) > to {
+			stale = append(stale, p.PeerIP)
+		}
+	}
+	for _, ip := range stale {
+		g.cleanupEnrolledPeerLocked(context.Background(), ip)
 	}
 }
 
