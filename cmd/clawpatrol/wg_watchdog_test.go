@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -11,19 +10,7 @@ import (
 )
 
 func TestParsePeerStats(t *testing.T) {
-	uapi := strings.Join([]string{
-		"private_key=abcd",
-		"listen_port=51820",
-		"public_key=deadbeef",
-		"endpoint=10.0.0.1:51820",
-		"last_handshake_time_sec=1700000000",
-		"last_handshake_time_nsec=123456789",
-		"tx_bytes=4096",
-		"rx_bytes=8192",
-		"persistent_keepalive_interval=25",
-		"allowed_ip=0.0.0.0/0",
-		"",
-	}, "\n")
+	uapi := "last_handshake_time_sec=1700000000\nlast_handshake_time_nsec=123456789\ntx_bytes=4096\nrx_bytes=8192\npersistent_keepalive_interval=25\n"
 	got := parsePeerStats(uapi)
 	if got == nil {
 		t.Fatal("parsePeerStats returned nil")
@@ -32,20 +19,15 @@ func TestParsePeerStats(t *testing.T) {
 	if !got.lastHandshake.Equal(wantHS) {
 		t.Errorf("lastHandshake = %v, want %v", got.lastHandshake, wantHS)
 	}
-	if got.txBytes != 4096 {
-		t.Errorf("txBytes = %d, want 4096", got.txBytes)
-	}
 	if got.rxBytes != 8192 {
 		t.Errorf("rxBytes = %d, want 8192", got.rxBytes)
 	}
 }
 
 func TestParsePeerStatsNoHandshake(t *testing.T) {
-	// last_handshake_time_sec=0 / _nsec=0 means "never" — wireguard-go
-	// uses zero for unset, and on the cold path we don't want to
-	// interpret that as a 1970 timestamp.
-	uapi := "last_handshake_time_sec=0\nlast_handshake_time_nsec=0\ntx_bytes=0\n"
-	got := parsePeerStats(uapi)
+	// last_handshake_time_sec=0 / _nsec=0 means "never" — don't interpret
+	// that as a 1970 timestamp.
+	got := parsePeerStats("last_handshake_time_sec=0\nlast_handshake_time_nsec=0\nrx_bytes=0\n")
 	if got == nil {
 		t.Fatal("parsePeerStats returned nil")
 	}
@@ -54,9 +36,8 @@ func TestParsePeerStatsNoHandshake(t *testing.T) {
 	}
 }
 
-// loggerWithLines returns a device.Logger that captures Errorf lines
-// into the returned slice pointer. Used to assert log behavior without
-// pulling in os.Stdout.
+// loggerWithLines returns a device.Logger that captures Errorf format
+// strings, so tests can assert log behavior without touching os.Stdout.
 func loggerWithLines() (*device.Logger, *[]string) {
 	var lines []string
 	l := &device.Logger{
@@ -68,233 +49,14 @@ func loggerWithLines() (*device.Logger, *[]string) {
 	return l, &lines
 }
 
-func TestWrapWGLoggerSignalsForceReset(t *testing.T) {
-	base, lines := loggerWithLines()
-	ch := make(chan struct{}, 1)
-	w := wrapWGLogger(base, ch)
-	w.Errorf("peer(x) - Failed to derive keypair: %s", "invalid state for keypair derivation: handshakeInitiationCreated")
-	w.Errorf("unrelated noise")
-	select {
-	case <-ch:
-	default:
-		t.Fatal("expected forceReset signal")
-	}
-	// Subsequent "Failed to derive keypair" should not block on a full
-	// channel — the watchdog coalesces signals.
-	w.Errorf("peer(x) - Failed to derive keypair: blah")
-	if len(*lines) != 3 {
-		t.Errorf("got %d lines, want 3", len(*lines))
-	}
-}
-
-func TestWrapWGLoggerNilBase(t *testing.T) {
-	// A nil base must not panic — defensive guard for the call sites
-	// that forget to construct a logger.
-	ch := make(chan struct{}, 1)
-	w := wrapWGLogger(nil, ch)
-	w.Errorf("peer(x) - Failed to derive keypair: nope")
-	select {
-	case <-ch:
-	default:
-		t.Fatal("expected forceReset signal")
-	}
-}
-
-// fakeClock advances synthetic time so the watchdog loop can be tested
-// in microseconds.
+// fakeClock advances synthetic time so the watchdog loop can be driven in
+// microseconds.
 type fakeClock struct {
 	now atomic.Int64 // unix nanos
 }
 
-func (c *fakeClock) Now() time.Time {
-	return time.Unix(0, c.now.Load())
-}
-
-func (c *fakeClock) Set(t time.Time) {
-	c.now.Store(t.UnixNano())
-}
-
-func TestWatchdogResetsWhenHandshakeStale(t *testing.T) {
-	clk := &fakeClock{}
-	clk.Set(time.Unix(2_000_000, 0))
-
-	tick := make(chan time.Time, 4)
-	forceReset := make(chan struct{}, 1)
-
-	stale := time.Unix(2_000_000-300, 0) // 5min ago, well past stuckTimeout
-	var statsHandshake atomic.Value
-	statsHandshake.Store(stale)
-	var statsTx atomic.Uint64
-	statsTx.Store(100)
-
-	stats := func() *wgPeerStats {
-		return &wgPeerStats{
-			lastHandshake: statsHandshake.Load().(time.Time),
-			txBytes:       statsTx.Load(),
-		}
-	}
-
-	resetCalls := make(chan struct{}, 8)
-	reset := func() error {
-		resetCalls <- struct{}{}
-		// Simulate a successful reset: handshake refreshed to now.
-		statsHandshake.Store(clk.Now())
-		return nil
-	}
-
-	log, _ := loggerWithLines()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	done := make(chan struct{})
-	go func() {
-		runWGWatchdogLoop(ctx, wgWatchdogConfig{
-			stats:         stats,
-			reset:         reset,
-			log:           log,
-			forceReset:    forceReset,
-			tick:          tick,
-			stuckTimeout:  3 * time.Minute,
-			resetCooldown: time.Minute,
-			now:           clk.Now,
-		})
-		close(done)
-	}()
-
-	// First tick: stale handshake + tx growing → reset.
-	statsTx.Store(200)
-	tick <- clk.Now()
-
-	select {
-	case <-resetCalls:
-	case <-time.After(time.Second):
-		t.Fatal("watchdog did not call reset for stale handshake")
-	}
-
-	// Second tick during cooldown should not reset again.
-	clk.Set(clk.Now().Add(10 * time.Second))
-	// Make it stale again to be sure the only thing stopping a reset
-	// is the cooldown, not "fresh handshake".
-	statsHandshake.Store(time.Unix(0, 0).Add(-time.Hour)) // ancient
-	statsTx.Store(300)
-	tick <- clk.Now()
-	select {
-	case <-resetCalls:
-		t.Fatal("watchdog reset during cooldown window")
-	case <-time.After(50 * time.Millisecond):
-	}
-
-	// Advance past cooldown — next tick should reset again.
-	clk.Set(clk.Now().Add(2 * time.Minute))
-	statsTx.Store(400)
-	tick <- clk.Now()
-	select {
-	case <-resetCalls:
-	case <-time.After(time.Second):
-		t.Fatal("watchdog did not reset after cooldown expired")
-	}
-
-	cancel()
-	<-done
-}
-
-func TestWatchdogResetsOnForceSignal(t *testing.T) {
-	clk := &fakeClock{}
-	clk.Set(time.Unix(2_000_000, 0))
-
-	tick := make(chan time.Time, 4)
-	forceReset := make(chan struct{}, 1)
-
-	// Handshake is fresh — only forceReset should cause a reset.
-	stats := func() *wgPeerStats {
-		return &wgPeerStats{
-			lastHandshake: clk.Now(),
-			txBytes:       100,
-		}
-	}
-
-	resetCalls := make(chan struct{}, 8)
-	reset := func() error {
-		resetCalls <- struct{}{}
-		return nil
-	}
-
-	log, _ := loggerWithLines()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	done := make(chan struct{})
-	go func() {
-		runWGWatchdogLoop(ctx, wgWatchdogConfig{
-			stats:         stats,
-			reset:         reset,
-			log:           log,
-			forceReset:    forceReset,
-			tick:          tick,
-			stuckTimeout:  3 * time.Minute,
-			resetCooldown: time.Minute,
-			now:           clk.Now,
-		})
-		close(done)
-	}()
-
-	forceReset <- struct{}{}
-	select {
-	case <-resetCalls:
-	case <-time.After(time.Second):
-		t.Fatal("watchdog did not reset on force signal")
-	}
-	cancel()
-	<-done
-}
-
-func TestWatchdogWaitsForInitialHandshake(t *testing.T) {
-	clk := &fakeClock{}
-	clk.Set(time.Unix(2_000_000, 0))
-
-	tick := make(chan time.Time, 4)
-	forceReset := make(chan struct{}, 1)
-
-	// Simulate "no handshake yet" by returning lastHandshake.IsZero().
-	stats := func() *wgPeerStats {
-		return &wgPeerStats{
-			lastHandshake: time.Time{},
-			txBytes:       100,
-		}
-	}
-
-	resetCalls := make(chan struct{}, 8)
-	reset := func() error {
-		resetCalls <- struct{}{}
-		return nil
-	}
-
-	log, _ := loggerWithLines()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	done := make(chan struct{})
-	go func() {
-		runWGWatchdogLoop(ctx, wgWatchdogConfig{
-			stats:         stats,
-			reset:         reset,
-			log:           log,
-			forceReset:    forceReset,
-			tick:          tick,
-			stuckTimeout:  3 * time.Minute,
-			resetCooldown: time.Minute,
-			now:           clk.Now,
-		})
-		close(done)
-	}()
-
-	tick <- clk.Now()
-	tick <- clk.Now()
-	select {
-	case <-resetCalls:
-		t.Fatal("watchdog reset before any handshake completed")
-	case <-time.After(80 * time.Millisecond):
-	}
-	cancel()
-	<-done
-}
+func (c *fakeClock) Now() time.Time  { return time.Unix(0, c.now.Load()) }
+func (c *fakeClock) Set(t time.Time) { c.now.Store(t.UnixNano()) }
 
 // TestWatchdogRxLivenessEscalates drives the enrolled-peer path: a flat
 // rx_bytes (gateway stopped responding) first triggers a local reset at
@@ -305,14 +67,10 @@ func TestWatchdogRxLivenessEscalates(t *testing.T) {
 	clk.Set(t0)
 
 	tick := make(chan time.Time, 4)
-	forceReset := make(chan struct{}, 1)
-
-	// Handshake completed at t0 and stays well within stuckTimeout, so the
-	// handshake-wedge path never fires — rx is the only trigger. rx is flat.
+	// Handshake completed at t0 (unblocks the first-handshake gate); rx flat.
 	stats := func() *wgPeerStats {
-		return &wgPeerStats{lastHandshake: t0, txBytes: 500, rxBytes: 1000}
+		return &wgPeerStats{lastHandshake: t0, rxBytes: 1000}
 	}
-
 	resetCalls := make(chan struct{}, 8)
 	reset := func() error { resetCalls <- struct{}{}; return nil }
 	exitCalls := make(chan struct{}, 1)
@@ -329,10 +87,9 @@ func TestWatchdogRxLivenessEscalates(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		runWGWatchdogLoop(ctx, wgWatchdogConfig{
-			stats: stats, reset: reset, log: log, forceReset: forceReset,
-			tick: tick, stuckTimeout: 3 * time.Minute, resetCooldown: time.Minute,
-			now: clk.Now, rxResetAfter: 50 * time.Second, rxExitAfter: 75 * time.Second,
-			exit: exit,
+			stats: stats, reset: reset, exit: exit, log: log, tick: tick,
+			resetCooldown: time.Minute, rxResetAfter: 50 * time.Second,
+			rxExitAfter: 75 * time.Second, now: clk.Now,
 		})
 		close(done)
 	}()
@@ -347,7 +104,7 @@ func TestWatchdogRxLivenessEscalates(t *testing.T) {
 	case <-time.After(50 * time.Millisecond):
 	}
 
-	// Advance past rxResetAfter (60s > 50s) with rx still flat → reset.
+	// Past rxResetAfter (60s > 50s), rx still flat → local reset.
 	clk.Set(t0.Add(60 * time.Second))
 	tick <- clk.Now()
 	select {
@@ -356,7 +113,7 @@ func TestWatchdogRxLivenessEscalates(t *testing.T) {
 		t.Fatal("watchdog did not reset at rxResetAfter")
 	}
 
-	// Advance past rxExitAfter (80s > 75s), rx still flat → hard exit.
+	// Past rxExitAfter (80s > 75s), rx still flat → hard exit.
 	clk.Set(t0.Add(80 * time.Second))
 	tick <- clk.Now()
 	select {
@@ -367,20 +124,17 @@ func TestWatchdogRxLivenessEscalates(t *testing.T) {
 	<-done // loop returns after exit()
 }
 
-// TestWatchdogRxLivenessDisabled confirms a flat rx never resets or exits
-// when the escalation thresholds are zero (run daemon / timeout_multiplier=0).
-func TestWatchdogRxLivenessDisabled(t *testing.T) {
+// TestWatchdogWaitsForFirstHandshake confirms the loop never escalates
+// before a handshake has completed, even with rx flat and thresholds set —
+// a tunnel that never came up is a setup problem, not a reap.
+func TestWatchdogWaitsForFirstHandshake(t *testing.T) {
 	clk := &fakeClock{}
-	t0 := time.Unix(4_000_000, 0)
+	t0 := time.Unix(5_000_000, 0)
 	clk.Set(t0)
 
 	tick := make(chan time.Time, 4)
-	forceReset := make(chan struct{}, 1)
-	// Keep the handshake fresh (relative to the current clock) so the
-	// handshake-wedge path stays quiet and this test isolates the rx path,
-	// which is disabled here (rxResetAfter/rxExitAfter zero).
 	stats := func() *wgPeerStats {
-		return &wgPeerStats{lastHandshake: clk.Now(), txBytes: 500, rxBytes: 1000}
+		return &wgPeerStats{lastHandshake: time.Time{}, rxBytes: 0} // no handshake yet
 	}
 	resetCalls := make(chan struct{}, 8)
 	reset := func() error { resetCalls <- struct{}{}; return nil }
@@ -393,16 +147,59 @@ func TestWatchdogRxLivenessDisabled(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		runWGWatchdogLoop(ctx, wgWatchdogConfig{
-			stats: stats, reset: reset, log: log, forceReset: forceReset,
-			tick: tick, stuckTimeout: 3 * time.Minute, resetCooldown: time.Minute,
-			now:  clk.Now, // rxResetAfter/rxExitAfter zero → inert
-			exit: exit,
+			stats: stats, reset: reset, exit: exit, log: log, tick: tick,
+			resetCooldown: time.Minute, rxResetAfter: 50 * time.Second,
+			rxExitAfter: 75 * time.Second, now: clk.Now,
 		})
 		close(done)
 	}()
 
 	tick <- clk.Now()
-	clk.Set(t0.Add(10 * time.Minute)) // long flat rx
+	clk.Set(t0.Add(10 * time.Minute))
+	tick <- clk.Now()
+	select {
+	case <-resetCalls:
+		t.Fatal("reset before any handshake completed")
+	case <-time.After(80 * time.Millisecond):
+	}
+	if exited {
+		t.Fatal("exit before any handshake completed")
+	}
+	cancel()
+	<-done
+}
+
+// TestWatchdogRxLivenessDisabled confirms a flat rx never resets or exits
+// when the thresholds are zero (a client without symmetric keepalive).
+func TestWatchdogRxLivenessDisabled(t *testing.T) {
+	clk := &fakeClock{}
+	t0 := time.Unix(4_000_000, 0)
+	clk.Set(t0)
+
+	tick := make(chan time.Time, 4)
+	// Fresh handshake so the first-handshake gate passes; rx flat.
+	stats := func() *wgPeerStats {
+		return &wgPeerStats{lastHandshake: clk.Now(), rxBytes: 1000}
+	}
+	resetCalls := make(chan struct{}, 8)
+	reset := func() error { resetCalls <- struct{}{}; return nil }
+	exited := false
+	exit := func() { exited = true }
+
+	log, _ := loggerWithLines()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		runWGWatchdogLoop(ctx, wgWatchdogConfig{
+			stats: stats, reset: reset, exit: exit, log: log, tick: tick,
+			resetCooldown: time.Minute, now: clk.Now, // rxResetAfter/rxExitAfter zero → inert
+		})
+		close(done)
+	}()
+
+	tick <- clk.Now()
+	clk.Set(t0.Add(10 * time.Minute))
 	tick <- clk.Now()
 	select {
 	case <-resetCalls:

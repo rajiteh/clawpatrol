@@ -106,11 +106,7 @@ func bridgeRun(ctx context.Context, opt bridgeOptions) error {
 	if err != nil {
 		return fmt.Errorf("tun name: %w", err)
 	}
-	forceReset := make(chan struct{}, 1)
-	logger := wrapWGLogger(
-		device.NewLogger(device.LogLevelError, "[clawpatrol tun wg] "),
-		forceReset,
-	)
+	logger := device.NewLogger(device.LogLevelError, "[clawpatrol tun wg] ")
 	dev := device.NewDevice(tunDev, conn.NewDefaultBind(), logger)
 	defer dev.Close()
 
@@ -170,9 +166,7 @@ func bridgeRun(ctx context.Context, opt bridgeOptions) error {
 			},
 			reset:         func() error { return dev.IpcSet(ipc) },
 			log:           logger,
-			forceReset:    forceReset,
 			tick:          watchdogTicker.C,
-			stuckTimeout:  wgWatchdogStuckTimeout,
 			resetCooldown: wgWatchdogResetCooldown,
 			now:           time.Now,
 			rxResetAfter:  rxResetAfter,
