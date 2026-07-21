@@ -33,7 +33,14 @@ const (
 	enrollmentTransportWireGuard           = "wireguard"
 	enrollmentAuthorizerKubernetesTokenRev = "kubernetes_token_review"
 	enrollmentDefaultMTU                   = 1420
-	enrollmentReaperInterval               = 20 * time.Second
+	// enrollmentReaperInterval is how often the reaper wakes to sample each
+	// enrolled peer's WireGuard rx and revoke peers past their liveness
+	// window. The sampled lastProgress also backs the dashboard's "last
+	// heartbeat", but the dashboard tolerates this coarse cadence: keepalive
+	// is clamped to a 10s minimum and this interval is 2× that, so a healthy
+	// peer's observed miss count never exceeds 1 — which is why the UI only
+	// flags "stale" at the 2nd missed beat.
+	enrollmentReaperInterval = 20 * time.Second
 	// enrollmentDefaultLiveness is the fallback WireGuard-quiet grace
 	// window used only when a peer's authorizer can no longer be resolved
 	// (e.g. removed from the policy on reload) — orphaned peers still get
@@ -130,6 +137,17 @@ type enrolledPeerView struct {
 	Metadata       map[string]string `json:"metadata,omitempty"`
 	CreatedAt      string            `json:"created_at"`
 	LastHandshake  string            `json:"last_handshake,omitempty"`
+
+	// Liveness surface for the dashboard. KeepaliveInterval and ReapCount
+	// are the authorizer's config; the liveness window (their product) and
+	// the "N missed" count are derived in the UI. LastRxAt is when the
+	// reaper last saw this peer's WireGuard rx advance — the real heartbeat
+	// signal — and is the one runtime value the client can't compute on its
+	// own. A peer that misses the whole window is reaped and drops out of
+	// this list entirely.
+	KeepaliveIntervalSeconds int    `json:"keepalive_interval_seconds,omitempty"`
+	ReapCount                int    `json:"reap_count,omitempty"`
+	LastRxAt                 string `json:"last_rx_at,omitempty"`
 }
 
 var errEnrollmentConflict = errors.New("enrollment conflict")
@@ -239,19 +257,40 @@ func (g *Gateway) listEnrolledPeerViews() ([]enrolledPeerView, error) {
 	if globalWG != nil {
 		stats = globalWG.PeerStats()
 	}
+	policy := g.Policy()
+
+	// Read-only snapshot of the reaper-maintained liveness trackers. The
+	// reaper is the sole writer of enrollLive (sampled on its own loop); we
+	// only copy lastProgress out, so the critical section is a handful of
+	// map lookups with no I/O held under the lock.
+	live := make(map[string]time.Time, len(peers))
+	g.enrollmentMu.Lock()
+	for _, p := range peers {
+		if l, ok := g.enrollLive[p.PubKeyHex]; ok {
+			live[p.PubKeyHex] = l.lastProgress
+		}
+	}
+	g.enrollmentMu.Unlock()
+
 	views := make([]enrolledPeerView, 0, len(peers))
 	for _, p := range peers {
+		keepalive, reapCount := enrollmentKeepaliveConfig(policy, p.AuthorizerName)
 		v := enrolledPeerView{
-			PeerIP:         p.PeerIP,
-			Transport:      enrollmentTransportWireGuard,
-			AuthorizerType: p.AuthorizerType,
-			AuthorizerName: p.AuthorizerName,
-			SubjectKey:     p.SubjectKey,
-			DisplayName:    p.DisplayName,
-			Owner:          p.Owner,
-			Profile:        p.Profile,
-			PublicKey:      p.PubKeyHex,
-			CreatedAt:      time.Unix(0, p.AddedNS).UTC().Format(time.RFC3339Nano),
+			PeerIP:                   p.PeerIP,
+			Transport:                enrollmentTransportWireGuard,
+			AuthorizerType:           p.AuthorizerType,
+			AuthorizerName:           p.AuthorizerName,
+			SubjectKey:               p.SubjectKey,
+			DisplayName:              p.DisplayName,
+			Owner:                    p.Owner,
+			Profile:                  p.Profile,
+			PublicKey:                p.PubKeyHex,
+			CreatedAt:                time.Unix(0, p.AddedNS).UTC().Format(time.RFC3339Nano),
+			KeepaliveIntervalSeconds: int(keepalive.Seconds()),
+			ReapCount:                reapCount,
+		}
+		if lp, ok := live[p.PubKeyHex]; ok && !lp.IsZero() {
+			v.LastRxAt = lp.UTC().Format(time.RFC3339Nano)
 		}
 		if p.MetadataJSON != "" && p.MetadataJSON != "{}" {
 			_ = json.Unmarshal([]byte(p.MetadataJSON), &v.Metadata)
@@ -616,20 +655,36 @@ func (g *Gateway) reapStaleEnrolledPeers(_ context.Context) {
 		return
 	}
 	policy := g.Policy()
+	// PeerStats (a wireguard-go UAPI dump) is identity-independent liveness
+	// data, so reading a slightly stale snapshot outside the lock is safe —
+	// at worst it delays a reap by one tick, and a peer that's new since the
+	// snapshot is seeded fresh below rather than mis-reaped.
 	stats := globalWG.PeerStats()
 
 	g.enrollmentMu.Lock()
 	defer g.enrollmentMu.Unlock()
+	// The peer list is read INSIDE the lock on purpose. registerEnrolledPeer
+	// runs under this same lock and, on a same-subject re-enroll (self-heal),
+	// reuses the peer's IP while swapping its key; the reap path below
+	// revokes by IP (RevokePeerByIP). Reading the list, deciding staleness,
+	// and revoking must therefore be atomic against a concurrent re-enroll —
+	// otherwise the reaper could act on a stale snapshot and revoke a peer
+	// that was just re-enrolled at the same IP with a fresh key. It's a small
+	// indexed SELECT; correctness beats the microseconds saved.
 	peers, err := g.listEnrolledPeers()
 	if err != nil {
 		return
 	}
+	now := time.Now()
 	if g.enrollLive == nil {
 		g.enrollLive = map[string]enrollmentLiveness{}
 	}
-	now := time.Now()
+	// Observe rx progress: seed newly seen peers with a full grace window
+	// (lastProgress = now), advance lastProgress whenever a peer's rx has
+	// moved since the last sample, and drop trackers for peers that are
+	// gone. This sampled lastProgress is also what the dashboard reads, so
+	// this loop is the single writer of enrollLive.
 	seen := make(map[string]bool, len(peers))
-	var stale []string
 	for _, p := range peers {
 		seen[p.PubKeyHex] = true
 		st, ok := stats[p.PubKeyHex]
@@ -643,18 +698,21 @@ func (g *Gateway) reapStaleEnrolledPeers(_ context.Context) {
 			g.enrollLive[p.PubKeyHex] = enrollmentLiveness{lastRx: rx, lastProgress: now}
 		case ok && st.rxBytes > live.lastRx:
 			g.enrollLive[p.PubKeyHex] = enrollmentLiveness{lastRx: st.rxBytes, lastProgress: now}
-		default:
-			// A non-positive window means reaping is disabled for this
-			// authorizer (keepalive_reap_count = 0) — never reap.
-			if to := enrollmentLivenessTimeout(policy, p.AuthorizerName); to > 0 && now.Sub(live.lastProgress) > to {
-				stale = append(stale, p.PeerIP)
-			}
 		}
 	}
-	// Drop trackers for peers that no longer exist.
 	for pub := range g.enrollLive {
 		if !seen[pub] {
 			delete(g.enrollLive, pub)
+		}
+	}
+	// Reap peers whose rx has been quiet past their liveness window.
+	var stale []string
+	for _, p := range peers {
+		live := g.enrollLive[p.PubKeyHex]
+		// A non-positive window means reaping is disabled for this
+		// authorizer (keepalive_reap_count = 0) — never reap.
+		if to := enrollmentLivenessTimeout(policy, p.AuthorizerName); to > 0 && now.Sub(live.lastProgress) > to {
+			stale = append(stale, p.PeerIP)
 		}
 	}
 	for _, ip := range stale {
