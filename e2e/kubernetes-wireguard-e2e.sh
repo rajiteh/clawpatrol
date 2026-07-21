@@ -200,6 +200,13 @@ log "waiting for sidecar handoff files"
 wait_until "sidecar wrote ready/env/ca files" 120 \
   agent_exec sh -lc 'test -f /clawpatrol/ready && test -s /clawpatrol/env && test -s /clawpatrol/ca.crt'
 
+log "checking handoff content (CA is a real cert, env points at it)"
+# The sidecar writes the gateway CA and an env file the workload sources; the
+# CA-path pushdown (SSL_CERT_FILE et al.) must point back into /clawpatrol.
+agent_exec sh -lc 'head -1 /clawpatrol/ca.crt | grep -q "^-----BEGIN CERTIFICATE-----"'
+agent_exec sh -lc 'grep -Eq "SSL_CERT_FILE=.*/clawpatrol/" /clawpatrol/env'
+agent_exec sh -lc 'grep -Eq "NODE_EXTRA_CA_CERTS=.*/clawpatrol/ca\.crt" /clawpatrol/env'
+
 log "checking restricted agent container contract"
 agent_exec sh -lc 'test ! -e /var/run/secrets/kubernetes.io/serviceaccount/token'
 agent_exec sh -lc 'test ! -e /var/run/secrets/tokens/clawpatrol-token'
@@ -213,6 +220,15 @@ agent_exec sh -lc 'ip route show default | grep -q "dev clawpatrol0"'
 log "checking tunnel route and a relayed TCP request"
 agent_exec sh -lc "ip route get '${HTTP_CLUSTER_IP}' | grep -q 'dev clawpatrol0'"
 agent_exec sh -lc "test \"\$(curl -sS --max-time 10 'http://${HTTP_CLUSTER_IP}:8081/')\" = 'ok'"
+
+log "checking the gateway path is pinned off the tunnel"
+# The sidecar pins the gateway API (+ WG endpoint) to the pod's original
+# default route before flipping the default to clawpatrol0, so enroll /
+# env-pushdown / deregister don't loop back through the tunnel. The API
+# ClusterIP must therefore NOT route via clawpatrol0.
+API_CLUSTER_IP="$("${KUBECTL[@]}" -n "${GATEWAY_NS}" get svc clawpatrol-api -o jsonpath='{.spec.clusterIP}')"
+[[ -n "${API_CLUSTER_IP}" ]] || fail "could not resolve clawpatrol-api ClusterIP"
+agent_exec sh -lc "! ip route get '${API_CLUSTER_IP}' | grep -q 'dev clawpatrol0'"
 
 log "checking enrolled peer row and WireGuard peer tables"
 gateway_exec sh -lc 'command -v sqlite3 >/dev/null'
@@ -250,6 +266,7 @@ if [[ "${CHECK_ESCALATION}" == "1" ]]; then
   BEFORE_RESTARTS="$(sidecar_restarts)"
   BEFORE_RESTARTS="${BEFORE_RESTARTS:-0}"
   BEFORE_PUBKEY="$(sqlite_query "SELECT pubkey FROM wg_peers WHERE enrolled = 1 AND display_name = '${AGENTS_NS}/${E2E_POD}' LIMIT 1;")"
+  BEFORE_PEER_IP="${PEER_IP}"
   DOWN_SECONDS=$(( TTL_SECONDS + 30 ))
 
   log "severing keepalive: scaling gateway to 0 for ${DOWN_SECONDS}s (> exit threshold) so the sidecar's rx stalls"
@@ -278,6 +295,11 @@ if [[ "${CHECK_ESCALATION}" == "1" ]]; then
   }
   wait_until "sidecar re-enrolled with a fresh WireGuard key" 180 peer_reenrolled
   PEER_IP="$(sqlite_query "SELECT ip FROM wg_peers WHERE enrolled = 1 AND display_name = '${AGENTS_NS}/${E2E_POD}' LIMIT 1;")"
+
+  # Same-subject renewal reuses the peer IP: the fresh enrollment swaps the
+  # WireGuard key but the gateway hands the identity back its prior slot.
+  [[ "${PEER_IP}" == "${BEFORE_PEER_IP}" ]] ||
+    fail "self-heal did not reuse the peer IP (was ${BEFORE_PEER_IP}, got ${PEER_IP})"
 
   wait_until "tunnel restored after self-heal" 60 \
     agent_exec sh -lc "test \"\$(curl -sS --max-time 10 'http://${HTTP_CLUSTER_IP}:8081/')\" = 'ok'"
