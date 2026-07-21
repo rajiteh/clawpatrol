@@ -123,7 +123,7 @@ func bridgeRun(ctx context.Context, opt bridgeOptions) error {
 	}
 	keepalive := time.Duration(keepaliveSecs) * time.Second
 	var rxResetAfter, rxExitAfter time.Duration
-	if mult := registerResp.TimeoutMultiplier; mult >= 2 {
+	if mult := registerResp.KeepaliveReapCount; mult >= 2 {
 		// Local rebuild after the client's configured missed-keepalive count
 		// (default 2, disabled at 0 or when it meets/exceeds the reap
 		// horizon); full restart at the reap horizon (mult missed). Positive

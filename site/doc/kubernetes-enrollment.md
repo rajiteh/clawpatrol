@@ -70,9 +70,9 @@ enrollment "kubernetes_token_review" "agents" {
     profiles        = ["default"]
   }
 
-  # Liveness is derived: keepalive_interval × timeout_multiplier (60s×3 = 3m).
+  # Liveness is derived: keepalive_interval × keepalive_reap_count (60s×3 = 3m).
   keepalive_interval = "60s"
-  timeout_multiplier = 3
+  keepalive_reap_count = 3
 }
 
 profile "default" {
@@ -92,9 +92,9 @@ Add more `match { ... }` blocks to bind additional identities.
 
 `keepalive_interval` (default 25s, min 10s) is the WireGuard
 persistent-keepalive cadence applied to enrolled peers in both directions;
-`timeout_multiplier` (default 3, or 0 to disable) is how many missed
+`keepalive_reap_count` (default 3, or 0 to disable) is how many missed
 keepalives elapse before the reaper revokes a peer. The liveness window is
-derived — `keepalive_interval × timeout_multiplier` — so the safety ratio is
+derived — `keepalive_interval × keepalive_reap_count` — so the safety ratio is
 an integer that can't be misconfigured, and the resolved keepalive is pushed
 to the sidecar at enroll so both ends stay in sync. `max_ttl` is optional,
 parsed and stored for a future hard-expiry pass; it is not enforced yet.
@@ -195,7 +195,7 @@ There is no application heartbeat. The gateway observes liveness from
 the WireGuard device: persistent keepalive advances the peer's
 `rx_bytes` every `keepalive_interval`, and a peer whose `rx_bytes` stops
 advancing past the liveness window (`keepalive_interval ×
-timeout_multiplier`) is reaped. A freshly enrolled peer gets a full
+keepalive_reap_count`) is reaped. A freshly enrolled peer gets a full
 liveness window first. On shutdown the sidecar best-effort deregisters;
 either way the gateway revokes the transient WireGuard peer and clears its
 enrolled `wg_peers` row.

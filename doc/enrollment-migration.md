@@ -12,7 +12,7 @@ labeled `enrollment "<type>" "<name>"` blocks — siblings of `profile` /
 > block moves out of `gateway { ... }` to the top level, the `authorizer`
 > sub-block's two labels move up onto `enrollment` itself, `allow { ... }`
 > rules become `match { ... }` blocks, `peer_ttl` is replaced by the
-> derived liveness window (`keepalive_interval × timeout_multiplier`), and
+> derived liveness window (`keepalive_interval × keepalive_reap_count`), and
 > an optional `max_ttl` slot is now accepted.
 
 No data migration is needed: the storage migration
@@ -29,7 +29,7 @@ enrollment block is what enables it). The old `authorizer "<type>"
 "<name>"` sub-block's two labels move onto the `enrollment` block itself;
 each `allow { ... }` rule becomes a `match { ... }` block; `lease_ttl` is
 replaced by the derived liveness window (`keepalive_interval ×
-timeout_multiplier`).
+keepalive_reap_count`).
 
 **Before:**
 
@@ -80,16 +80,16 @@ enrollment "kubernetes_token_review" "agents" {
     profiles        = ["default"]
   }
 
-  # Liveness is derived: keepalive_interval × timeout_multiplier (60s×3 = 3m).
+  # Liveness is derived: keepalive_interval × keepalive_reap_count (60s×3 = 3m).
   keepalive_interval = "60s"
-  timeout_multiplier = 3
+  keepalive_reap_count = 3
   # max_ttl = "24h"   # optional; parsed + stored, not enforced yet
 }
 ```
 
 Notes:
 - The liveness window is derived, not set directly: `keepalive_interval`
-  (default 25s, min 10s) × `timeout_multiplier` (default 3; `0` disables
+  (default 25s, min 10s) × `keepalive_reap_count` (default 3; `0` disables
   reaping). It is not a heartbeat TTL — the gateway reaps a peer once its
   WireGuard `rx_bytes` has been quiet for that long. Because the window is
   a whole number of keepalives, the reap-vs-keepalive safety ratio can't be
@@ -115,7 +115,7 @@ If you already migrated off `dynamic_peers` onto the interim
 - each `allow { namespace, service_account, profiles }` →
   `match { namespace, service_account, profile_label?, profiles }`.
 - the enrollment-wide `peer_ttl` → per-block `keepalive_interval` ×
-  `timeout_multiplier` (derived liveness window).
+  `keepalive_reap_count` (derived liveness window).
 - new optional `max_ttl` slot (parsed + stored, not yet enforced).
 
 Multiple authorizers that used to be sibling `authorizer` blocks under
@@ -180,7 +180,7 @@ container that reads the handoff files.
 - The `dynamic_peers { enabled = ... }` nested block and the `enabled`
   flag.
 - `lease_ttl` / the interim `peer_ttl` (replaced by the derived liveness
-  window, `keepalive_interval × timeout_multiplier`).
+  window, `keepalive_interval × keepalive_reap_count`).
 - The interim nested `authorizer "<type>" "<name>"` block and its
   `allow { ... }` rules (replaced by labels on `enrollment` and
   `match { ... }` blocks).
@@ -198,7 +198,7 @@ container that reads the handoff files.
       `enrollment` block; drop the now-empty `authorizer` wrapper.
 - [ ] Turn each `allow { ... }` rule into a `match { ... }` block.
 - [ ] Replace `lease_ttl` / `peer_ttl` with `keepalive_interval` +
-      `timeout_multiplier` (liveness = interval × multiplier; e.g.
+      `keepalive_reap_count` (liveness = interval × multiplier; e.g.
       `3m` → `60s × 3`).
 - [ ] In every agent pod spec: replace the `run` + `--tun` args with a
       single `bridge` arg.

@@ -532,10 +532,10 @@ func TestRegisterEnrolledPeerKeepaliveGating(t *testing.T) {
 	if err != nil {
 		t.Fatalf("bridge register: %v", err)
 	}
-	wantKA := int(config.K8sDefaultKeepalive.Seconds())
-	if bridge.KeepaliveIntervalSeconds != wantKA || bridge.TimeoutMultiplier != config.K8sDefaultTimeoutMultiplier {
+	wantKA := int(config.EnrollmentDefaultKeepalive.Seconds())
+	if bridge.KeepaliveIntervalSeconds != wantKA || bridge.KeepaliveReapCount != config.EnrollmentDefaultReapCount {
 		t.Fatalf("bridge keepalive passdown = %ds/%d, want %ds/%d",
-			bridge.KeepaliveIntervalSeconds, bridge.TimeoutMultiplier, wantKA, config.K8sDefaultTimeoutMultiplier)
+			bridge.KeepaliveIntervalSeconds, bridge.KeepaliveReapCount, wantKA, config.EnrollmentDefaultReapCount)
 	}
 
 	// Non-bridge: no request flag → no gateway keepalive, no passdown.
@@ -546,8 +546,8 @@ func TestRegisterEnrolledPeerKeepaliveGating(t *testing.T) {
 	if err != nil {
 		t.Fatalf("non-bridge register: %v", err)
 	}
-	if other.KeepaliveIntervalSeconds != 0 || other.TimeoutMultiplier != 0 {
+	if other.KeepaliveIntervalSeconds != 0 || other.KeepaliveReapCount != 0 {
 		t.Fatalf("non-bridge keepalive passdown = %ds/%d, want 0/0",
-			other.KeepaliveIntervalSeconds, other.TimeoutMultiplier)
+			other.KeepaliveIntervalSeconds, other.KeepaliveReapCount)
 	}
 }

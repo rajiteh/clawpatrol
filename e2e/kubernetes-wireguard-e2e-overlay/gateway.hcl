@@ -25,7 +25,7 @@ enrollment "kubernetes_token_review" "agents" {
 
   # Fast reap for the e2e: 10s keepalive × 3 missed = 30s liveness window.
   keepalive_interval = "10s"
-  timeout_multiplier = 3
+  keepalive_reap_count = 3
 }
 
 profile "default" {

@@ -59,6 +59,12 @@ type CompiledPolicy struct {
 	// enrollment block's <name> label (the runtime's authorizer name).
 	K8sEnrollments       []*CompiledK8sEnrollment
 	K8sEnrollmentsByName map[string]*CompiledK8sEnrollment
+	// EnrollmentLivenessByName holds the keepalive/reap tuning for every
+	// enrollment authorizer, indexed by authorizer name and independent of
+	// the authorizer type. The reaper and the register-time keepalive
+	// passdown resolve liveness through this map, so a new enrollment type
+	// gets both by populating it during its compile pass.
+	EnrollmentLivenessByName map[string]EnrollmentLiveness
 }
 
 // CompiledProfile binds an identity to the endpoint set its requests
@@ -303,7 +309,8 @@ func Compile(gw *Gateway) (*CompiledPolicy, error) {
 		Approvers:      p.Approvers,
 		Credentials:    p.Credentials,
 
-		K8sEnrollmentsByName: map[string]*CompiledK8sEnrollment{},
+		K8sEnrollmentsByName:     map[string]*CompiledK8sEnrollment{},
+		EnrollmentLivenessByName: map[string]EnrollmentLiveness{},
 	}
 
 	// Compile tunnels first so endpoint compilation can resolve

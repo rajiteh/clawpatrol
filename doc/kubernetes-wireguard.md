@@ -77,10 +77,10 @@ enrollment "kubernetes_token_review" "agents" {
     profiles        = ["default"]
   }
 
-  # Liveness is derived: keepalive_interval × timeout_multiplier.
+  # Liveness is derived: keepalive_interval × keepalive_reap_count.
   # Here 60s × 3 = a 3m reap window.
   keepalive_interval = "60s"
-  timeout_multiplier = 3
+  keepalive_reap_count = 3
 }
 ```
 
@@ -95,10 +95,10 @@ Each
 named by `profile_label` (default `clawpatrol.dev/profile`), and that value
 must be in the match's `profiles` allowlist. `keepalive_interval` (default
 25s, min 10s) is the WireGuard persistent-keepalive cadence applied to
-enrolled peers in both directions; `timeout_multiplier` (default 3, or 0 to
+enrolled peers in both directions; `keepalive_reap_count` (default 3, or 0 to
 disable reaping) is how many missed keepalives elapse before the reaper
 revokes a peer. The liveness window is derived — `keepalive_interval ×
-timeout_multiplier` — so the reap-vs-keepalive safety ratio is an integer
+keepalive_reap_count` — so the reap-vs-keepalive safety ratio is an integer
 that can't be misconfigured, and the gateway pushes the resolved keepalive
 to the sidecar at enroll so both ends stay in sync. `max_ttl` is accepted
 and stored for a future hard-expiry pass; it is not enforced yet.
@@ -196,7 +196,7 @@ Kubernetes pod peers are transient. There is no application heartbeat: the
 gateway observes liveness from the WireGuard device, where persistent
 keepalive advances each peer's `rx_bytes` every `keepalive_interval`. A
 freshly enrolled peer gets a full liveness window
-(`keepalive_interval × timeout_multiplier`) before it is eligible for
+(`keepalive_interval × keepalive_reap_count`) before it is eligible for
 reaping.
 
 - On SIGTERM the sidecar best-effort deletes its registration with

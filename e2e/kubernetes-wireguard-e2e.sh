@@ -129,12 +129,12 @@ fi
 [[ -f "${DOCKERFILE}" ]] || fail "Dockerfile not found: ${DOCKERFILE}"
 
 # Keep the liveness/reap waits in sync with the window the gateway enforces.
-# Liveness is derived: keepalive_interval × timeout_multiplier.
+# Liveness is derived: keepalive_interval × keepalive_reap_count.
 KEEPALIVE_INTERVAL="$(sed -n 's/.*keepalive_interval[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "${OVERLAY}/gateway.hcl" | head -1)"
-TIMEOUT_MULTIPLIER="$(sed -n 's/.*timeout_multiplier[[:space:]]*=[[:space:]]*\([0-9][0-9]*\).*/\1/p' "${OVERLAY}/gateway.hcl" | head -1)"
+KEEPALIVE_REAP_COUNT="$(sed -n 's/.*keepalive_reap_count[[:space:]]*=[[:space:]]*\([0-9][0-9]*\).*/\1/p' "${OVERLAY}/gateway.hcl" | head -1)"
 KEEPALIVE_INTERVAL="${KEEPALIVE_INTERVAL:-10s}"
-TIMEOUT_MULTIPLIER="${TIMEOUT_MULTIPLIER:-3}"
-PEER_TTL="$(( $(seconds_from_duration "${KEEPALIVE_INTERVAL}") * TIMEOUT_MULTIPLIER ))s"
+KEEPALIVE_REAP_COUNT="${KEEPALIVE_REAP_COUNT:-3}"
+PEER_TTL="$(( $(seconds_from_duration "${KEEPALIVE_INTERVAL}") * KEEPALIVE_REAP_COUNT ))s"
 
 if ! kind get clusters | grep -Fxq "${CLUSTER_NAME}"; then
   fail "kind cluster ${CLUSTER_NAME} not found"
@@ -237,7 +237,7 @@ fi
 if [[ "${CHECK_ESCALATION}" == "1" ]]; then
   # Client self-heal. Sever the tunnel's return path by scaling the gateway
   # to 0 for longer than the exit threshold (keepalive_interval ×
-  # timeout_multiplier + jitter). The pod stays alive, but its WireGuard
+  # keepalive_reap_count + jitter). The pod stays alive, but its WireGuard
   # rx_bytes stalls, so the sidecar's watchdog must hard-exit; the kubelet
   # then restarts the (native-sidecar) container, which re-enrolls with a
   # fresh WireGuard key. This is the reap-recovery path the gateway-side
