@@ -196,12 +196,18 @@ func setupTunDevice(iface string, mtu int, peerIP, peerIPv6 string) error {
 		{"ip", "link", "set", "dev", iface, "mtu", strconv.Itoa(mtu), "up"},
 		{"ip", "addr", "replace", peerIP + "/32", "dev", iface},
 	}
-	if peerIPv6 != "" {
-		steps = append(steps, []string{"ip", "-6", "addr", "replace", peerIPv6 + "/128", "dev", iface})
-	}
 	for _, step := range steps {
 		if err := runIP(step...); err != nil {
 			return err
+		}
+	}
+	// IPv6 is best-effort: a netns without IPv6 (e.g. the host booted with
+	// ipv6.disable=1) must still bring up the v4 tunnel. This mirrors the
+	// optional v6 default route in replaceDefaultRoutes and the child-netns
+	// degradation in run_linux.go — never let a missing v6 stack be fatal.
+	if peerIPv6 != "" {
+		if err := runIP("ip", "-6", "addr", "replace", peerIPv6+"/128", "dev", iface); err != nil {
+			fmt.Fprintf(os.Stderr, "[clawpatrol] bridge: ip -6 addr replace %s/128 dev %s: %v — continuing without IPv6 in the sandbox\n", peerIPv6, iface, err)
 		}
 	}
 	return nil
