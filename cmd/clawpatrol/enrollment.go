@@ -655,18 +655,27 @@ func (g *Gateway) reapStaleEnrolledPeers(_ context.Context) {
 		return
 	}
 	policy := g.Policy()
-	// Both reads are kept OUT of the critical section: PeerStats does a
-	// wireguard-go UAPI dump and listEnrolledPeers is a DB query, neither
-	// of which should be held under enrollmentMu.
+	// PeerStats (a wireguard-go UAPI dump) is identity-independent liveness
+	// data, so reading a slightly stale snapshot outside the lock is safe —
+	// at worst it delays a reap by one tick, and a peer that's new since the
+	// snapshot is seeded fresh below rather than mis-reaped.
 	stats := globalWG.PeerStats()
+
+	g.enrollmentMu.Lock()
+	defer g.enrollmentMu.Unlock()
+	// The peer list is read INSIDE the lock on purpose. registerEnrolledPeer
+	// runs under this same lock and, on a same-subject re-enroll (self-heal),
+	// reuses the peer's IP while swapping its key; the reap path below
+	// revokes by IP (RevokePeerByIP). Reading the list, deciding staleness,
+	// and revoking must therefore be atomic against a concurrent re-enroll —
+	// otherwise the reaper could act on a stale snapshot and revoke a peer
+	// that was just re-enrolled at the same IP with a fresh key. It's a small
+	// indexed SELECT; correctness beats the microseconds saved.
 	peers, err := g.listEnrolledPeers()
 	if err != nil {
 		return
 	}
 	now := time.Now()
-
-	g.enrollmentMu.Lock()
-	defer g.enrollmentMu.Unlock()
 	if g.enrollLive == nil {
 		g.enrollLive = map[string]enrollmentLiveness{}
 	}
