@@ -23,6 +23,7 @@ SKIP_BUILD="${CLAWPATROL_E2E_SKIP_BUILD:-0}"
 KEEP_RESOURCES="${CLAWPATROL_E2E_KEEP_RESOURCES:-0}"
 CHECK_LIVENESS="${CLAWPATROL_E2E_CHECK_LIVENESS:-1}"
 CHECK_EXPIRY="${CLAWPATROL_E2E_CHECK_EXPIRY:-0}"
+CHECK_ESCALATION="${CLAWPATROL_E2E_CHECK_ESCALATION:-1}"
 GOARCH_OVERRIDE="${CLAWPATROL_E2E_GOARCH:-}"
 
 # These are fixed by the overlay (images: transformer, namespaces, RBAC
@@ -56,6 +57,9 @@ Environment knobs:
   CLAWPATROL_E2E_KEEP_RESOURCES  set 1 to skip final namespace cleanup
   CLAWPATROL_E2E_CHECK_LIVENESS  set 0 to skip the rx_bytes liveness check
   CLAWPATROL_E2E_CHECK_EXPIRY    set 1 to test reap cleanup (force-delete sidecar)
+  CLAWPATROL_E2E_CHECK_ESCALATION set 0 to skip the sidecar self-heal check
+                                 (sever keepalive → sidecar hard-exits, restarts,
+                                 re-enrolls with a fresh WireGuard key)
   CLAWPATROL_E2E_GOARCH          override node arch for the Linux build
 
 Image tag, namespaces, peer TTL, and RBAC names live in the overlay
@@ -124,9 +128,13 @@ fi
 [[ -f "${OVERLAY}/gateway.hcl" ]] || fail "e2e gateway config not found: ${OVERLAY}/gateway.hcl"
 [[ -f "${DOCKERFILE}" ]] || fail "Dockerfile not found: ${DOCKERFILE}"
 
-# Keep the liveness/reap waits in sync with the liveness_timeout the gateway enforces.
-PEER_TTL="$(sed -n 's/.*liveness_timeout[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "${OVERLAY}/gateway.hcl" | head -1)"
-PEER_TTL="${PEER_TTL:-30s}"
+# Keep the liveness/reap waits in sync with the window the gateway enforces.
+# Liveness is derived: keepalive_interval × timeout_multiplier.
+KEEPALIVE_INTERVAL="$(sed -n 's/.*keepalive_interval[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "${OVERLAY}/gateway.hcl" | head -1)"
+TIMEOUT_MULTIPLIER="$(sed -n 's/.*timeout_multiplier[[:space:]]*=[[:space:]]*\([0-9][0-9]*\).*/\1/p' "${OVERLAY}/gateway.hcl" | head -1)"
+KEEPALIVE_INTERVAL="${KEEPALIVE_INTERVAL:-10s}"
+TIMEOUT_MULTIPLIER="${TIMEOUT_MULTIPLIER:-3}"
+PEER_TTL="$(( $(seconds_from_duration "${KEEPALIVE_INTERVAL}") * TIMEOUT_MULTIPLIER ))s"
 
 if ! kind get clusters | grep -Fxq "${CLUSTER_NAME}"; then
   fail "kind cluster ${CLUSTER_NAME} not found"
@@ -216,14 +224,64 @@ log "enrolled peer ${PEER_IP}"
 
 if [[ "${CHECK_LIVENESS}" == "1" ]]; then
   # No app-level heartbeat: the gateway drives liveness from WireGuard
-  # rx_bytes movement (persistent-keepalive ~every 25s). A live tunnel must
-  # therefore keep its enrolled row past peer_ttl without being reaped.
+  # rx_bytes movement (persistent-keepalive every keepalive_interval). A live
+  # tunnel must keep its enrolled row past peer_ttl without being reaped.
   TTL_SECONDS="$(seconds_from_duration "${PEER_TTL}")"
   SLEEP_SECONDS=$(( TTL_SECONDS + 30 ))
   log "waiting ${SLEEP_SECONDS}s (> peer_ttl) to confirm keepalive liveness holds the peer"
   sleep "${SLEEP_SECONDS}"
   enrolled_present || fail "live peer was reaped despite an active tunnel (rx_bytes liveness regressed)"
   log "live peer survived past peer_ttl"
+fi
+
+if [[ "${CHECK_ESCALATION}" == "1" ]]; then
+  # Client self-heal. Sever the tunnel's return path by scaling the gateway
+  # to 0 for longer than the exit threshold (keepalive_interval ×
+  # timeout_multiplier + jitter). The pod stays alive, but its WireGuard
+  # rx_bytes stalls, so the sidecar's watchdog must hard-exit; the kubelet
+  # then restarts the (native-sidecar) container, which re-enrolls with a
+  # fresh WireGuard key. This is the reap-recovery path the gateway-side
+  # reaper can't drive on its own.
+  TTL_SECONDS="$(seconds_from_duration "${PEER_TTL}")"
+  sidecar_restarts() {
+    "${KUBECTL[@]}" -n "${AGENTS_NS}" get pod "${E2E_POD}" \
+      -o jsonpath='{.status.initContainerStatuses[?(@.name=="wireguard-sidecar")].restartCount}' 2>/dev/null
+  }
+  BEFORE_RESTARTS="$(sidecar_restarts)"
+  BEFORE_RESTARTS="${BEFORE_RESTARTS:-0}"
+  BEFORE_PUBKEY="$(sqlite_query "SELECT pubkey FROM wg_peers WHERE enrolled = 1 AND display_name = '${AGENTS_NS}/${E2E_POD}' LIMIT 1;")"
+  DOWN_SECONDS=$(( TTL_SECONDS + 30 ))
+
+  log "severing keepalive: scaling gateway to 0 for ${DOWN_SECONDS}s (> exit threshold) so the sidecar's rx stalls"
+  "${KUBECTL[@]}" -n "${GATEWAY_NS}" scale statefulset/clawpatrol-gateway --replicas=0 >/dev/null
+  "${KUBECTL[@]}" -n "${GATEWAY_NS}" rollout status statefulset/clawpatrol-gateway --timeout="${TIMEOUT}" >/dev/null 2>&1 || true
+  sleep "${DOWN_SECONDS}"
+
+  log "restoring gateway"
+  "${KUBECTL[@]}" -n "${GATEWAY_NS}" scale statefulset/clawpatrol-gateway --replicas=1 >/dev/null
+  "${KUBECTL[@]}" -n "${GATEWAY_NS}" rollout status statefulset/clawpatrol-gateway --timeout="${TIMEOUT}"
+  "${KUBECTL[@]}" -n "${GATEWAY_NS}" wait --for=condition=Ready pod -l app=clawpatrol-gateway --timeout="${TIMEOUT}"
+  GATEWAY_POD="$("${KUBECTL[@]}" -n "${GATEWAY_NS}" get pod -l app=clawpatrol-gateway -o jsonpath='{.items[0].metadata.name}')"
+
+  sidecar_restarted() { [[ "$(sidecar_restarts || echo "${BEFORE_RESTARTS}")" -gt "${BEFORE_RESTARTS}" ]]; }
+  wait_until "sidecar hard-exited and was restarted (restarts > ${BEFORE_RESTARTS})" 180 sidecar_restarted
+
+  # The gateway's DB persists across the scale, so it re-seeds the OLD peer
+  # row on startup — enrolled_present alone would be satisfied by that stale
+  # row before the restarted sidecar re-enrolls. Wait for the pubkey to
+  # actually change, which only the fresh enrollment (new ephemeral key)
+  # produces.
+  peer_reenrolled() {
+    local pk
+    pk="$(sqlite_query "SELECT pubkey FROM wg_peers WHERE enrolled = 1 AND display_name = '${AGENTS_NS}/${E2E_POD}' LIMIT 1;" 2>/dev/null)"
+    [[ -n "${pk}" && "${pk}" != "${BEFORE_PUBKEY}" ]]
+  }
+  wait_until "sidecar re-enrolled with a fresh WireGuard key" 180 peer_reenrolled
+  PEER_IP="$(sqlite_query "SELECT ip FROM wg_peers WHERE enrolled = 1 AND display_name = '${AGENTS_NS}/${E2E_POD}' LIMIT 1;")"
+
+  wait_until "tunnel restored after self-heal" 60 \
+    agent_exec sh -lc "test \"\$(curl -sS --max-time 10 'http://${HTTP_CLUSTER_IP}:8081/')\" = 'ok'"
+  log "sidecar self-healed: restarts ${BEFORE_RESTARTS} → $(sidecar_restarts), re-enrolled ${PEER_IP} with a fresh key"
 fi
 
 if [[ "${CHECK_EXPIRY}" == "1" ]]; then
