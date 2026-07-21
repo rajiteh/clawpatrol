@@ -35,9 +35,10 @@ const (
 	enrollmentDefaultMTU                   = 1420
 	enrollmentReaperInterval               = 20 * time.Second
 	// enrollmentDefaultLiveness is the fallback WireGuard-quiet grace
-	// window used when an authorizer sets no `liveness_timeout` (or the
-	// peer's authorizer can no longer be resolved). ~3x the 25s
-	// persistent-keepalive interval.
+	// window used only when a peer's authorizer can no longer be resolved
+	// (e.g. removed from the policy on reload) — orphaned peers still get
+	// reaped. Configured authorizers supply their own derived window
+	// (keepalive_interval × timeout_multiplier). ~3x the 25s keepalive.
 	enrollmentDefaultLiveness = 75 * time.Second
 )
 
@@ -58,6 +59,13 @@ type enrollmentRegisterResponse struct {
 	MTU             int      `json:"mtu"`
 	APIToken        string   `json:"api_token"`
 	CAPEM           string   `json:"ca_pem,omitempty"`
+	// KeepaliveIntervalSeconds is the persistent-keepalive interval the
+	// sidecar must apply to its tunnel (matches the gateway's own side).
+	// TimeoutMultiplier is how many missed keepalives the gateway waits
+	// before reaping; the sidecar sizes its watchdog reset/hard-exit
+	// thresholds from it. 0 disables the client's self-heal escalation.
+	KeepaliveIntervalSeconds int `json:"keepalive_interval_s,omitempty"`
+	TimeoutMultiplier        int `json:"timeout_multiplier,omitempty"`
 }
 
 // enrollmentIdentity is the normalized identity an authorizer returns
@@ -342,7 +350,12 @@ func (g *Gateway) registerEnrolledPeer(ctx context.Context, cfg *config.Gateway,
 			return enrollmentRegisterResponse{}, err
 		}
 	}
-	if err := globalWG.AddPeer(pubHex, peerIP); err != nil {
+	// Resolve the keepalive/liveness knobs for this authorizer. The gateway
+	// keepalives toward the peer at this interval (symmetric with the
+	// client) and echoes both values back so the sidecar's watchdog uses the
+	// same cadence and reap horizon the gateway enforces.
+	keepalive, multiplier := enrollmentKeepaliveConfig(g.Policy(), authorizer.Name())
+	if err := globalWG.AddPeer(pubHex, peerIP, keepalive); err != nil {
 		return enrollmentRegisterResponse{}, fmt.Errorf("wg add peer: %w", err)
 	}
 	// Roll back the transport peer + token on any failure before the
@@ -415,6 +428,9 @@ func (g *Gateway) registerEnrolledPeer(ctx context.Context, cfg *config.Gateway,
 		AllowedIPs:      []string{"0.0.0.0/0", "::/0"},
 		MTU:             enrollmentDefaultMTU,
 		APIToken:        apiToken,
+
+		KeepaliveIntervalSeconds: int(keepalive.Seconds()),
+		TimeoutMultiplier:        multiplier,
 	}
 	if g.certs != nil {
 		resp.CAPEM = string(g.certs.CertPEM())
@@ -535,16 +551,34 @@ func (g *Gateway) noteEnrolledLiveLocked(pubHex string) {
 }
 
 // enrollmentLivenessTimeout resolves the WireGuard-quiet grace window for
-// an enrolled peer from its authorizer's compiled `liveness_timeout`,
-// falling back to enrollmentDefaultLiveness when the authorizer is unset,
-// no longer present in the policy, or declared no explicit timeout.
+// an enrolled peer from its authorizer's derived liveness window
+// (keepalive_interval × timeout_multiplier). A resolved value of 0 means
+// reaping is disabled for that authorizer (timeout_multiplier = 0) and the
+// caller must not reap. Only when the authorizer can no longer be resolved
+// does it fall back to enrollmentDefaultLiveness, so orphaned peers left by
+// a policy reload still get reclaimed.
 func enrollmentLivenessTimeout(policy *config.CompiledPolicy, authorizerName string) time.Duration {
 	if policy != nil && authorizerName != "" {
-		if enr := policy.K8sEnrollmentsByName[authorizerName]; enr != nil && enr.LivenessTimeout > 0 {
-			return enr.LivenessTimeout
+		if enr, ok := policy.K8sEnrollmentsByName[authorizerName]; ok && enr != nil {
+			return enr.LivenessTimeout // derived; 0 == reaping disabled
 		}
 	}
 	return enrollmentDefaultLiveness
+}
+
+// enrollmentKeepaliveConfig resolves the WireGuard persistent-keepalive
+// interval and the missed-keepalive timeout multiplier for an authorizer.
+// The gateway applies the interval to its side of the peer and pushes both
+// values to the sidecar at enroll so the client's watchdog stays in sync
+// with the reaper. Falls back to the package defaults when the authorizer
+// can't be resolved.
+func enrollmentKeepaliveConfig(policy *config.CompiledPolicy, authorizerName string) (time.Duration, int) {
+	if policy != nil && authorizerName != "" {
+		if enr, ok := policy.K8sEnrollmentsByName[authorizerName]; ok && enr != nil {
+			return enr.KeepaliveInterval, enr.TimeoutMultiplier
+		}
+	}
+	return config.K8sDefaultKeepalive, config.K8sDefaultTimeoutMultiplier
 }
 
 func (g *Gateway) startEnrollmentReaper(ctx context.Context) {
@@ -598,7 +632,9 @@ func (g *Gateway) reapStaleEnrolledPeers(_ context.Context) {
 		case ok && st.rxBytes > live.lastRx:
 			g.enrollLive[p.PubKeyHex] = enrollmentLiveness{lastRx: st.rxBytes, lastProgress: now}
 		default:
-			if now.Sub(live.lastProgress) > enrollmentLivenessTimeout(policy, p.AuthorizerName) {
+			// A non-positive window means reaping is disabled for this
+			// authorizer (timeout_multiplier = 0) — never reap.
+			if to := enrollmentLivenessTimeout(policy, p.AuthorizerName); to > 0 && now.Sub(live.lastProgress) > to {
 				stale = append(stale, p.PeerIP)
 			}
 		}
