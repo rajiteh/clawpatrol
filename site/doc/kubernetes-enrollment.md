@@ -208,8 +208,9 @@ not restore a broad default route on the way out: with `clawpatrol0` gone the
 pod has no default route, so the workload's general egress fails closed until
 the tunnel is rebuilt. The restarted sidecar reaches the gateway over the
 control-plane host routes it pinned to the pod's underlay (the gateway and the
-DNS resolvers, tagged with a dedicated route protocol so they survive the
-restart and are found again), re-enrolls with a fresh key, and reuses its
+DNS resolvers, tagged with a dedicated route protocol — `--route-proto`,
+default `111` — so they survive the restart and are found again), re-enrolls
+with a fresh key, and reuses its
 prior peer IP for the same subject. Because DNS stays reachable, the gateway
 is resolved by name, so its TLS SNI and `Host` are unaffected.
 

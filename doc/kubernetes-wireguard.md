@@ -220,9 +220,9 @@ workload's general egress fails closed during the gap rather than leaking out
 untunneled. The `restartPolicy: Always` native sidecar is restarted by the
 kubelet; it reaches the gateway over the control-plane host routes it pinned
 to the pod's underlay — the gateway API/endpoint and the DNS resolvers, tagged
-with a dedicated route protocol so they survive the restart and can be found
-again without a default route — re-enrolls with a fresh key, and reuses its
-prior peer IP for the same subject.
+with a dedicated route protocol (`--route-proto`, default `111`) so they
+survive the restart and can be found again without a default route — re-enrolls
+with a fresh key, and reuses its prior peer IP for the same subject.
 
 ## Restricting pod egress (recommended)
 

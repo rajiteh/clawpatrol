@@ -35,3 +35,16 @@ func TestParseBridgeAuthorizer(t *testing.T) {
 		}
 	}
 }
+
+func TestValidateRouteProto(t *testing.T) {
+	for _, ok := range []string{defaultRouteProto, "1", "255", "static", "clawpatrol"} {
+		if err := validateRouteProto(ok); err != nil {
+			t.Errorf("validateRouteProto(%q) = %v, want nil", ok, err)
+		}
+	}
+	for _, bad := range []string{"", "  ", "0", "256", "-1"} {
+		if err := validateRouteProto(bad); err == nil {
+			t.Errorf("validateRouteProto(%q) expected error", bad)
+		}
+	}
+}
