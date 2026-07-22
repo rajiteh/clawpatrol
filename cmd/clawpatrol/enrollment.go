@@ -448,6 +448,12 @@ func (g *Gateway) registerEnrolledPeer(ctx context.Context, cfg *config.Gateway,
 	}
 	committed = true
 	g.noteEnrolledLiveLocked(pubHex)
+	// One line per successful enroll. reused_ip=true is the self-heal case: a
+	// sidecar that restarted with a fresh key reclaimed its prior IP for the
+	// same subject — the gateway-side counterpart to the bridge's re-enroll
+	// log, so a reap→re-enroll can be reconstructed from the gateway alone.
+	log.Printf("enrollment: registered peer ip=%s name=%q subject=%s authorizer=%s reused_ip=%t",
+		peerIP, identity.DisplayName, identity.SubjectKey, authorizer.Name(), reuseIP != "")
 	if g.onboard != nil {
 		g.onboard.AssignProfile(peerIP, identity.Profile)
 		g.onboard.SetOwner(peerIP, identity.Owner)
@@ -713,6 +719,11 @@ func (g *Gateway) reapStaleEnrolledPeers(_ context.Context) {
 		// A non-positive window means reaping is disabled for this
 		// authorizer (keepalive_reap_count = 0) — never reap.
 		if to := enrollmentLivenessTimeout(policy, p.AuthorizerName); to > 0 && now.Sub(live.lastProgress) > to {
+			// The gateway's view of a lost peer: one line per real death (a
+			// healthy peer never crosses the full window), with how long its
+			// WG rx was quiet. Correlates with the sidecar's exit/re-enroll.
+			log.Printf("enrollment: reaping peer ip=%s name=%q subject=%s authorizer=%s: no WG rx for %s (> %s)",
+				p.PeerIP, p.DisplayName, p.SubjectKey, p.AuthorizerName, now.Sub(live.lastProgress).Round(time.Second), to)
 			stale = append(stale, p.PeerIP)
 		}
 	}

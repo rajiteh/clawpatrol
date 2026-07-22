@@ -94,6 +94,7 @@ func runWGWatchdogLoop(ctx context.Context, c wgWatchdogConfig) {
 		lastRx        uint64
 		lastRxAt      time.Time
 		lastResetAt   time.Time
+		resetPending  bool
 	)
 	logf := func(format string, args ...any) {
 		if c.log != nil && c.log.Errorf != nil {
@@ -125,6 +126,14 @@ func runWGWatchdogLoop(ctx context.Context, c wgWatchdogConfig) {
 		case !rxTracking:
 			rxTracking, lastRx, lastRxAt = true, s.rxBytes, c.now()
 		case s.rxBytes > lastRx:
+			// rx advanced. If an in-place reset was pending confirmation, this
+			// is the recovery the reset was aiming for — log it so a self-heal
+			// that never escalated to a full restart is still visible on the
+			// surviving container (otherwise it leaves no trace at all).
+			if resetPending {
+				logf("watchdog: WG rx resumed after in-place reset — tunnel recovered without re-enrolling")
+				resetPending = false
+			}
 			lastRx, lastRxAt = s.rxBytes, c.now()
 		default:
 			quiet := c.now().Sub(lastRxAt)
@@ -144,6 +153,7 @@ func runWGWatchdogLoop(ctx context.Context, c wgWatchdogConfig) {
 					logf("watchdog: peer reset failed: %v", err)
 				} else {
 					lastResetAt = c.now()
+					resetPending = true
 				}
 			}
 		}

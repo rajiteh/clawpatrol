@@ -57,14 +57,24 @@ func bridgeRun(ctx context.Context, opt bridgeOptions) error {
 	// it from a surviving tagged pin instead — the pins carry the same
 	// via/dev. Either way we need it to pin the control-plane hosts to the
 	// underlay before the default flips to the tunnel.
-	route4, ok4 := discoverUnderlayRoute("-4", opt.RouteProto)
+	route4, src4, ok4 := discoverUnderlayRoute("-4", opt.RouteProto)
 	if !ok4 {
 		return fmt.Errorf("no usable underlay route: neither a default route nor a tagged clawpatrol pin was found")
+	}
+	// One positive lifecycle line per boot, keyed on where the underlay came
+	// from. "pin" means there was no default route at start, so this is a
+	// self-heal restart recovering the gateway from the tagged pins — the
+	// signal that would otherwise be invisible on the surviving container once
+	// the failed instance's logs rotate out. "default" is a normal first boot.
+	if src4 == "pin" {
+		fmt.Fprintf(os.Stderr, "[clawpatrol] bridge: no default route at start — recovered underlay gateway via %s dev %s from tagged pins (proto %s); this is a self-heal restart, re-enrolling\n", route4.Via, route4.Dev, opt.RouteProto)
+	} else {
+		fmt.Fprintf(os.Stderr, "[clawpatrol] bridge: starting; underlay gateway via %s dev %s, enrolling with %s\n", route4.Via, route4.Dev, opt.AuthorizerName)
 	}
 	// IPv6 is optional: present only when the pod already has a v6 underlay
 	// route. We pin/replace v6 only in that case, so we never create a v6
 	// default that would blackhole traffic that previously had no route.
-	route6, have6 := discoverUnderlayRoute("-6", opt.RouteProto)
+	route6, _, have6 := discoverUnderlayRoute("-6", opt.RouteProto)
 
 	// Resolvers the pod already uses (from /etc/resolv.conf). Pinning them to
 	// the underlay keeps DNS working after the default flips to the tunnel and,
@@ -89,6 +99,7 @@ func bridgeRun(ctx context.Context, opt bridgeOptions) error {
 	if registerResp.MTU != 0 {
 		opt.MTU = registerResp.MTU
 	}
+	fmt.Fprintf(os.Stderr, "[clawpatrol] bridge: enrolled peer_ip=%s keepalive=%ds reap_count=%d\n", registerResp.PeerIP, registerResp.KeepaliveIntervalSeconds, registerResp.KeepaliveReapCount)
 
 	apiURL, err := url.Parse(opt.GatewayURL)
 	if err != nil {
@@ -317,26 +328,29 @@ func setupTunDevice(iface string, mtu int, peerIP, peerIPv6 string) error {
 // ("-4" / "-6"). It prefers the live default route (the normal first-boot
 // case) and falls back to a surviving tagged clawpatrol pin, which is how a
 // self-heal restart recovers the underlay gateway when there is no default
-// route left. Returns false when neither is available (for v4 that's fatal to
-// bring-up; for v6 it just means "no IPv6 underlay", same as before).
-func discoverUnderlayRoute(family, proto string) (linuxDefaultRoute, bool) {
+// route left. The middle return value is the source: "default" when it came
+// from the live default route (normal first boot) or "pin" when it was
+// recovered from a tagged pin (a self-heal restart). Source "" with ok=false
+// means neither was available — for v4 that's fatal to bring-up; for v6 it
+// just means "no IPv6 underlay", same as before.
+func discoverUnderlayRoute(family, proto string) (linuxDefaultRoute, string, bool) {
 	if out, err := exec.Command("ip", family, "route", "show", "default").Output(); err == nil {
 		if r, err := parseDefaultRoute(out); err == nil && r.Dev != "" {
-			return r, true
+			return r, "default", true
 		}
 	}
 	// No usable default (self-heal restart). Recover via/dev from a pin we
 	// tagged on first boot; they live on the underlay device and survive.
 	out, err := exec.Command("ip", family, "route", "show", "proto", proto).Output()
 	if err != nil {
-		return linuxDefaultRoute{}, false
+		return linuxDefaultRoute{}, "", false
 	}
 	for _, line := range strings.Split(string(out), "\n") {
 		if r, err := parsePinnedRoute(line); err == nil && r.Dev != "" {
-			return r, true
+			return r, "pin", true
 		}
 	}
-	return linuxDefaultRoute{}, false
+	return linuxDefaultRoute{}, "", false
 }
 
 // parsePinnedRoute extracts the via/dev from one `ip route show proto` line
