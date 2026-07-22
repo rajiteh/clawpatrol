@@ -57,6 +57,13 @@ func peerIPForAPIToken(db *sql.DB, token string) string {
 	return ip
 }
 
+func deletePeerAPITokensForIP(db *sql.DB, peerIP string) {
+	if db == nil || peerIP == "" {
+		return
+	}
+	_, _ = db.Exec(`DELETE FROM peer_api_tokens WHERE peer_ip = ?`, peerIP)
+}
+
 // hashPeerAPIToken hashes a raw bearer for the lookup table.
 // SHA-256 is fine here — the token is a uniformly-random 256-bit
 // value, not a password, so we don't need a password hash.

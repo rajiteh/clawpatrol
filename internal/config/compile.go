@@ -52,6 +52,19 @@ type CompiledPolicy struct {
 	// pointers into the same Entity records, no copies.
 	Approvers   map[string]*Entity
 	Credentials map[string]*Entity
+
+	// Kubernetes enrollment policy is compiled separately from endpoint
+	// routing: it authorizes a new WireGuard peer into a profile, not a
+	// request to an endpoint. K8sEnrollmentsByName indexes by the
+	// enrollment block's <name> label (the runtime's authorizer name).
+	K8sEnrollments       []*CompiledK8sEnrollment
+	K8sEnrollmentsByName map[string]*CompiledK8sEnrollment
+	// EnrollmentLivenessByName holds the keepalive/reap tuning for every
+	// enrollment authorizer, indexed by authorizer name and independent of
+	// the authorizer type. The reaper and the register-time keepalive
+	// passdown resolve liveness through this map, so a new enrollment type
+	// gets both by populating it during its compile pass.
+	EnrollmentLivenessByName map[string]EnrollmentLiveness
 }
 
 // CompiledProfile binds an identity to the endpoint set its requests
@@ -295,6 +308,9 @@ func Compile(gw *Gateway) (*CompiledPolicy, error) {
 		Tunnels:        map[string]*CompiledTunnel{},
 		Approvers:      p.Approvers,
 		Credentials:    p.Credentials,
+
+		K8sEnrollmentsByName:     map[string]*CompiledK8sEnrollment{},
+		EnrollmentLivenessByName: map[string]EnrollmentLiveness{},
 	}
 
 	// Compile tunnels first so endpoint compilation can resolve
@@ -447,6 +463,10 @@ func Compile(gw *Gateway) (*CompiledPolicy, error) {
 		dedupePatterns(&profile.HostPatterns)
 		sortHostPatterns(profile.HostPatterns)
 		cp.Profiles[name] = profile
+	}
+
+	if err := compileK8sEnrollments(cp, p); err != nil {
+		return nil, err
 	}
 
 	return cp, nil

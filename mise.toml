@@ -1,0 +1,5 @@
+[tools]
+deno = "latest"
+go = "1.26"
+golangci-lint = "latest"
+kind = "latest"
