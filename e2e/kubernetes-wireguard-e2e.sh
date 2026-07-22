@@ -233,6 +233,12 @@ agent_exec sh -lc "! ip route get '${API_CLUSTER_IP}' | grep -q 'dev clawpatrol0
 # self-heal restart can recover the underlay gateway from them when there is
 # no default route. The gateway API pin must show that tag.
 agent_exec sh -lc "ip route show proto 111 | grep -q '${API_CLUSTER_IP}'"
+# The pod's resolver is pinned to the underlay with the same tag, so DNS keeps
+# working after a self-heal restart (the gateway is resolved by name; SNI/Host
+# stay correct). Read the agent's actual nameserver and require it be pinned.
+AGENT_DNS_IP="$(agent_exec sh -lc "awk '/^nameserver/{print \$2; exit}' /etc/resolv.conf" | tr -d '[:space:]')"
+[[ -n "${AGENT_DNS_IP}" ]] || fail "agent has no resolv.conf nameserver"
+agent_exec sh -lc "ip route show proto 111 | grep -q '${AGENT_DNS_IP}'"
 
 log "checking enrolled peer row and WireGuard peer tables"
 gateway_exec sh -lc 'command -v sqlite3 >/dev/null'
@@ -269,23 +275,32 @@ if [[ "${CHECK_ESCALATION}" == "1" ]]; then
   }
   BEFORE_RESTARTS="$(sidecar_restarts)"
   BEFORE_RESTARTS="${BEFORE_RESTARTS:-0}"
+  sidecar_restarted() { [[ "$(sidecar_restarts || echo "${BEFORE_RESTARTS}")" -gt "${BEFORE_RESTARTS}" ]]; }
   BEFORE_PUBKEY="$(sqlite_query "SELECT pubkey FROM wg_peers WHERE enrolled = 1 AND display_name = '${AGENTS_NS}/${E2E_POD}' LIMIT 1;")"
   BEFORE_PEER_IP="${PEER_IP}"
   DOWN_SECONDS=$(( TTL_SECONDS + 30 ))
 
-  log "severing keepalive: scaling gateway to 0 for ${DOWN_SECONDS}s (> exit threshold) so the sidecar's rx stalls"
+  log "severing keepalive: scaling gateway to 0 (> exit threshold) so the sidecar's rx stalls"
   "${KUBECTL[@]}" -n "${GATEWAY_NS}" scale statefulset/clawpatrol-gateway --replicas=0 >/dev/null
   "${KUBECTL[@]}" -n "${GATEWAY_NS}" rollout status statefulset/clawpatrol-gateway --timeout="${TIMEOUT}" >/dev/null 2>&1 || true
-  sleep "${DOWN_SECONDS}"
+
+  # With the gateway down the sidecar's rx stalls and the watchdog must
+  # hard-exit. Catch that while the gateway is still down, then assert the
+  # netns is fail-closed: the workload has no default route (general egress is
+  # blocked, not leaking untunnelled) while the tagged control-plane pins
+  # survive, so the restart can still reach the gateway to recover. The
+  # restarted sidecar can't re-enroll until the gateway is back, so this state
+  # holds for the rest of the down window.
+  wait_until "sidecar hard-exited while gateway down (restarts > ${BEFORE_RESTARTS})" "$(( DOWN_SECONDS + 120 ))" sidecar_restarted
+  log "checking fail-closed during the gap: no default route, control-plane pins intact"
+  agent_exec sh -lc '! ip route show default | grep -q .'
+  agent_exec sh -lc "ip route show proto 111 | grep -q '${API_CLUSTER_IP}'"
 
   log "restoring gateway"
   "${KUBECTL[@]}" -n "${GATEWAY_NS}" scale statefulset/clawpatrol-gateway --replicas=1 >/dev/null
   "${KUBECTL[@]}" -n "${GATEWAY_NS}" rollout status statefulset/clawpatrol-gateway --timeout="${TIMEOUT}"
   "${KUBECTL[@]}" -n "${GATEWAY_NS}" wait --for=condition=Ready pod -l app=clawpatrol-gateway --timeout="${TIMEOUT}"
   GATEWAY_POD="$("${KUBECTL[@]}" -n "${GATEWAY_NS}" get pod -l app=clawpatrol-gateway -o jsonpath='{.items[0].metadata.name}')"
-
-  sidecar_restarted() { [[ "$(sidecar_restarts || echo "${BEFORE_RESTARTS}")" -gt "${BEFORE_RESTARTS}" ]]; }
-  wait_until "sidecar hard-exited and was restarted (restarts > ${BEFORE_RESTARTS})" 180 sidecar_restarted
 
   # The gateway's DB persists across the scale, so it re-seeds the OLD peer
   # row on startup — enrolled_present alone would be satisfied by that stale
