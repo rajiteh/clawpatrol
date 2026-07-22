@@ -236,12 +236,12 @@ func TestRegisterEnrolledPeerRollbackOnPersistFailure(t *testing.T) {
 }
 
 // reapStaleEnrolledPeers revokes an enrolled peer whose receive counter has
-// not advanced within peer_ttl. We register a real peer, then backdate its
-// liveness tracker so the reaper sees no progress past the TTL.
+// not advanced within its liveness window. We register a real peer, then
+// backdate its liveness tracker so the reaper sees no progress past the window.
 func TestReapStaleEnrolledPeers(t *testing.T) {
 	g := newEnrollmentTestGateway(t)
 	g.cfg.Store(enabledEnrollmentCfg())
-	g.policy.Store(enabledEnrollmentPolicy(t)) // reaper reads liveness_timeout from the compiled policy
+	g.policy.Store(enabledEnrollmentPolicy(t)) // reaper reads the liveness window from the compiled policy
 	startEnrollmentTestWGServer(t, g)
 	resp, err := registerFor(t, g, "kubernetes:agents:uid-1", "kubernetes:agents:agent-1", keyA)
 	if err != nil {

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/netip"
 	"os"
+	"strconv"
 	"strings"
 )
 
@@ -52,7 +53,18 @@ type bridgeOptions struct {
 	// eagerly to attempt a cheap local recovery first is the sidecar's call.
 	// Capped below the restart horizon; 0 disables the local rebuild.
 	LocalResetMisses int
+
+	// RouteProto is the rt_proto tag stamped on the control-plane host routes
+	// the bridge pins to the underlay, and the filter used to recover them on
+	// a self-heal restart. Escape hatch: override only if the default collides
+	// with a route protocol another component already uses in the netns.
+	RouteProto string
 }
+
+// defaultRouteProto is the rt_proto the bridge tags its underlay pins with by
+// default (overridable via --route-proto). Arbitrary and unregistered; it only
+// has to be stable and unlikely to collide with the CNI's own routes.
+const defaultRouteProto = "111"
 
 // runBridge parses the `clawpatrol bridge` flags and dispatches to the
 // platform implementation. Kept cross-platform (no wireguard imports) so
@@ -74,6 +86,8 @@ func runBridge(args []string) {
 	fs.IntVar(&opt.MTU, "mtu", enrollmentDefaultMTU, "TUN MTU")
 	fs.IntVar(&opt.LocalResetMisses, "local-reset-missed", wgWatchdogResetMisses,
 		"missed keepalives before an in-place tunnel rebuild; 0 disables it, and a value at or above the gateway's restart threshold never fires (the restart happens instead)")
+	fs.StringVar(&opt.RouteProto, "route-proto", defaultRouteProto,
+		"rt_proto tag for the underlay control-plane pins (gateway + DNS); override only if it collides with another component's routes")
 	_ = fs.Parse(args)
 
 	if len(fs.Args()) > 0 {
@@ -81,6 +95,9 @@ func runBridge(args []string) {
 	}
 	if strings.TrimSpace(opt.GatewayURL) == "" {
 		fail("clawpatrol bridge: --gateway-url is required")
+	}
+	if err := validateRouteProto(opt.RouteProto); err != nil {
+		fail("clawpatrol bridge: %v", err)
 	}
 	typ, name, err := parseBridgeAuthorizer(authorizer)
 	if err != nil {
@@ -110,6 +127,21 @@ func preferV4(ips []netip.Addr) (netip.Addr, bool) {
 		}
 	}
 	return ips[0].Unmap(), true
+}
+
+// validateRouteProto checks the --route-proto value. iproute2 accepts either
+// a numeric rt_proto (1–255) or a name defined in /etc/iproute2/rt_protos; we
+// only reject the clearly invalid cases (empty, or a number out of range) and
+// leave name resolution to `ip` at runtime.
+func validateRouteProto(p string) error {
+	p = strings.TrimSpace(p)
+	if p == "" {
+		return fmt.Errorf("--route-proto must not be empty")
+	}
+	if n, err := strconv.Atoi(p); err == nil && (n < 1 || n > 255) {
+		return fmt.Errorf("--route-proto %q must be in 1..255 (or an rt_protos name)", p)
+	}
+	return nil
 }
 
 // parseBridgeAuthorizer splits the `--authorizer <type>/<name>` value,

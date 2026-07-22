@@ -3,7 +3,6 @@ package config
 import (
 	"fmt"
 	"strings"
-	"time"
 
 	"github.com/hashicorp/hcl/v2"
 	"github.com/hashicorp/hcl/v2/hclwrite"
@@ -32,9 +31,6 @@ type K8sEnrollment struct {
 	// liveness window is derived (keepalive × reap count), never set directly.
 	KeepaliveInterval  string `json:"keepalive_interval,omitempty"`
 	KeepaliveReapCount *int   `json:"keepalive_reap_count,omitempty"`
-	// MaxTTL is a raw time.ParseDuration string, empty when omitted.
-	// Validated as a positive duration at load time.
-	MaxTTL string `json:"max_ttl,omitempty"`
 }
 
 // K8sMatch is one identity → profile-binding rule. A Pod is matched on
@@ -71,10 +67,6 @@ type k8sEnrollmentBody struct {
 	// 0 to disable reaping (and the sidecar's self-heal escalation) entirely;
 	// any other value must be 2 or greater.
 	KeepaliveReapCount *int `hcl:"keepalive_reap_count,optional"`
-	// MaxTTL is an optional hard lifetime for enrolled peers
-	// (time.ParseDuration). Parsed and stored; enforcement is future
-	// work. Validated as a positive duration when set.
-	MaxTTL string `hcl:"max_ttl,optional"`
 }
 
 // k8sMatchBody is one identity → profile-binding rule inside a
@@ -147,22 +139,7 @@ func validateK8sEnrollment(decoded any, name string, ctx *BuildCtx) hcl.Diagnost
 
 	diags = append(diags, validateEnrollmentKeepaliveInterval(ctx, name, body.KeepaliveInterval)...)
 	diags = append(diags, validateEnrollmentReapCount(ctx, name, body.KeepaliveReapCount)...)
-	diags = append(diags, validateK8sEnrollmentDuration(ctx, name, "max_ttl", body.MaxTTL)...)
 	return diags
-}
-
-// validateK8sEnrollmentDuration accepts an empty string (attr omitted)
-// or a positive Go duration; anything else is a diagnostic.
-func validateK8sEnrollmentDuration(ctx *BuildCtx, name, attr, raw string) hcl.Diagnostics {
-	if strings.TrimSpace(raw) == "" {
-		return nil
-	}
-	d, err := time.ParseDuration(raw)
-	if err != nil || d <= 0 {
-		return hcl.Diagnostics{enrollmentDiag(ctx, "Invalid enrollment "+attr,
-			fmt.Sprintf("enrollment %q %s = %q must be a positive Go duration string such as \"3m\".", name, attr, raw))}
-	}
-	return nil
 }
 
 func buildK8sEnrollment(decoded any, _ string, _ *BuildCtx) (any, hcl.Diagnostics) {
@@ -171,7 +148,6 @@ func buildK8sEnrollment(decoded any, _ string, _ *BuildCtx) (any, hcl.Diagnostic
 		Audience:           body.Audience,
 		KeepaliveInterval:  body.KeepaliveInterval,
 		KeepaliveReapCount: body.KeepaliveReapCount,
-		MaxTTL:             body.MaxTTL,
 	}
 	for _, m := range body.Matches {
 		label := strings.TrimSpace(m.ProfileLabel)
@@ -205,9 +181,6 @@ func emitK8sEnrollment(body any, _ string, b *hclwrite.Body) {
 	}
 	if ke.KeepaliveReapCount != nil {
 		b.SetAttributeValue("keepalive_reap_count", cty.NumberIntVal(int64(*ke.KeepaliveReapCount)))
-	}
-	if ke.MaxTTL != "" {
-		b.SetAttributeValue("max_ttl", cty.StringVal(ke.MaxTTL))
 	}
 }
 

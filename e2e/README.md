@@ -22,7 +22,7 @@ The overlay reuses the example base at
 
 - `clawpatrol-e2e` and `agents-e2e` namespaces,
 - the local `clawpatrol-kind-e2e:dev` image,
-- a short enrollment `peer_ttl`,
+- a short liveness window (a small `keepalive_interval`),
 - an e2e HTTP target used to prove tunneled data-path traffic.
 
 The script validates:
@@ -34,7 +34,9 @@ The script validates:
 - tunnel routing through the WireGuard interface,
 - a TCP request through the tunnel,
 - the enrolled `wg_peers` row and WireGuard peer state,
-- rx_bytes liveness (a live tunnel holds its peer past `peer_ttl`),
+- rx_bytes liveness (a live tunnel holds its peer past the liveness window),
+- sidecar self-heal (a severed tunnel drives a hard-exit, restart, and
+  re-enrollment with a fresh key at the reused peer IP),
 - graceful deregistration and peer revocation.
 
 By default the script deletes the e2e namespaces and cluster-scoped RBAC
@@ -70,5 +72,5 @@ already loaded into the kind cluster. `CLAWPATROL_E2E_KEEP_RESOURCES=1`
 keeps namespaces and RBAC objects around for debugging; clean them up
 manually afterward.
 
-Image tag, namespace names, RBAC names, and enrollment `peer_ttl` are
+Image tag, namespace names, RBAC names, and enrollment keepalive tuning are
 owned by the overlay files, not by the shell script.

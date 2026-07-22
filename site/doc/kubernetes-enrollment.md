@@ -96,8 +96,7 @@ persistent-keepalive cadence applied to enrolled peers in both directions;
 keepalives elapse before the reaper revokes a peer. The liveness window is
 derived — `keepalive_interval × keepalive_reap_count` — so the safety ratio is
 an integer that can't be misconfigured, and the resolved keepalive is pushed
-to the sidecar at enroll so both ends stay in sync. `max_ttl` is optional,
-parsed and stored for a future hard-expiry pass; it is not enforced yet.
+to the sidecar at enroll so both ends stay in sync.
 
 The complete standalone HCL example lives at
 [`examples/wireguard-enrollment-kubernetes.hcl`](https://github.com/denoland/clawpatrol/blob/main/examples/wireguard-enrollment-kubernetes.hcl).
@@ -200,8 +199,40 @@ liveness window first. On shutdown the sidecar best-effort deregisters;
 either way the gateway revokes the transient WireGuard peer and clears its
 enrolled `wg_peers` row.
 
-Enrolled peers show up in the dashboard as regular devices — there is no
-separate enrollment surface.
+The sidecar also self-heals from the client side. An rx-liveness watchdog
+watches the same keepalive signal: after a client-configurable number of
+missed keepalives (`--local-reset-missed`, default 2, clamped to the server
+reap count) it resets the tunnel in place, and if `rx_bytes` is still quiet
+at the reap threshold it exits so the kubelet restarts the sidecar. It does
+not restore a broad default route on the way out: with `clawpatrol0` gone the
+pod has no default route, so the workload's general egress fails closed until
+the tunnel is rebuilt. The restarted sidecar reaches the gateway over the
+control-plane host routes it pinned to the pod's underlay (the gateway and the
+DNS resolvers, tagged with a dedicated route protocol — `--route-proto`,
+default `111` — so they survive the restart and are found again), re-enrolls
+with a fresh key, and reuses its
+prior peer IP for the same subject. Because DNS stays reachable, the gateway
+is resolved by name, so its TLS SNI and `Host` are unaffected.
+
+Enrolled peers show up in the dashboard's Devices list alongside onboarded
+devices, distinguished by their `authorizer/subject` name. The device detail
+page adds an Enrollment panel showing the authorizer, subject, enrolled time,
+keepalive, derived liveness window, and last heartbeat with a missed-beat
+counter, plus a live/stale indicator. The profile is shown read-only (it is
+assigned from the pod label) and the delete action is hidden, since the peer
+is reaper-managed.
+
+## Restricting pod egress (recommended)
+
+The sidecar already fails closed at the routing layer, so a workload cannot
+reach off-cluster destinations untunneled even during a self-heal gap. For a
+second, cluster-enforced layer, pin the agent pod's allowed egress to exactly
+the paths enrollment needs — the gateway (API + WireGuard endpoint) and
+cluster DNS — with a NetworkPolicy. A ready-to-adapt example is at
+[`examples/kubernetes/agent-egress-networkpolicy.yaml`](https://github.com/denoland/clawpatrol/blob/main/examples/kubernetes/agent-egress-networkpolicy.yaml).
+It is defense-in-depth, not a dependency: it is not part of the Kustomization
+base, and it only takes effect on a CNI that enforces NetworkPolicy (Calico,
+Cilium, and similar; kind's default kindnet does not).
 
 ## Local e2e
 

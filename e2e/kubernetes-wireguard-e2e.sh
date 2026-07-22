@@ -229,6 +229,10 @@ log "checking the gateway path is pinned off the tunnel"
 API_CLUSTER_IP="$("${KUBECTL[@]}" -n "${GATEWAY_NS}" get svc clawpatrol-api -o jsonpath='{.spec.clusterIP}')"
 [[ -n "${API_CLUSTER_IP}" ]] || fail "could not resolve clawpatrol-api ClusterIP"
 agent_exec sh -lc "! ip route get '${API_CLUSTER_IP}' | grep -q 'dev clawpatrol0'"
+# The control-plane pins carry the clawpatrol route protocol (111) so a
+# self-heal restart can recover the underlay gateway from them when there is
+# no default route. The gateway API pin must show that tag.
+agent_exec sh -lc "ip route show proto 111 | grep -q '${API_CLUSTER_IP}'"
 
 log "checking enrolled peer row and WireGuard peer tables"
 gateway_exec sh -lc 'command -v sqlite3 >/dev/null'

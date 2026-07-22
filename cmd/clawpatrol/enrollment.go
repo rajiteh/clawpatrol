@@ -646,9 +646,10 @@ func (g *Gateway) startEnrollmentReaper(ctx context.Context) {
 }
 
 // reapStaleEnrolledPeers revokes enrolled peers whose WireGuard receive
-// counter has not advanced within its authorizer's liveness_timeout. Liveness comes from the device
+// counter has not advanced within its authorizer's liveness window
+// (keepalive_interval × keepalive_reap_count). Liveness comes from the device
 // (persistent-keepalive traffic increments rx_bytes ~every 25s), not an
-// app-level heartbeat. A freshly enrolled peer gets a full liveness_timeout grace
+// app-level heartbeat. A freshly enrolled peer gets a full liveness window
 // before it is eligible (lastProgress is seeded on first sight).
 func (g *Gateway) reapStaleEnrolledPeers(_ context.Context) {
 	if g == nil || g.db == nil || globalWG == nil {

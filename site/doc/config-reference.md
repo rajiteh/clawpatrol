@@ -615,7 +615,6 @@ projected ServiceAccount token with the Kubernetes TokenReview API.
 | `match` | `block` | no | The repeated `match { ... }` rules. Each binds one namespace + service_account identity to a profile allowlist. At least one is required. |
 | `keepalive_interval` | `string` | no | The WireGuard persistent-keepalive interval (time.ParseDuration) applied to enrolled peers in both directions and pushed to the sidecar at enroll. Optional; defaults to 25s, and must be at least 10s. |
 | `keepalive_reap_count` | `int` | no | How many missed keepalives elapse before an enrolled peer is reaped; the liveness window is keepalive_interval × keepalive_reap_count. Expressing it as a count keeps the safety ratio an integer that can't be misconfigured. Optional; defaults to 3. Set to 0 to disable reaping (and the sidecar's self-heal escalation) entirely; any other value must be 2 or greater. |
-| `max_ttl` | `string` | no | An optional hard lifetime for enrolled peers (time.ParseDuration). Parsed and stored; enforcement is future work. Validated as a positive duration when set. |
 
 **Nested block `match {}`:**
 

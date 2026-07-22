@@ -100,8 +100,7 @@ disable reaping) is how many missed keepalives elapse before the reaper
 revokes a peer. The liveness window is derived — `keepalive_interval ×
 keepalive_reap_count` — so the reap-vs-keepalive safety ratio is an integer
 that can't be misconfigured, and the gateway pushes the resolved keepalive
-to the sidecar at enroll so both ends stay in sync. `max_ttl` is accepted
-and stored for a future hard-expiry pass; it is not enforced yet.
+to the sidecar at enroll so both ends stay in sync.
 
 ## Security boundary
 
@@ -209,6 +208,31 @@ reaping.
 
 The reaper only ever touches enrolled rows (`enrolled = 1`), so durably
 onboarded devices are never reaped.
+
+The sidecar recovers on its own when the tunnel goes quiet, independent of
+the reaper. Its rx-liveness watchdog watches the same keepalive signal: after
+a client-configurable number of missed keepalives (`--local-reset-missed`,
+default 2, clamped to the server reap count; `0` disables) it resets the
+tunnel in place, and if `rx_bytes` is still stalled at the reap threshold it
+exits. It deliberately does not restore a broad default route on the way out:
+with `clawpatrol0` torn down the pod is left with no default route, so the
+workload's general egress fails closed during the gap rather than leaking out
+untunneled. The `restartPolicy: Always` native sidecar is restarted by the
+kubelet; it reaches the gateway over the control-plane host routes it pinned
+to the pod's underlay — the gateway API/endpoint and the DNS resolvers, tagged
+with a dedicated route protocol (`--route-proto`, default `111`) so they
+survive the restart and can be found again without a default route — re-enrolls
+with a fresh key, and reuses its prior peer IP for the same subject.
+
+## Restricting pod egress (recommended)
+
+The fail-closed routing above means a workload cannot reach off-cluster
+destinations untunneled, even mid-self-heal. As a second, cluster-enforced
+layer, restrict the agent pod's egress to only the gateway (API + WireGuard
+endpoint) and cluster DNS with a NetworkPolicy — see
+[`examples/kubernetes/agent-egress-networkpolicy.yaml`](https://github.com/denoland/clawpatrol/blob/main/examples/kubernetes/agent-egress-networkpolicy.yaml).
+It is optional defense-in-depth (not part of the Kustomization base) and only
+takes effect on a CNI that enforces NetworkPolicy.
 
 ## Limitations
 
