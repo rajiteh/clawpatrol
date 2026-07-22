@@ -214,9 +214,25 @@ the reaper. Its rx-liveness watchdog watches the same keepalive signal: after
 a client-configurable number of missed keepalives (`--local-reset-missed`,
 default 2, clamped to the server reap count; `0` disables) it resets the
 tunnel in place, and if `rx_bytes` is still stalled at the reap threshold it
-restores the pod's default route and exits. The `restartPolicy: Always`
-native sidecar is then restarted by the kubelet and re-enrolls with a fresh
-key, reusing its prior peer IP for the same subject.
+exits. It deliberately does not restore a broad default route on the way out:
+with `clawpatrol0` torn down the pod is left with no default route, so the
+workload's general egress fails closed during the gap rather than leaking out
+untunneled. The `restartPolicy: Always` native sidecar is restarted by the
+kubelet; it reaches the gateway over the control-plane host routes it pinned
+to the pod's underlay — the gateway API/endpoint and the DNS resolvers, tagged
+with a dedicated route protocol so they survive the restart and can be found
+again without a default route — re-enrolls with a fresh key, and reuses its
+prior peer IP for the same subject.
+
+## Restricting pod egress (recommended)
+
+The fail-closed routing above means a workload cannot reach off-cluster
+destinations untunneled, even mid-self-heal. As a second, cluster-enforced
+layer, restrict the agent pod's egress to only the gateway (API + WireGuard
+endpoint) and cluster DNS with a NetworkPolicy — see
+[`examples/kubernetes/agent-egress-networkpolicy.yaml`](https://github.com/denoland/clawpatrol/blob/main/examples/kubernetes/agent-egress-networkpolicy.yaml).
+It is optional defense-in-depth (not part of the Kustomization base) and only
+takes effect on a CNI that enforces NetworkPolicy.
 
 ## Limitations
 

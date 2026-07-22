@@ -1,0 +1,67 @@
+# Recommended (defense-in-depth) egress NetworkPolicy for agent pods.
+#
+# This is NOT part of the default Kustomization base and nothing in the
+# enrollment path depends on it. The bridge sidecar already fails closed at
+# the routing layer: all pod egress is default-routed through the WireGuard
+# tunnel, and if the tunnel drops there is no default route at all, so the
+# workload cannot reach off-cluster destinations untunneled. This policy adds
+# a second, cluster-enforced layer that pins the pod's *allowed* egress to
+# exactly the paths enrollment needs.
+#
+# Apply it in a cluster whose CNI enforces NetworkPolicy (Calico, Cilium,
+# etc.). Note that some CNIs — including kind's default kindnet — do not
+# enforce NetworkPolicy, in which case this manifest is inert.
+#
+# Egress is restricted to:
+#   - the clawpatrol gateway: API (TCP 8080) and the WireGuard endpoint
+#     (UDP 51820); once the tunnel is up, all tunneled traffic egresses as
+#     WireGuard to the gateway, so this is the pod's only real egress;
+#   - cluster DNS (kube-dns / CoreDNS, UDP+TCP 53), needed to resolve the
+#     gateway hostname on (re-)enrollment.
+# Everything else is denied by the implicit default-deny that a NetworkPolicy
+# with an Egress rule imposes.
+#
+# Namespace/label assumptions match the Kustomization base: the gateway runs
+# in namespace `clawpatrol` with pod label `app: clawpatrol-gateway`, and the
+# cluster DNS pods carry `k8s-app: kube-dns` in `kube-system`. Adjust the
+# selectors and the DNS target to match your environment.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: clawpatrol-agent-egress
+  namespace: agents
+spec:
+  # Scope to enrollment agents. Narrow this podSelector if the namespace also
+  # runs pods that should keep unrestricted egress.
+  podSelector:
+    matchLabels:
+      clawpatrol.dev/profile: default
+  policyTypes:
+    - Egress
+  egress:
+    # clawpatrol gateway: API + WireGuard endpoint.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: clawpatrol
+          podSelector:
+            matchLabels:
+              app: clawpatrol-gateway
+      ports:
+        - protocol: TCP
+          port: 8080
+        - protocol: UDP
+          port: 51820
+    # Cluster DNS.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
