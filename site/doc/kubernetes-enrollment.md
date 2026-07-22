@@ -96,8 +96,7 @@ persistent-keepalive cadence applied to enrolled peers in both directions;
 keepalives elapse before the reaper revokes a peer. The liveness window is
 derived — `keepalive_interval × keepalive_reap_count` — so the safety ratio is
 an integer that can't be misconfigured, and the resolved keepalive is pushed
-to the sidecar at enroll so both ends stay in sync. `max_ttl` is optional,
-parsed and stored for a future hard-expiry pass; it is not enforced yet.
+to the sidecar at enroll so both ends stay in sync.
 
 The complete standalone HCL example lives at
 [`examples/wireguard-enrollment-kubernetes.hcl`](https://github.com/denoland/clawpatrol/blob/main/examples/wireguard-enrollment-kubernetes.hcl).

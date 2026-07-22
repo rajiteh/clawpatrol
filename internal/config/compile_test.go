@@ -129,7 +129,6 @@ func TestEnrollmentConfigValidation(t *testing.T) {
 
   keepalive_interval = "40s"
   keepalive_reap_count = 3
-  max_ttl            = "24h"
 }
 `
 	valid := `gateway {
@@ -161,8 +160,8 @@ profile "default" { credentials = [] }
 	if !ok {
 		t.Fatalf("enrollment body = %T, want *config.K8sEnrollment", ent.Body)
 	}
-	if ke.KeepaliveInterval != "40s" || ke.KeepaliveReapCount == nil || *ke.KeepaliveReapCount != 3 || ke.MaxTTL != "24h" {
-		t.Fatalf("keepalive/multiplier/max = %q/%v/%q, want 40s/3/24h", ke.KeepaliveInterval, ke.KeepaliveReapCount, ke.MaxTTL)
+	if ke.KeepaliveInterval != "40s" || ke.KeepaliveReapCount == nil || *ke.KeepaliveReapCount != 3 {
+		t.Fatalf("keepalive/reap = %q/%v, want 40s/3", ke.KeepaliveInterval, ke.KeepaliveReapCount)
 	}
 	if len(ke.Matches) != 1 || ke.Matches[0].ProfileLabel != "clawpatrol.dev/profile" {
 		t.Fatalf("unexpected matches: %+v", ke.Matches)
@@ -176,9 +175,6 @@ profile "default" { credentials = [] }
 	enr := cp.K8sEnrollmentsByName["agents"]
 	if enr == nil {
 		t.Fatalf("compiled enrollment %q missing", "agents")
-	}
-	if enr.MaxTTL != 24*time.Hour {
-		t.Fatalf("compiled max_ttl = %s, want 24h", enr.MaxTTL)
 	}
 	// Liveness is derived and shared: keepalive_interval × keepalive_reap_count = 40s×3 = 2m.
 	l, ok := cp.EnrollmentLivenessByName["agents"]
@@ -228,11 +224,6 @@ profile "default" { credentials = [] }
 			name: "keepalive_reap_count of 1 rejected",
 			body: strings.Replace(valid, `keepalive_reap_count = 3`, `keepalive_reap_count = 1`, 1),
 			want: "Invalid enrollment keepalive_reap_count",
-		},
-		{
-			name: "bad max_ttl",
-			body: strings.Replace(valid, `max_ttl            = "24h"`, `max_ttl            = "nope"`, 1),
-			want: "Invalid enrollment max_ttl",
 		},
 		{
 			name: "missing match",

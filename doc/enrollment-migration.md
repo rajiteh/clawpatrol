@@ -11,9 +11,8 @@ labeled `enrollment "<type>" "<name>"` blocks — siblings of `profile` /
 > [§1b](#1b-interim-enrollment-shape) for the small change: the whole
 > block moves out of `gateway { ... }` to the top level, the `authorizer`
 > sub-block's two labels move up onto `enrollment` itself, `allow { ... }`
-> rules become `match { ... }` blocks, `peer_ttl` is replaced by the
-> derived liveness window (`keepalive_interval × keepalive_reap_count`), and
-> an optional `max_ttl` slot is now accepted.
+> rules become `match { ... }` blocks, and `peer_ttl` is replaced by the
+> derived liveness window (`keepalive_interval × keepalive_reap_count`).
 
 No data migration is needed: the storage migration
 (`0020_wg_peer_enrollment.sql`) runs automatically on gateway startup
@@ -83,7 +82,6 @@ enrollment "kubernetes_token_review" "agents" {
   # Liveness is derived: keepalive_interval × keepalive_reap_count (60s×3 = 3m).
   keepalive_interval = "60s"
   keepalive_reap_count = 3
-  # max_ttl = "24h"   # optional; parsed + stored, not enforced yet
 }
 ```
 
@@ -97,8 +95,6 @@ Notes:
 - `profile_label` is optional per `match` (default
   `clawpatrol.dev/profile`). The pod's profile is read from that label
   and must be in the match's `profiles` allowlist.
-- `max_ttl` is optional; it is parsed and stored for a future
-  hard-expiry pass but not enforced yet.
 - Validate before rolling out: `clawpatrol validate gateway.hcl`.
 
 ## 1b. Interim enrollment shape
@@ -116,7 +112,6 @@ If you already migrated off `dynamic_peers` onto the interim
   `match { namespace, service_account, profile_label?, profiles }`.
 - the enrollment-wide `peer_ttl` → per-block `keepalive_interval` ×
   `keepalive_reap_count` (derived liveness window).
-- new optional `max_ttl` slot (parsed + stored, not yet enforced).
 
 Multiple authorizers that used to be sibling `authorizer` blocks under
 one `enrollment` become multiple top-level `enrollment "<type>"

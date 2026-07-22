@@ -100,8 +100,7 @@ disable reaping) is how many missed keepalives elapse before the reaper
 revokes a peer. The liveness window is derived — `keepalive_interval ×
 keepalive_reap_count` — so the reap-vs-keepalive safety ratio is an integer
 that can't be misconfigured, and the gateway pushes the resolved keepalive
-to the sidecar at enroll so both ends stay in sync. `max_ttl` is accepted
-and stored for a future hard-expiry pass; it is not enforced yet.
+to the sidecar at enroll so both ends stay in sync.
 
 ## Security boundary
 
