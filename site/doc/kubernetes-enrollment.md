@@ -199,8 +199,21 @@ liveness window first. On shutdown the sidecar best-effort deregisters;
 either way the gateway revokes the transient WireGuard peer and clears its
 enrolled `wg_peers` row.
 
-Enrolled peers show up in the dashboard as regular devices — there is no
-separate enrollment surface.
+The sidecar also self-heals from the client side. An rx-liveness watchdog
+watches the same keepalive signal: after a client-configurable number of
+missed keepalives (`--local-reset-missed`, default 2, clamped to the server
+reap count) it resets the tunnel in place, and if `rx_bytes` is still quiet
+at the reap threshold it restores the pod's default route and exits so the
+kubelet restarts the sidecar. The restarted sidecar re-enrolls with a fresh
+key and reuses its prior peer IP for the same subject.
+
+Enrolled peers show up in the dashboard's Devices list alongside onboarded
+devices, distinguished by their `authorizer/subject` name. The device detail
+page adds an Enrollment panel showing the authorizer, subject, enrolled time,
+keepalive, derived liveness window, and last heartbeat with a missed-beat
+counter, plus a live/stale indicator. The profile is shown read-only (it is
+assigned from the pod label) and the delete action is hidden, since the peer
+is reaper-managed.
 
 ## Local e2e
 

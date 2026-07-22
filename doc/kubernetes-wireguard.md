@@ -209,6 +209,15 @@ reaping.
 The reaper only ever touches enrolled rows (`enrolled = 1`), so durably
 onboarded devices are never reaped.
 
+The sidecar recovers on its own when the tunnel goes quiet, independent of
+the reaper. Its rx-liveness watchdog watches the same keepalive signal: after
+a client-configurable number of missed keepalives (`--local-reset-missed`,
+default 2, clamped to the server reap count; `0` disables) it resets the
+tunnel in place, and if `rx_bytes` is still stalled at the reap threshold it
+restores the pod's default route and exits. The `restartPolicy: Always`
+native sidecar is then restarted by the kubelet and re-enrolls with a fresh
+key, reusing its prior peer IP for the same subject.
+
 ## Limitations
 
 - v1 assumes the gateway is a single active replica with a PVC-backed
