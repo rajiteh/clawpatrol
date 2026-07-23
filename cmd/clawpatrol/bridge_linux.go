@@ -5,9 +5,7 @@ package main
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
-	"math/rand"
 	"net"
 	"net/netip"
 	"net/url"
@@ -28,252 +26,382 @@ import (
 // The route protocol tag (opt.RouteProto, default defaultRouteProto) turns the
 // routing table itself into the bridge's durable state: every control-plane
 // host route the bridge pins to the underlay (gateway API, WireGuard endpoint,
-// DNS resolvers) carries it, so it survives the process exit and the container
-// restart. A self-heal restart then recovers the underlay gateway from a
-// tagged pin instead of a default route — there is no default route after
-// self-heal, by design (see the selfHeal case in bridgeRun).
+// DNS resolvers) carries it, so it survives an in-process reconnect (which
+// tears clawpatrol0 down) and a genuine container restart. Bring-up then
+// recovers the underlay gateway from a tagged pin when there is no default
+// route left, and reconciles the pinned set against the current resolv.conf +
+// underlay each time (see bridgeBringUp / pruneStalePins).
 
-// bridgeRun is the resident, privileged data plane behind
-// `clawpatrol bridge`. It self-enrolls through an authorizer, hosts a
-// userspace WireGuard tunnel, routes the whole network namespace through the
-// gateway, writes the CA + env handoff for the sibling workload container,
-// and deregisters on SIGTERM. The enroll / deregister / claims logic is the
-// transport-agnostic enrollment client core (enrollment_client.go);
-// everything here is the TUN-specific bring-up.
+// bridgeState is the sidecar's retained in-memory state. Because recovery is
+// in-process (the sidecar never exits to recover — a native-sidecar restart
+// lands in the same pod sandbox and resets nothing a device rebuild doesn't),
+// this survives across reconnects and backs the recovery counters that replace
+// container restart-count as the operator signal, plus the bring-up backoff.
+type bridgeState struct {
+	reconnects     int
+	bringUpFails   int
+	handoffWritten bool
+}
+
+// bridgeSession is one live tunnel: the userspace WireGuard device, its TUN,
+// and the peer API token for deregister. Closing it tears the tunnel down —
+// clawpatrol0 dies, so the `default dev clawpatrol0` route dies with it and
+// egress fails closed — and stops the watchdog. The tagged control-plane pins
+// live on the underlay device and survive, so the next bring-up can still
+// reach the gateway.
+type bridgeSession struct {
+	dev          *device.Device
+	tun          wgtun.Device
+	apiToken     string
+	stopWatchdog context.CancelFunc
+	reconnect    chan struct{}
+}
+
+func (s *bridgeSession) close() {
+	if s.stopWatchdog != nil {
+		s.stopWatchdog()
+	}
+	if s.dev != nil {
+		s.dev.Close()
+	}
+	if s.tun != nil {
+		_ = s.tun.Close()
+	}
+}
+
+// bridgeRun is the resident, privileged data plane behind `clawpatrol bridge`.
+// It enrolls, hosts a userspace WireGuard tunnel, routes the whole netns
+// through the gateway, and hands off CA+env to the sibling workload. On lost
+// liveness it self-heals in place: the ICMP-echo watchdog rekeys and, if
+// needed, triggers a full in-process teardown + re-enroll — the reconnect loop
+// below re-discovers DNS + the underlay and reconciles the tagged pins each
+// time. It does not exit to recover (see bridgeState); only SIGTERM (pod
+// teardown) ends the loop, with a best-effort deregister.
 func bridgeRun(ctx context.Context, opt bridgeOptions) error {
+	sigCtx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	st := &bridgeState{}
+	backoff := time.Second
+	for {
+		sess, err := bridgeBringUp(sigCtx, opt, st)
+		if err != nil {
+			if sigCtx.Err() != nil {
+				return nil
+			}
+			st.bringUpFails++
+			fmt.Fprintf(os.Stderr, "[clawpatrol] bridge: bring-up failed (attempt %d): %v — retrying in %s\n", st.bringUpFails, err, backoff)
+			select {
+			case <-sigCtx.Done():
+				return nil
+			case <-time.After(backoff):
+			}
+			backoff = minDuration(backoff*2, 30*time.Second)
+			continue
+		}
+		st.bringUpFails = 0
+		backoff = time.Second
+
+		select {
+		case <-sigCtx.Done():
+			// Graceful shutdown: best-effort deregister (bounded so a hung
+			// gateway/DNS call can't delay pod termination past the grace
+			// period), then tear the tunnel down. The netns goes with the pod.
+			delCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			enrollmentDeregister(delCtx, opt.GatewayURL, sess.apiToken)
+			cancel()
+			sess.close()
+			return nil
+		case <-sess.reconnect:
+			// The watchdog gave up on this session. Tear it down — egress fails
+			// closed during the gap — and loop: bring-up re-discovers DNS +
+			// underlay and reconciles the tagged pins before re-enrolling. Skip
+			// deregister: the peer is either reaped already or reused by IP.
+			st.reconnects++
+			fmt.Fprintf(os.Stderr, "[clawpatrol] bridge: liveness lost — reconnecting in-process (reconnect #%d)\n", st.reconnects)
+			sess.close()
+		}
+	}
+}
+
+// bridgeBringUp performs one enroll + tunnel bring-up and returns a live
+// session. It is re-callable: every call re-reads /etc/resolv.conf and
+// re-discovers the underlay (a container restart would rediscover for free;
+// in-process reconnect must do it deliberately), reconciling the tagged
+// control-plane pins so a swapped resolver or moved gateway is picked up and
+// stale pins are pruned.
+func bridgeBringUp(ctx context.Context, opt bridgeOptions, st *bridgeState) (_ *bridgeSession, err error) {
 	claims, credential, err := gatherEnrollmentClaims(opt.AuthorizerType, opt.KubeTokenPath)
 	if err != nil {
-		return err
+		return nil, err
 	}
-
 	clientPrivB64, _, clientPubB64, err := wgGenKeypair()
 	if err != nil {
-		return fmt.Errorf("generate wireguard keypair: %w", err)
+		return nil, fmt.Errorf("generate wireguard keypair: %w", err)
 	}
 
-	// The underlay route is the pod's original (pre-tunnel) default. On first
-	// boot that is the live CNI default route. After a self-heal restart there
-	// is no default route (self-heal leaves the netns fail-closed), so recover
-	// it from a surviving tagged pin instead — the pins carry the same
-	// via/dev. Either way we need it to pin the control-plane hosts to the
-	// underlay before the default flips to the tunnel.
+	// Underlay route: the pod's pre-tunnel default on first boot, or a surviving
+	// tagged pin after an in-process reconnect / genuine restart (clawpatrol0 is
+	// gone, so there is no default route). Re-discovered every bring-up so a
+	// moved underlay gateway is picked up.
 	route4, src4, ok4 := discoverUnderlayRoute("-4", opt.RouteProto)
 	if !ok4 {
-		return fmt.Errorf("no usable underlay route: neither a default route nor a tagged clawpatrol pin was found")
-	}
-	// One positive lifecycle line per boot, keyed on where the underlay came
-	// from. "pin" means there was no default route at start, so this is a
-	// self-heal restart recovering the gateway from the tagged pins — the
-	// signal that would otherwise be invisible on the surviving container once
-	// the failed instance's logs rotate out. "default" is a normal first boot.
-	if src4 == "pin" {
-		fmt.Fprintf(os.Stderr, "[clawpatrol] bridge: no default route at start — recovered underlay gateway via %s dev %s from tagged pins (proto %s); this is a self-heal restart, re-enrolling\n", route4.Via, route4.Dev, opt.RouteProto)
-	} else {
-		fmt.Fprintf(os.Stderr, "[clawpatrol] bridge: starting; underlay gateway via %s dev %s, enrolling with %s\n", route4.Via, route4.Dev, opt.AuthorizerName)
+		return nil, fmt.Errorf("no usable underlay route: neither a default route nor a tagged clawpatrol pin was found")
 	}
 	// IPv6 is optional: present only when the pod already has a v6 underlay
-	// route. We pin/replace v6 only in that case, so we never create a v6
-	// default that would blackhole traffic that previously had no route.
+	// route. We pin/replace v6 only then, never creating a v6 default that
+	// would blackhole traffic that previously had no route.
 	route6, _, have6 := discoverUnderlayRoute("-6", opt.RouteProto)
+	// One positive boot line on the first bring-up, keyed on where the underlay
+	// came from. "pin" means no default route at process start — a genuine
+	// restart into a fail-closed netns, recovering the gateway from the tagged
+	// pins. Reconnects log their own line from the loop above.
+	if st.reconnects == 0 && st.bringUpFails == 0 {
+		if src4 == "pin" {
+			fmt.Fprintf(os.Stderr, "[clawpatrol] bridge: no default route at start — recovered underlay gateway via %s dev %s from tagged pins (proto %s); recovery boot, re-enrolling\n", route4.Via, route4.Dev, opt.RouteProto)
+		} else {
+			fmt.Fprintf(os.Stderr, "[clawpatrol] bridge: starting; underlay gateway via %s dev %s, enrolling with %s\n", route4.Via, route4.Dev, opt.AuthorizerName)
+		}
+	}
 
-	// Resolvers the pod already uses (from /etc/resolv.conf). Pinning them to
-	// the underlay keeps DNS working after the default flips to the tunnel and,
-	// critically, after a self-heal restart when there is no default route —
-	// so the sidecar can still resolve the gateway hostname by name (SNI/Host
-	// stay correct) to re-enroll. Best-effort: empty when resolv.conf names no
-	// nameservers.
+	// Re-read resolv.conf every bring-up (it may have swapped) and pin the
+	// resolvers to the underlay BEFORE registering, so DNS resolves the gateway
+	// host over the underlay even when there is no default route (reconnect).
+	// Best-effort — a resolver reachable only through the tunnel just falls back
+	// to normal routing.
 	resolverIPs := resolvConfNameservers()
+	_ = pinHosts(resolverIPs, route4, route6, have6, opt.RouteProto, false)
+
+	apiURL, err := url.Parse(opt.GatewayURL)
+	if err != nil {
+		return nil, fmt.Errorf("gateway-url: %w", err)
+	}
+	// API pins are fatal: an unpinned API host blackholes register / env-pushdown
+	// / deregister once (or while) the default route is not the underlay.
+	apiIPs, err := lookupHostIPs(apiURL.Hostname())
+	if err != nil {
+		return nil, fmt.Errorf("resolve gateway api host %q: %w", apiURL.Hostname(), err)
+	}
+	if err := pinHosts(apiIPs, route4, route6, have6, opt.RouteProto, true); err != nil {
+		return nil, err
+	}
+
 	registerResp, err := enrollmentRegister(ctx, opt.GatewayURL, credential, enrollmentRegisterRequest{
 		Transport:          enrollmentTransportWireGuard,
 		Authorizer:         opt.AuthorizerName,
 		WireGuardPublicKey: clientPubB64,
 		Claims:             claims,
-		// The bridge hosts a resident tunnel and runs the liveness watchdog,
-		// so it needs the gateway to keepalive back (symmetric) for its
-		// rx-based self-heal to work.
+		// The sidecar is the sole authoritative keepalive sender; request the
+		// resolved interval + reap count so it can keepalive and size its
+		// watchdog escalation. The gateway does not keepalive back.
 		Keepalive: true,
 	})
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if registerResp.MTU != 0 {
 		opt.MTU = registerResp.MTU
 	}
-	fmt.Fprintf(os.Stderr, "[clawpatrol] bridge: enrolled peer_ip=%s keepalive=%ds reap_count=%d\n", registerResp.PeerIP, registerResp.KeepaliveIntervalSeconds, registerResp.KeepaliveReapCount)
+	fmt.Fprintf(os.Stderr, "[clawpatrol] bridge: enrolled peer_ip=%s keepalive=%ds reap_count=%d gateway_tunnel_ip=%s\n",
+		registerResp.PeerIP, registerResp.KeepaliveIntervalSeconds, registerResp.KeepaliveReapCount, registerResp.GatewayTunnelIP)
 
-	apiURL, err := url.Parse(opt.GatewayURL)
-	if err != nil {
-		return fmt.Errorf("gateway-url: %w", err)
-	}
-	// Fail fast rather than silently skip pinning the API host routes —
-	// consistent with the fatal pin stance below; an unpinned API after the
-	// default-route swap would blackhole the env-pushdown + deregister calls.
-	apiIPs, err := lookupHostIPs(apiURL.Hostname())
-	if err != nil {
-		return fmt.Errorf("resolve gateway api host %q: %w", apiURL.Hostname(), err)
-	}
 	endpointIP, endpointAddr, err := resolveWGEndpoint(registerResp.Endpoint)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	// Keep the gateway API + WG endpoint reachable on the original path once
-	// the default route flips to the tunnel. A missed pin blackholes the
-	// handshake / API calls, so a pin failure is fatal. v6 addresses are
-	// pinned only when a v6 default route exists (the family we'll replace);
-	// otherwise they keep their existing routing.
-	for _, ip := range append(apiIPs, endpointIP) {
-		if !ip.Is4() && !have6 {
-			continue
-		}
-		if err := pinHostRoute(ip, route4, route6, have6, opt.RouteProto); err != nil {
-			return fmt.Errorf("pin host route %s: %w", ip, err)
-		}
+	if err := pinHosts([]netip.Addr{endpointIP}, route4, route6, have6, opt.RouteProto, true); err != nil {
+		return nil, fmt.Errorf("pin wg endpoint: %w", err)
 	}
-	// Pin the resolvers too, so DNS survives the default flip and a self-heal
-	// restart. Best-effort: a resolver that can't be pinned (e.g. reachable
-	// only through the tunnel) just falls back to normal routing rather than
-	// failing bring-up.
+	// Now that the full desired set is known, prune any tagged pin no longer
+	// needed (a resolver that swapped out, an endpoint that moved) so stale
+	// pins can't accumulate across reconnects.
+	want := map[netip.Addr]bool{endpointIP: true}
 	for _, ip := range resolverIPs {
-		if !ip.Is4() && !have6 {
-			continue
-		}
-		if err := pinHostRoute(ip, route4, route6, have6, opt.RouteProto); err != nil {
-			fmt.Fprintf(os.Stderr, "[clawpatrol] bridge: pin resolver route %s: %v — continuing\n", ip, err)
-		}
+		want[ip] = true
+	}
+	for _, ip := range apiIPs {
+		want[ip] = true
+	}
+	pruneStalePins(want, opt.RouteProto)
+
+	gwTunIP, err := netip.ParseAddr(strings.TrimSpace(registerResp.GatewayTunnelIP))
+	if err != nil {
+		return nil, fmt.Errorf("gateway did not return a usable tunnel IP %q: %w", registerResp.GatewayTunnelIP, err)
 	}
 
 	tunDev, err := wgtun.CreateTUN(opt.Iface, opt.MTU)
 	if err != nil {
-		return fmt.Errorf("create tun: %w", err)
+		return nil, fmt.Errorf("create tun: %w", err)
 	}
-	defer func() { _ = tunDev.Close() }()
+	ok := false
+	defer func() {
+		if !ok {
+			_ = tunDev.Close()
+		}
+	}()
 	ifaceName, err := tunDev.Name()
 	if err != nil {
-		return fmt.Errorf("tun name: %w", err)
+		return nil, fmt.Errorf("tun name: %w", err)
 	}
 	logger := device.NewLogger(device.LogLevelError, "[clawpatrol tun wg] ")
 	dev := device.NewDevice(tunDev, conn.NewDefaultBind(), logger)
-	defer dev.Close()
+	defer func() {
+		if !ok {
+			dev.Close()
+		}
+	}()
 
 	if err := setupTunDevice(ifaceName, opt.MTU, registerResp.PeerIP, registerResp.PeerIPv6); err != nil {
-		return err
+		return nil, err
 	}
-	// The gateway dictates keepalive + reap horizon at enroll. Mirror the
-	// keepalive onto our tunnel and size the watchdog's rx-liveness
-	// thresholds from the same numbers so the client escalates in lock-step
-	// with the gateway's reaper.
 	keepaliveSecs := registerResp.KeepaliveIntervalSeconds
 	if keepaliveSecs <= 0 {
 		keepaliveSecs = 25
 	}
-	keepalive := time.Duration(keepaliveSecs) * time.Second
-	var rxResetAfter, rxExitAfter time.Duration
-	if mult := registerResp.KeepaliveReapCount; mult >= 2 {
-		// Local rebuild after the client's configured missed-keepalive count
-		// (default 2, disabled at 0 or when it meets/exceeds the reap
-		// horizon); full restart at the reap horizon (mult missed). Positive
-		// jitter (≤ half a keepalive) never fires early and staggers a mass
-		// reap so sidecars don't all re-enroll at once.
-		if rm := watchdogResetMisses(opt.LocalResetMisses, mult); rm > 0 {
-			rxResetAfter = keepalive * time.Duration(rm)
-		}
-		jitter := time.Duration(rand.Int63n(int64(keepalive/2) + 1))
-		rxExitAfter = keepalive*time.Duration(mult) + jitter
-	}
 	ipc, err := buildTunWGIpc(clientPrivB64, registerResp.ServerPublicKey, endpointAddr, keepaliveSecs)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if err := dev.IpcSet(ipc); err != nil {
-		return fmt.Errorf("wg IpcSet: %w", err)
+		return nil, fmt.Errorf("wg IpcSet: %w", err)
 	}
 	if err := dev.Up(); err != nil {
-		return fmt.Errorf("wg up: %w", err)
+		return nil, fmt.Errorf("wg up: %w", err)
 	}
 	if err := replaceDefaultRoutes(ifaceName, have6); err != nil {
-		return err
+		return nil, err
 	}
 
-	watchdogCtx, stopWatchdog := context.WithCancel(context.Background())
-	defer stopWatchdog()
-	// selfHeal fires when the watchdog gives up on this enrollment (rx quiet
-	// past the exit threshold). We handle it on the main goroutine rather
-	// than os.Exit from the watchdog so the netns is cleaned up first — see
-	// the wait below.
-	selfHeal := make(chan struct{}, 1)
-	watchdogTicker := time.NewTicker(wgWatchdogPoll)
+	// env + CA handoff only on the first successful bring-up: the workload reads
+	// it once, and it does not change across reconnects for the same subject.
+	if !st.handoffWritten {
+		envVars, err := enrollmentFetchEnv(ctx, opt.GatewayURL, registerResp.APIToken)
+		if err != nil {
+			return nil, err
+		}
+		envVars = append(caPathPushdownVars(opt.CAOut), envVars...)
+		if err := writeTunFiles(opt, envVars, registerResp.CAPEM); err != nil {
+			return nil, err
+		}
+		st.handoffWritten = true
+	}
+
+	// Watchdog: rx_bytes is the cheap positive signal, an ICMP echo to the
+	// gateway tunnel IP is the active probe when rx goes quiet. Cadence and
+	// escalation reuse the keepalive interval and the server-dictated reap
+	// count so the client stays in lock-step with the reaper.
+	keepalive := time.Duration(keepaliveSecs) * time.Second
+	reconnectAfter := registerResp.KeepaliveReapCount
+	rekeyAfter := watchdogResetMisses(opt.LocalResetMisses, reconnectAfter)
+
+	wdCtx, stopWatchdog := context.WithCancel(context.Background())
+	sess := &bridgeSession{
+		dev:          dev,
+		tun:          tunDev,
+		apiToken:     registerResp.APIToken,
+		stopWatchdog: stopWatchdog,
+		reconnect:    make(chan struct{}, 1),
+	}
+	ticker := time.NewTicker(wgWatchdogPoll)
 	go func() {
-		defer watchdogTicker.Stop()
-		runWGWatchdogLoop(watchdogCtx, wgWatchdogConfig{
-			stats: func() *wgPeerStats {
+		defer ticker.Stop()
+		runWGWatchdogLoop(wdCtx, wgWatchdogConfig{
+			rx: func() uint64 {
 				uapi, err := dev.IpcGet()
 				if err != nil {
-					return nil
+					return 0
 				}
-				return parsePeerStats(uapi)
+				if s := parsePeerStats(uapi); s != nil {
+					return s.rxBytes
+				}
+				return 0
 			},
-			reset:         func() error { return dev.IpcSet(ipc) },
-			log:           logger,
-			tick:          watchdogTicker.C,
-			resetCooldown: wgWatchdogResetCooldown,
-			now:           time.Now,
-			rxResetAfter:  rxResetAfter,
-			rxExitAfter:   rxExitAfter,
-			exit: func() {
+			probe: func() error { return pingGatewayTunnel(gwTunIP, wgProbeTimeout) },
+			rekey: func() error { return dev.IpcSet(ipc) },
+			reconnect: func() {
 				select {
-				case selfHeal <- struct{}{}:
+				case sess.reconnect <- struct{}{}:
 				default:
 				}
 			},
+			log:  logger,
+			tick: ticker.C,
+			now:  time.Now,
+
+			probeAfter:          keepalive,
+			probeInterval:       keepalive,
+			rekeyAfterFails:     rekeyAfter,
+			reconnectAfterFails: reconnectAfter,
 		})
 	}()
+	ok = true
+	return sess, nil
+}
 
-	envVars, err := enrollmentFetchEnv(ctx, opt.GatewayURL, registerResp.APIToken)
-	if err != nil {
-		return err
+// pinHosts pins each host to its family's underlay route, tagged with proto.
+// When fatal, the first pin error aborts (an unpinned control-plane host
+// blackholes the path); otherwise pins are best-effort. Hosts of a family with
+// no underlay route are skipped.
+func pinHosts(hosts []netip.Addr, route4, route6 linuxDefaultRoute, have6 bool, proto string, fatal bool) error {
+	for _, ip := range hosts {
+		if !ip.Is4() && !have6 {
+			continue
+		}
+		if err := pinHostRoute(ip, route4, route6, have6, proto); err != nil {
+			if fatal {
+				return fmt.Errorf("pin host route %s: %w", ip, err)
+			}
+			fmt.Fprintf(os.Stderr, "[clawpatrol] bridge: pin route %s: %v — continuing\n", ip, err)
+		}
 	}
-	envVars = append(caPathPushdownVars(opt.CAOut), envVars...)
-	if err := writeTunFiles(opt, envVars, registerResp.CAPEM); err != nil {
-		return err
-	}
+	return nil
+}
 
-	// Stay up for the netns lifetime. WireGuard persistent-keepalive keeps
-	// the tunnel live and lets the gateway observe liveness (rx_bytes); the
-	// gateway reaps the peer if we go quiet. No app-level heartbeat.
-	sigCtx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-	select {
-	case <-sigCtx.Done():
-		// Graceful shutdown: the pod is terminating, so best-effort
-		// deregister (bounded so a hung gateway/DNS call can't delay pod
-		// termination past the grace period). The netns is torn down with
-		// the pod, so there is nothing to restore.
-		delCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		enrollmentDeregister(delCtx, opt.GatewayURL, registerResp.APIToken)
-		return nil
-	case <-selfHeal:
-		// The watchdog gave up on this enrollment (peer reaped or
-		// partitioned). The pod keeps running. We deliberately do NOT restore
-		// a broad default route: doing so would let the workload's general
-		// egress leave untunneled during the gap before the restarted sidecar
-		// rebuilds the tunnel. Instead we let the `default dev clawpatrol0`
-		// route die with the interface on exit — off-link egress then has no
-		// route (fail closed). The kubelet restarts this native sidecar; it
-		// recovers the underlay gateway from the tagged control-plane pins
-		// (which survive on eth0) and re-enrolls with a fresh key over them.
-		// Skip deregister: the peer is already gone. Exit non-zero to trigger
-		// the restart.
-		stopWatchdog()
-		return errBridgeSelfHeal
+// pruneStalePins deletes every proto-tagged route whose destination host is
+// not in want. The proto tag makes the pinned set self-identifying, so the
+// bridge can rebuild its control-plane routes without ever touching CNI ones.
+func pruneStalePins(want map[netip.Addr]bool, proto string) {
+	for _, fam := range []string{"-4", "-6"} {
+		for _, ip := range listPinnedHosts(fam, proto) {
+			if want[ip] {
+				continue
+			}
+			dst := ip.String() + "/32"
+			if ip.Is6() {
+				dst = ip.String() + "/128"
+			}
+			_ = runIP("ip", fam, "route", "del", dst, "proto", proto)
+		}
 	}
 }
 
-// errBridgeSelfHeal is returned by bridgeRun when the watchdog decides the
-// enrollment is gone and the sidecar must restart to re-enroll. It is an
-// expected, non-fatal outcome (the kubelet restarts the native sidecar), not
-// a crash — but it exits non-zero to trigger that restart.
-var errBridgeSelfHeal = errors.New("bridge: peer liveness lost; restarting to re-enroll")
+// listPinnedHosts returns the destination host of every proto-tagged route in
+// the given family ("-4"/"-6") — the bridge's own control-plane pins.
+func listPinnedHosts(family, proto string) []netip.Addr {
+	out, err := exec.Command("ip", family, "route", "show", "proto", proto).Output()
+	if err != nil {
+		return nil
+	}
+	var hosts []netip.Addr
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		dst, _, _ := strings.Cut(fields[0], "/")
+		if ip, err := netip.ParseAddr(dst); err == nil {
+			hosts = append(hosts, ip)
+		}
+	}
+	return hosts
+}
+
+func minDuration(a, b time.Duration) time.Duration {
+	if a < b {
+		return a
+	}
+	return b
+}
 
 func buildTunWGIpc(privateKeyB64, serverPublicKeyB64, endpoint string, keepaliveSeconds int) (string, error) {
 	privHex, err := base64DecodeToHex(privateKeyB64)

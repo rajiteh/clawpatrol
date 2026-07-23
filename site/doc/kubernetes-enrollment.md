@@ -202,29 +202,41 @@ On startup, the sidecar:
 5. fetches env pushdown and writes `/clawpatrol/env`,
    `/clawpatrol/ca.crt`, and `/clawpatrol/ready`.
 
-There is no application heartbeat. The gateway observes liveness from
-the WireGuard device: persistent keepalive advances the peer's
-`rx_bytes` every `keepalive_interval`, and a peer whose `rx_bytes` stops
-advancing past the liveness window (`keepalive_interval ×
-keepalive_reap_count`) is reaped. A freshly enrolled peer gets a full
-liveness window first. On shutdown the sidecar best-effort deregisters;
-either way the gateway revokes the transient WireGuard peer and clears its
-enrolled `wg_peers` row.
+There is no application heartbeat. The **sidecar is the sole (authoritative)
+keepalive sender** — the gateway does not keepalive back. That is deliberate:
+wireguard-go rearms its persistent-keepalive timer on any authenticated packet,
+including received ones, so with both peers sending, one direction's traffic
+perpetually postpones the other's keepalive and a healthy idle peer can show
+flat `rx_bytes` in one direction and be falsely reaped. With only the client
+sending, client→gateway `rx_bytes` advances deterministically every
+`keepalive_interval`, so the gateway's reaper observes true liveness: a peer
+whose `rx_bytes` stops advancing past the liveness window (`keepalive_interval
+× keepalive_reap_count`) is reaped, and a freshly enrolled peer gets a full
+window first. On shutdown the sidecar best-effort deregisters; either way the
+gateway revokes the transient WireGuard peer and clears its enrolled
+`wg_peers` row.
 
-The sidecar also self-heals from the client side. An rx-liveness watchdog
-watches the same keepalive signal: after a client-configurable number of
-missed keepalives (`--local-reset-missed`, default 2, clamped to the server
-reap count) it resets the tunnel in place, and if `rx_bytes` is still quiet
-at the reap threshold it exits so the kubelet restarts the sidecar. It does
-not restore a broad default route on the way out: with `clawpatrol0` gone the
-pod has no default route, so the workload's general egress fails closed until
-the tunnel is rebuilt. The restarted sidecar reaches the gateway over the
-control-plane host routes it pinned to the pod's underlay (the gateway and the
-DNS resolvers, tagged with a dedicated route protocol — `--route-proto`,
-default `111` — so they survive the restart and are found again), re-enrolls
-with a fresh key, and reuses its
-prior peer IP for the same subject. Because DNS stays reachable, the gateway
-is resolved by name, so its TLS SNI and `Host` are unaffected.
+The sidecar checks its own direction with an **active ICMP-echo probe**, not
+by watching `rx_bytes` (which is normally quiet on an idle tunnel now that the
+gateway does not keepalive back). While `rx_bytes` advances there is nothing to
+do. When it goes quiet the watchdog sends an ICMP echo to the gateway's tunnel
+address — a round-trip reply proves both directions — and escalates only on
+sustained failure: after `--local-reset-missed` (default 2, clamped below the
+reap count) consecutive failed probes it rekeys in place, and past the reap
+count it tears the tunnel down and **re-enrolls in process**. It does not exit
+the container to recover: a native-sidecar restart lands in the same pod
+sandbox and resets nothing a device rebuild doesn't. During the gap
+`clawpatrol0` is gone, so the pod has no default route and the workload's
+general egress fails closed until the tunnel is rebuilt. Each reconnect
+re-reads `/etc/resolv.conf` and re-discovers the underlay, reconciling the
+control-plane host routes it pins to the pod's underlay (the gateway API, the
+WireGuard endpoint, and the DNS resolvers, tagged with a dedicated route
+protocol — `--route-proto`, default `111` — so they survive with no default
+route and are found again). It re-enrolls with a fresh key, reusing its prior
+peer IP for the same subject. Because DNS stays reachable, the gateway is
+resolved by name, so its TLS SNI and `Host` are unaffected. Recovery leaves the
+container restart count untouched, so lifecycle logging (enroll, rekey, and
+reconnect transitions) — not restart count — is the operator signal.
 
 Enrolled peers show up in the dashboard's Devices list alongside onboarded
 devices, distinguished by their `authorizer/subject` name. The device detail
@@ -259,8 +271,9 @@ The test builds the current workspace image, loads it into kind,
 applies the e2e overlay, waits for the agent handoff, verifies the
 restricted agent contract, checks traffic through the tunnel, confirms
 rx_bytes liveness holds a live peer past the derived liveness window,
-exercises the sidecar self-heal (sever keepalive → hard-exit → restart →
-re-enroll with a fresh key), and verifies peer cleanup.
+exercises the sidecar self-heal (scale the gateway to 0 → the ICMP probe
+fails → the sidecar fails closed and re-enrolls in process with a fresh key,
+with no container restart), and verifies peer cleanup.
 
 ## Limitations
 

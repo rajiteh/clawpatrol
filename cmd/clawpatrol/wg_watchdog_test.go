@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -58,25 +59,143 @@ type fakeClock struct {
 func (c *fakeClock) Now() time.Time  { return time.Unix(0, c.now.Load()) }
 func (c *fakeClock) Set(t time.Time) { c.now.Store(t.UnixNano()) }
 
-// TestWatchdogRxLivenessEscalates drives the enrolled-peer path: a flat
-// rx_bytes (gateway stopped responding) first triggers a local reset at
-// rxResetAfter, then a hard exit at rxExitAfter when the reset didn't help.
-func TestWatchdogRxLivenessEscalates(t *testing.T) {
+func waitSignal(t *testing.T, ch <-chan struct{}, what string) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(time.Second):
+		t.Fatalf("expected %s", what)
+	}
+}
+
+func assertNoSignal(t *testing.T, ch <-chan struct{}, what string) {
+	t.Helper()
+	select {
+	case <-ch:
+		t.Fatalf("unexpected %s", what)
+	case <-time.After(80 * time.Millisecond):
+	}
+}
+
+// TestWatchdogProbeEscalates drives the escalation ladder: rx is flat (the
+// sidecar is the sole keepalive sender, so a quiet inbound is normal), so once
+// rx has been quiet past probeAfter the watchdog probes; consecutive probe
+// failures rekey, then reconnect.
+func TestWatchdogProbeEscalates(t *testing.T) {
 	clk := &fakeClock{}
 	t0 := time.Unix(3_000_000, 0)
 	clk.Set(t0)
 
-	tick := make(chan time.Time, 4)
-	// Handshake completed at t0 (unblocks the first-handshake gate); rx flat.
-	stats := func() *wgPeerStats {
-		return &wgPeerStats{lastHandshake: t0, rxBytes: 1000}
-	}
-	resetCalls := make(chan struct{}, 8)
-	reset := func() error { resetCalls <- struct{}{}; return nil }
-	exitCalls := make(chan struct{}, 1)
-	exit := func() {
+	tick := make(chan time.Time)
+	probeCalls := make(chan struct{}, 16)
+	probe := func() error { probeCalls <- struct{}{}; return errors.New("no reply") }
+	rekeyCalls := make(chan struct{}, 8)
+	rekey := func() error { rekeyCalls <- struct{}{}; return nil }
+	reconnectCalls := make(chan struct{}, 1)
+	reconnect := func() {
 		select {
-		case exitCalls <- struct{}{}:
+		case reconnectCalls <- struct{}{}:
+		default:
+		}
+	}
+	rx := func() uint64 { return 1000 } // flat
+
+	log, _ := loggerWithLines()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		runWGWatchdogLoop(ctx, wgWatchdogConfig{
+			rx: rx, probe: probe, rekey: rekey, reconnect: reconnect,
+			log: log, tick: tick, now: clk.Now,
+			probeAfter: 25 * time.Second, probeInterval: 25 * time.Second,
+			rekeyAfterFails: 2, reconnectAfterFails: 3,
+		})
+		close(done)
+	}()
+
+	// Tick 1 seeds rx tracking — no probe (rx quiet only just observed).
+	tick <- clk.Now()
+	assertNoSignal(t, probeCalls, "probe on seed tick")
+
+	// +25s: rx quiet past probeAfter → probe #1, fails (1) — no rekey yet.
+	clk.Set(t0.Add(25 * time.Second))
+	tick <- clk.Now()
+	waitSignal(t, probeCalls, "probe #1")
+	assertNoSignal(t, rekeyCalls, "rekey after a single failure")
+
+	// +50s: probe #2, second consecutive failure → in-place rekey.
+	clk.Set(t0.Add(50 * time.Second))
+	tick <- clk.Now()
+	waitSignal(t, probeCalls, "probe #2")
+	waitSignal(t, rekeyCalls, "rekey at 2 consecutive failures")
+
+	// +75s: probe #3, third failure → reconnect, loop returns.
+	clk.Set(t0.Add(75 * time.Second))
+	tick <- clk.Now()
+	waitSignal(t, probeCalls, "probe #3")
+	waitSignal(t, reconnectCalls, "reconnect at 3 consecutive failures")
+	<-done
+}
+
+// TestWatchdogRxHealthyNoProbe confirms an advancing rx (real inbound traffic)
+// is treated as liveness on its own — the watchdog never generates a probe.
+func TestWatchdogRxHealthyNoProbe(t *testing.T) {
+	clk := &fakeClock{}
+	t0 := time.Unix(6_000_000, 0)
+	clk.Set(t0)
+
+	tick := make(chan time.Time)
+	var rxv atomic.Uint64
+	rxv.Store(1000)
+	probeCalls := make(chan struct{}, 8)
+	probe := func() error { probeCalls <- struct{}{}; return nil }
+
+	log, _ := loggerWithLines()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		runWGWatchdogLoop(ctx, wgWatchdogConfig{
+			rx:        func() uint64 { return rxv.Load() },
+			probe:     probe,
+			rekey:     func() error { return nil },
+			reconnect: func() {},
+			log:       log, tick: tick, now: clk.Now,
+			probeAfter: 25 * time.Second, probeInterval: 25 * time.Second,
+			rekeyAfterFails: 2, reconnectAfterFails: 3,
+		})
+		close(done)
+	}()
+
+	tick <- clk.Now() // seed
+	// Advance well past probeAfter each round, but with rx advancing → healthy.
+	for i := 1; i <= 4; i++ {
+		clk.Set(t0.Add(time.Duration(i) * 40 * time.Second))
+		rxv.Add(32) // an inbound packet was received
+		tick <- clk.Now()
+	}
+	assertNoSignal(t, probeCalls, "probe while rx is advancing")
+	cancel()
+	<-done
+}
+
+// TestWatchdogProbeSuccessIdle confirms that on a healthy-but-idle tunnel
+// (rx flat, probe replies) the watchdog probes on cadence but never escalates.
+func TestWatchdogProbeSuccessIdle(t *testing.T) {
+	clk := &fakeClock{}
+	t0 := time.Unix(7_000_000, 0)
+	clk.Set(t0)
+
+	tick := make(chan time.Time)
+	probeCalls := make(chan struct{}, 16)
+	probe := func() error { probeCalls <- struct{}{}; return nil } // reply
+	rekeyCalls := make(chan struct{}, 8)
+	rekey := func() error { rekeyCalls <- struct{}{}; return nil }
+	reconnectCalls := make(chan struct{}, 1)
+	reconnect := func() {
+		select {
+		case reconnectCalls <- struct{}{}:
 		default:
 		}
 	}
@@ -87,147 +206,72 @@ func TestWatchdogRxLivenessEscalates(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		runWGWatchdogLoop(ctx, wgWatchdogConfig{
-			stats: stats, reset: reset, exit: exit, log: log, tick: tick,
-			resetCooldown: time.Minute, rxResetAfter: 50 * time.Second,
-			rxExitAfter: 75 * time.Second, now: clk.Now,
+			rx: func() uint64 { return 1000 }, probe: probe, rekey: rekey, reconnect: reconnect,
+			log: log, tick: tick, now: clk.Now,
+			probeAfter: 25 * time.Second, probeInterval: 25 * time.Second,
+			rekeyAfterFails: 2, reconnectAfterFails: 3,
 		})
 		close(done)
 	}()
 
-	// Tick 1 seeds rx tracking (first sight) — no action.
-	tick <- clk.Now()
-	select {
-	case <-resetCalls:
-		t.Fatal("reset on first rx sample")
-	case <-exitCalls:
-		t.Fatal("exit on first rx sample")
-	case <-time.After(50 * time.Millisecond):
+	tick <- clk.Now() // seed
+	for i := 1; i <= 5; i++ {
+		clk.Set(t0.Add(time.Duration(i) * 25 * time.Second))
+		tick <- clk.Now()
+		waitSignal(t, probeCalls, "idle liveness probe")
 	}
-
-	// Past rxResetAfter (60s > 50s), rx still flat → local reset.
-	clk.Set(t0.Add(60 * time.Second))
-	tick <- clk.Now()
-	select {
-	case <-resetCalls:
-	case <-time.After(time.Second):
-		t.Fatal("watchdog did not reset at rxResetAfter")
-	}
-
-	// Past rxExitAfter (80s > 75s), rx still flat → hard exit.
-	clk.Set(t0.Add(80 * time.Second))
-	tick <- clk.Now()
-	select {
-	case <-exitCalls:
-	case <-time.After(time.Second):
-		t.Fatal("watchdog did not exit at rxExitAfter")
-	}
-	<-done // loop returns after exit()
-}
-
-// TestWatchdogWaitsForFirstHandshake confirms the loop never escalates
-// before a handshake has completed, even with rx flat and thresholds set —
-// a tunnel that never came up is a setup problem, not a reap.
-func TestWatchdogWaitsForFirstHandshake(t *testing.T) {
-	clk := &fakeClock{}
-	t0 := time.Unix(5_000_000, 0)
-	clk.Set(t0)
-
-	tick := make(chan time.Time, 4)
-	stats := func() *wgPeerStats {
-		return &wgPeerStats{lastHandshake: time.Time{}, rxBytes: 0} // no handshake yet
-	}
-	resetCalls := make(chan struct{}, 8)
-	reset := func() error { resetCalls <- struct{}{}; return nil }
-	exited := false
-	exit := func() { exited = true }
-
-	log, _ := loggerWithLines()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	done := make(chan struct{})
-	go func() {
-		runWGWatchdogLoop(ctx, wgWatchdogConfig{
-			stats: stats, reset: reset, exit: exit, log: log, tick: tick,
-			resetCooldown: time.Minute, rxResetAfter: 50 * time.Second,
-			rxExitAfter: 75 * time.Second, now: clk.Now,
-		})
-		close(done)
-	}()
-
-	tick <- clk.Now()
-	clk.Set(t0.Add(10 * time.Minute))
-	tick <- clk.Now()
-	select {
-	case <-resetCalls:
-		t.Fatal("reset before any handshake completed")
-	case <-time.After(80 * time.Millisecond):
-	}
-	if exited {
-		t.Fatal("exit before any handshake completed")
-	}
+	assertNoSignal(t, rekeyCalls, "rekey while probes succeed")
+	assertNoSignal(t, reconnectCalls, "reconnect while probes succeed")
 	cancel()
 	<-done
 }
 
-// TestWatchdogRxLivenessDisabled confirms a flat rx never resets or exits
-// when the thresholds are zero (a client without symmetric keepalive).
-func TestWatchdogRxLivenessDisabled(t *testing.T) {
+// TestWatchdogInertWhenReapingDisabled confirms the loop returns immediately
+// (never probes or escalates) when reaping is disabled server-side
+// (reconnectAfterFails <= 0).
+func TestWatchdogInertWhenReapingDisabled(t *testing.T) {
 	clk := &fakeClock{}
-	t0 := time.Unix(4_000_000, 0)
-	clk.Set(t0)
-
-	tick := make(chan time.Time, 4)
-	// Fresh handshake so the first-handshake gate passes; rx flat.
-	stats := func() *wgPeerStats {
-		return &wgPeerStats{lastHandshake: clk.Now(), rxBytes: 1000}
-	}
-	resetCalls := make(chan struct{}, 8)
-	reset := func() error { resetCalls <- struct{}{}; return nil }
-	exited := false
-	exit := func() { exited = true }
-
+	clk.Set(time.Unix(4_000_000, 0))
+	probeCalls := make(chan struct{}, 4)
 	log, _ := loggerWithLines()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+
 	done := make(chan struct{})
 	go func() {
-		runWGWatchdogLoop(ctx, wgWatchdogConfig{
-			stats: stats, reset: reset, exit: exit, log: log, tick: tick,
-			resetCooldown: time.Minute, now: clk.Now, // rxResetAfter/rxExitAfter zero → inert
+		runWGWatchdogLoop(context.Background(), wgWatchdogConfig{
+			rx:        func() uint64 { return 1000 },
+			probe:     func() error { probeCalls <- struct{}{}; return errors.New("no reply") },
+			rekey:     func() error { return nil },
+			reconnect: func() {},
+			log:       log, tick: make(chan time.Time), now: clk.Now,
+			probeAfter: 25 * time.Second, probeInterval: 25 * time.Second,
+			rekeyAfterFails: 0, reconnectAfterFails: 0,
 		})
 		close(done)
 	}()
 
-	tick <- clk.Now()
-	clk.Set(t0.Add(10 * time.Minute))
-	tick <- clk.Now()
 	select {
-	case <-resetCalls:
-		t.Fatal("reset fired with rx escalation disabled")
-	case <-time.After(80 * time.Millisecond):
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("inert watchdog should return immediately when reaping is disabled")
 	}
-	if exited {
-		t.Fatal("exit fired with rx escalation disabled")
-	}
-	cancel()
-	<-done
+	assertNoSignal(t, probeCalls, "probe with reaping disabled")
 }
 
 // TestWatchdogResetMisses checks the client-configured local-reset threshold
-// resolved against the server restart horizon: used as-is below the horizon,
+// resolved against the server reconnect horizon: used as-is below the horizon,
 // disabled (0) at/above it or when non-positive.
 func TestWatchdogResetMisses(t *testing.T) {
-	for _, c := range []struct{ configured, mult, want int }{
-		{2, 3, 2},  // default: 2 missed → reset, 3 → restart
-		{2, 5, 2},  // large horizon still gets an early local reset at 2
+	for _, c := range []struct{ configured, reconnectAfter, want int }{
+		{2, 3, 2},  // default: 2 failures → rekey, 3 → reconnect
+		{2, 5, 2},  // large horizon still gets an early local rekey at 2
 		{4, 10, 4}, // custom value honored below the horizon
-		{2, 2, 0},  // == horizon → never fires; restart handles it
+		{2, 2, 0},  // == horizon → never fires; reconnect handles it
 		{5, 3, 0},  // > horizon → clamped off
 		{0, 3, 0},  // explicitly disabled
 		{-1, 3, 0}, // guard non-positive
 	} {
-		if got := watchdogResetMisses(c.configured, c.mult); got != c.want {
-			t.Errorf("watchdogResetMisses(%d, %d) = %d, want %d", c.configured, c.mult, got, c.want)
+		if got := watchdogResetMisses(c.configured, c.reconnectAfter); got != c.want {
+			t.Errorf("watchdogResetMisses(%d, %d) = %d, want %d", c.configured, c.reconnectAfter, got, c.want)
 		}
 	}
 }

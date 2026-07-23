@@ -205,9 +205,15 @@ required, and nothing in the enrollment path depends on it.
 ## Cleanup
 
 Kubernetes pod peers are transient. There is no application heartbeat: the
-gateway observes liveness from the WireGuard device, where persistent
-keepalive advances each peer's `rx_bytes` every `keepalive_interval`. A
-freshly enrolled peer gets a full liveness window
+gateway observes liveness from the WireGuard device, where the **sidecar is the
+sole (authoritative) keepalive sender** — the gateway does not keepalive back.
+That is deliberate: wireguard-go rearms its persistent-keepalive timer on any
+authenticated packet, including received ones, so with both peers sending, one
+direction's traffic perpetually postpones the other's keepalive and a healthy
+idle peer can show flat `rx_bytes` in one direction and be falsely reaped. With
+only the client sending, client→gateway `rx_bytes` advances deterministically
+every `keepalive_interval`, so the reaper sees true liveness. A freshly
+enrolled peer gets a full liveness window
 (`keepalive_interval × keepalive_reap_count`) before it is eligible for
 reaping.
 
@@ -222,20 +228,27 @@ reaping.
 The reaper only ever touches enrolled rows (`enrolled = 1`), so durably
 onboarded devices are never reaped.
 
-The sidecar recovers on its own when the tunnel goes quiet, independent of
-the reaper. Its rx-liveness watchdog watches the same keepalive signal: after
-a client-configurable number of missed keepalives (`--local-reset-missed`,
-default 2, clamped to the server reap count; `0` disables) it resets the
-tunnel in place, and if `rx_bytes` is still stalled at the reap threshold it
-exits. It deliberately does not restore a broad default route on the way out:
-with `clawpatrol0` torn down the pod is left with no default route, so the
-workload's general egress fails closed during the gap rather than leaking out
-untunneled. The `restartPolicy: Always` native sidecar is restarted by the
-kubelet; it reaches the gateway over the control-plane host routes it pinned
-to the pod's underlay — the gateway API/endpoint and the DNS resolvers, tagged
-with a dedicated route protocol (`--route-proto`, default `111`) so they
-survive the restart and can be found again without a default route — re-enrolls
-with a fresh key, and reuses its prior peer IP for the same subject.
+The sidecar recovers on its own when the tunnel goes quiet, independent of the
+reaper, using an **active ICMP-echo probe** rather than watching `rx_bytes`
+(which is normally quiet on an idle tunnel now that the gateway does not
+keepalive back). While `rx_bytes` advances there is nothing to do; when it goes
+quiet the watchdog sends an ICMP echo to the gateway's tunnel address — a
+round-trip reply proves both directions — and escalates only on sustained
+failure. After a client-configurable number of failed probes
+(`--local-reset-missed`, default 2, clamped below the server reap count; `0`
+disables) it rekeys in place, and past the reap count it tears the tunnel down
+and **re-enrolls in process**. It does not exit the container to recover: a
+`restartPolicy: Always` native sidecar restarts into the same pod sandbox and
+resets nothing a device rebuild doesn't (recovery therefore leaves the restart
+count untouched — lifecycle logs, not restart count, are the signal). During
+the gap `clawpatrol0` is torn down, so the pod has no default route and the
+workload's general egress fails closed rather than leaking out untunneled. Each
+reconnect re-reads `/etc/resolv.conf` and re-discovers the underlay, reconciling
+the control-plane host routes it pins to the pod's underlay — the gateway
+API/endpoint and the DNS resolvers, tagged with a dedicated route protocol
+(`--route-proto`, default `111`) so they survive with no default route and can
+be found again. It re-enrolls with a fresh key and reuses its prior peer IP for
+the same subject.
 
 ## Restricting pod egress (recommended)
 

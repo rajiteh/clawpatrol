@@ -72,12 +72,19 @@ type enrollmentRegisterResponse struct {
 	APIToken        string   `json:"api_token"`
 	CAPEM           string   `json:"ca_pem,omitempty"`
 	// KeepaliveIntervalSeconds is the persistent-keepalive interval the
-	// sidecar must apply to its tunnel (matches the gateway's own side).
-	// KeepaliveReapCount is how many missed keepalives the gateway waits
-	// before reaping; the sidecar sizes its watchdog reset/hard-exit
-	// thresholds from it. 0 disables the client's self-heal escalation.
+	// sidecar applies to its tunnel. The sidecar is the sole (authoritative)
+	// keepalive sender — the gateway does not keepalive back — so this drives
+	// the gateway's rx-liveness in the one direction that matters and sizes the
+	// sidecar's own probe cadence. KeepaliveReapCount is how many missed
+	// keepalives the gateway waits before reaping; the sidecar sizes its
+	// watchdog rekey/reconnect escalation from it. 0 disables reaping and the
+	// sidecar's self-heal escalation.
 	KeepaliveIntervalSeconds int `json:"keepalive_interval_s,omitempty"`
 	KeepaliveReapCount       int `json:"keepalive_reap_count,omitempty"`
+	// GatewayTunnelIP is the gateway's address inside the WireGuard subnet.
+	// The sidecar sends ICMP echo to it as its bidirectional liveness probe:
+	// a reply proves both directions of the tunnel in one round trip.
+	GatewayTunnelIP string `json:"gateway_tunnel_ip,omitempty"`
 }
 
 // enrollmentIdentity is the normalized identity an authorizer returns
@@ -394,18 +401,24 @@ func (g *Gateway) registerEnrolledPeer(ctx context.Context, cfg *config.Gateway,
 			return enrollmentRegisterResponse{}, err
 		}
 	}
-	// Symmetric keepalive is only for resident tunnel hosts (clawpatrol
-	// bridge) that run a liveness watchdog and request it. When requested,
-	// the gateway keepalives toward the peer at the authorizer's interval and
-	// echoes the cadence + reap horizon back so the sidecar's watchdog stays
-	// in sync. Other enrollment clients get neither (keepalive stays 0, so
-	// AddPeer installs no gateway-initiated keepalive).
+	// The client (clawpatrol bridge) is the sole authoritative keepalive
+	// sender. The gateway does NOT keepalive back: wireguard-go rearms the
+	// persistent-keepalive timer on any authenticated packet — including
+	// received ones — so with both sides sending, one direction's traffic
+	// perpetually postpones the other's keepalive, and a healthy idle peer can
+	// show flat rx in one direction and be falsely reaped. With only the client
+	// sending, client→gateway rx advances deterministically every interval, so
+	// the reaper observes true liveness. AddPeer keepalive stays 0 (as with
+	// onboarded devices); the resolved interval + reap count are still returned
+	// so the client applies the keepalive and sizes its watchdog escalation.
+	// The sidecar checks its own (gateway→client) direction with an ICMP echo
+	// probe, not gateway keepalive.
 	var keepalive time.Duration
 	var reapCount int
 	if req.Keepalive {
 		keepalive, reapCount = enrollmentKeepaliveConfig(g.Policy(), authorizer.Name())
 	}
-	if err := globalWG.AddPeer(pubHex, peerIP, keepalive); err != nil {
+	if err := globalWG.AddPeer(pubHex, peerIP, 0); err != nil {
 		return enrollmentRegisterResponse{}, fmt.Errorf("wg add peer: %w", err)
 	}
 	// Roll back the transport peer + token on any failure before the
@@ -487,6 +500,7 @@ func (g *Gateway) registerEnrolledPeer(ctx context.Context, cfg *config.Gateway,
 
 		KeepaliveIntervalSeconds: int(keepalive.Seconds()),
 		KeepaliveReapCount:       reapCount,
+		GatewayTunnelIP:          globalWG.GatewayTunnelIP().String(),
 	}
 	if g.certs != nil {
 		resp.CAPEM = string(g.certs.CertPEM())

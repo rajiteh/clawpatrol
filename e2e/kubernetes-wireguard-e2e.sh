@@ -58,8 +58,9 @@ Environment knobs:
   CLAWPATROL_E2E_CHECK_LIVENESS  set 0 to skip the rx_bytes liveness check
   CLAWPATROL_E2E_CHECK_EXPIRY    set 1 to test reap cleanup (force-delete sidecar)
   CLAWPATROL_E2E_CHECK_ESCALATION set 0 to skip the sidecar self-heal check
-                                 (sever keepalive → sidecar hard-exits, restarts,
-                                 re-enrolls with a fresh WireGuard key)
+                                 (gateway → 0 → ICMP probe fails → sidecar fails
+                                 closed and re-enrolls in process with a fresh
+                                 key, no container restart)
   CLAWPATROL_E2E_GOARCH          override node arch for the Linux build
 
 Image tag, namespaces, peer TTL, and RBAC names live in the overlay
@@ -229,13 +230,13 @@ log "checking the gateway path is pinned off the tunnel"
 API_CLUSTER_IP="$("${KUBECTL[@]}" -n "${GATEWAY_NS}" get svc clawpatrol-api -o jsonpath='{.spec.clusterIP}')"
 [[ -n "${API_CLUSTER_IP}" ]] || fail "could not resolve clawpatrol-api ClusterIP"
 agent_exec sh -lc "! ip route get '${API_CLUSTER_IP}' | grep -q 'dev clawpatrol0'"
-# The control-plane pins carry the clawpatrol route protocol (111) so a
-# self-heal restart can recover the underlay gateway from them when there is
-# no default route. The gateway API pin must show that tag.
+# The control-plane pins carry the clawpatrol route protocol (111) so an
+# in-process reconnect (or a genuine restart) can recover the underlay gateway
+# from them when there is no default route. The gateway API pin must show that tag.
 agent_exec sh -lc "ip route show proto 111 | grep -q '${API_CLUSTER_IP}'"
 # The pod's resolver is pinned to the underlay with the same tag, so DNS keeps
-# working after a self-heal restart (the gateway is resolved by name; SNI/Host
-# stay correct). Read the agent's actual nameserver and require it be pinned.
+# working across a reconnect (the gateway is resolved by name; SNI/Host stay
+# correct). Read the agent's actual nameserver and require it be pinned.
 AGENT_DNS_IP="$(agent_exec sh -lc "awk '/^nameserver/{print \$2; exit}' /etc/resolv.conf" | tr -d '[:space:]')"
 [[ -n "${AGENT_DNS_IP}" ]] || fail "agent has no resolv.conf nameserver"
 agent_exec sh -lc "ip route show proto 111 | grep -q '${AGENT_DNS_IP}'"
@@ -261,40 +262,40 @@ if [[ "${CHECK_LIVENESS}" == "1" ]]; then
 fi
 
 if [[ "${CHECK_ESCALATION}" == "1" ]]; then
-  # Client self-heal. Sever the tunnel's return path by scaling the gateway
-  # to 0 for longer than the exit threshold (keepalive_interval ×
-  # keepalive_reap_count + jitter). The pod stays alive, but its WireGuard
-  # rx_bytes stalls, so the sidecar's watchdog must hard-exit; the kubelet
-  # then restarts the (native-sidecar) container, which re-enrolls with a
-  # fresh WireGuard key. This is the reap-recovery path the gateway-side
-  # reaper can't drive on its own.
-  TTL_SECONDS="$(seconds_from_duration "${PEER_TTL}")"
+  # Client self-heal, in-process. Scale the gateway to 0 so the sidecar's
+  # liveness probe (ICMP echo to the gateway tunnel IP) fails. The sidecar
+  # rekeys, then tears the tunnel down and re-enrolls — all WITHOUT exiting the
+  # container (a native-sidecar restart lands in the same pod sandbox and buys
+  # nothing a device rebuild doesn't). While the gateway is down it stays
+  # fail-closed: clawpatrol0 is gone, so there is no default route (general
+  # egress is blocked, not leaking untunnelled) while the tagged control-plane
+  # pins survive on the underlay. When the gateway returns it re-enrolls in
+  # place with a fresh key, reusing its peer IP — and the container restart
+  # count never moves.
   sidecar_restarts() {
     "${KUBECTL[@]}" -n "${AGENTS_NS}" get pod "${E2E_POD}" \
       -o jsonpath='{.status.initContainerStatuses[?(@.name=="wireguard-sidecar")].restartCount}' 2>/dev/null
   }
   BEFORE_RESTARTS="$(sidecar_restarts)"
   BEFORE_RESTARTS="${BEFORE_RESTARTS:-0}"
-  sidecar_restarted() { [[ "$(sidecar_restarts || echo "${BEFORE_RESTARTS}")" -gt "${BEFORE_RESTARTS}" ]]; }
   BEFORE_PUBKEY="$(sqlite_query "SELECT pubkey FROM wg_peers WHERE enrolled = 1 AND display_name = '${AGENTS_NS}/${E2E_POD}' LIMIT 1;")"
   BEFORE_PEER_IP="${PEER_IP}"
-  DOWN_SECONDS=$(( TTL_SECONDS + 30 ))
 
-  log "severing keepalive: scaling gateway to 0 (> exit threshold) so the sidecar's rx stalls"
+  log "severing liveness: scaling gateway to 0 so the sidecar's ICMP probe fails"
   "${KUBECTL[@]}" -n "${GATEWAY_NS}" scale statefulset/clawpatrol-gateway --replicas=0 >/dev/null
   "${KUBECTL[@]}" -n "${GATEWAY_NS}" rollout status statefulset/clawpatrol-gateway --timeout="${TIMEOUT}" >/dev/null 2>&1 || true
 
-  # With the gateway down the sidecar's rx stalls and the watchdog must
-  # hard-exit. Catch that while the gateway is still down, then assert the
-  # netns is fail-closed: the workload has no default route (general egress is
-  # blocked, not leaking untunnelled) while the tagged control-plane pins
-  # survive, so the restart can still reach the gateway to recover. The
-  # restarted sidecar can't re-enroll until the gateway is back, so this state
-  # holds for the rest of the down window.
-  wait_until "sidecar hard-exited while gateway down (restarts > ${BEFORE_RESTARTS})" "$(( DOWN_SECONDS + 120 ))" sidecar_restarted
-  log "checking fail-closed during the gap: no default route, control-plane pins intact"
-  agent_exec sh -lc '! ip route show default | grep -q .'
+  # The sidecar escalates to an in-process reconnect: it tears clawpatrol0 down
+  # (so the default route disappears) and cannot re-enroll while the gateway is
+  # down, so it holds fail-closed. Wait for that torn-down state, then assert
+  # the control-plane pins survive and — crucially — the container has NOT
+  # restarted (recovery is in-process, not a kubelet restart).
+  wait_until "sidecar tore the tunnel down and failed closed (no default route)" 150 \
+    agent_exec sh -lc '! ip route show default | grep -q .'
+  log "checking fail-closed gap: no default route, control-plane pins intact, no container restart"
   agent_exec sh -lc "ip route show proto 111 | grep -q '${API_CLUSTER_IP}'"
+  [[ "$(sidecar_restarts)" == "${BEFORE_RESTARTS}" ]] ||
+    fail "sidecar container restarted during the gap (was ${BEFORE_RESTARTS}); recovery must be in-process"
 
   log "restoring gateway"
   "${KUBECTL[@]}" -n "${GATEWAY_NS}" scale statefulset/clawpatrol-gateway --replicas=1 >/dev/null
@@ -302,18 +303,21 @@ if [[ "${CHECK_ESCALATION}" == "1" ]]; then
   "${KUBECTL[@]}" -n "${GATEWAY_NS}" wait --for=condition=Ready pod -l app=clawpatrol-gateway --timeout="${TIMEOUT}"
   GATEWAY_POD="$("${KUBECTL[@]}" -n "${GATEWAY_NS}" get pod -l app=clawpatrol-gateway -o jsonpath='{.items[0].metadata.name}')"
 
-  # The gateway's DB persists across the scale, so it re-seeds the OLD peer
-  # row on startup — enrolled_present alone would be satisfied by that stale
-  # row before the restarted sidecar re-enrolls. Wait for the pubkey to
-  # actually change, which only the fresh enrollment (new ephemeral key)
-  # produces.
+  # The gateway's DB persists across the scale, so it re-seeds the OLD peer row
+  # on startup — enrolled_present alone would be satisfied by that stale row
+  # before the sidecar re-enrolls. Wait for the pubkey to actually change,
+  # which only the fresh in-process enrollment (new ephemeral key) produces.
   peer_reenrolled() {
     local pk
     pk="$(sqlite_query "SELECT pubkey FROM wg_peers WHERE enrolled = 1 AND display_name = '${AGENTS_NS}/${E2E_POD}' LIMIT 1;" 2>/dev/null)"
     [[ -n "${pk}" && "${pk}" != "${BEFORE_PUBKEY}" ]]
   }
-  wait_until "sidecar re-enrolled with a fresh WireGuard key" 180 peer_reenrolled
+  wait_until "sidecar re-enrolled in-process with a fresh WireGuard key" 180 peer_reenrolled
   PEER_IP="$(sqlite_query "SELECT ip FROM wg_peers WHERE enrolled = 1 AND display_name = '${AGENTS_NS}/${E2E_POD}' LIMIT 1;")"
+
+  # Recovery stayed in-process: the container restart count must be unchanged.
+  [[ "$(sidecar_restarts)" == "${BEFORE_RESTARTS}" ]] ||
+    fail "sidecar container restarted during recovery (was ${BEFORE_RESTARTS}, now $(sidecar_restarts)); recovery must be in-process"
 
   # Same-subject renewal reuses the peer IP: the fresh enrollment swaps the
   # WireGuard key but the gateway hands the identity back its prior slot.
@@ -322,7 +326,7 @@ if [[ "${CHECK_ESCALATION}" == "1" ]]; then
 
   wait_until "tunnel restored after self-heal" 60 \
     agent_exec sh -lc "test \"\$(curl -sS --max-time 10 'http://${HTTP_CLUSTER_IP}:8081/')\" = 'ok'"
-  log "sidecar self-healed: restarts ${BEFORE_RESTARTS} → $(sidecar_restarts), re-enrolled ${PEER_IP} with a fresh key"
+  log "sidecar self-healed in-process: 0 container restarts, re-enrolled ${PEER_IP} with a fresh key"
 fi
 
 if [[ "${CHECK_EXPIRY}" == "1" ]]; then

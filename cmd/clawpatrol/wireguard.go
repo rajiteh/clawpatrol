@@ -309,6 +309,11 @@ var (
 func setWGServer(s *WGServer) { globalWG = s }
 func setDB(d *sql.DB)         { globalDB = d }
 
+// GatewayTunnelIP is the gateway's own address inside the WireGuard subnet
+// (the .1). Enrolled sidecars probe it with ICMP echo as their bidirectional
+// liveness check, so it is returned in the enrollment register response.
+func (s *WGServer) GatewayTunnelIP() netip.Addr { return s.serverIP }
+
 // StartWGServer brings up a userspace WG endpoint listening on
 // 0.0.0.0:<ListenPort>. Server private key is read from the
 // wg_server_key sqlite row; if missing, generated and persisted on
