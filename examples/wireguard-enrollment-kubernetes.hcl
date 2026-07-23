@@ -27,10 +27,9 @@ enrollment "kubernetes_token_review" "agents" {
   }
 
   # Liveness is derived: keepalive_interval × keepalive_reap_count. A peer is
-  # reaped after `keepalive_reap_count` missed keepalives. keepalive_interval
-  # is capped at 25s so WireGuard rekeys an idle tunnel before its session
-  # expires; lengthen the liveness window with keepalive_reap_count, not a
-  # larger interval. Here: 25s × 3 = 75s.
+  # reaped after `keepalive_reap_count` missed keepalives. Here: 25s × 3 = 75s.
+  # A longer interval means fewer keepalive packets and a longer window;
+  # keepalive_interval has no upper bound (minimum 10s).
   keepalive_interval = "25s"
   keepalive_reap_count = 3
 }

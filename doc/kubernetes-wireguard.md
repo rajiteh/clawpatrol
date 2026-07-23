@@ -78,8 +78,8 @@ enrollment "kubernetes_token_review" "agents" {
   }
 
   # Liveness is derived: keepalive_interval × keepalive_reap_count.
-  # keepalive_interval is capped at 25s (WireGuard rekey safety); lengthen the
-  # window with the reap count. Here 25s × 3 = a 75s reap window.
+  # Here 25s × 3 = a 75s reap window. A longer interval means fewer keepalive
+  # packets and a longer window; there is no upper bound.
   keepalive_interval = "25s"
   keepalive_reap_count = 3
 }
@@ -95,25 +95,21 @@ Each
 `namespace` + `service_account`, its profile is read from the pod label
 named by `profile_label` (default `clawpatrol.dev/profile`), and that value
 must be in the match's `profiles` allowlist. `keepalive_interval` (default
-25s, range 10s–25s) is the WireGuard persistent-keepalive cadence applied to
-enrolled peers in both directions; `keepalive_reap_count` (default 3, or 0 to
-disable reaping) is how many missed keepalives elapse before the reaper
-revokes a peer. The liveness window is derived — `keepalive_interval ×
-keepalive_reap_count` — so the reap-vs-keepalive safety ratio is an integer
-that can't be misconfigured, and the gateway pushes the resolved keepalive
-to the sidecar at enroll so both ends stay in sync.
+25s, minimum 10s) is the WireGuard persistent-keepalive cadence the sidecar
+applies; `keepalive_reap_count` (default 3, or 0 to disable reaping) is how
+many missed keepalives elapse before the reaper revokes a peer. The liveness
+window is derived — `keepalive_interval × keepalive_reap_count` — so the
+reap-vs-keepalive safety ratio is an integer that can't be misconfigured, and
+the gateway pushes the resolved keepalive to the sidecar at enroll.
 
-The 25s ceiling on `keepalive_interval` is a WireGuard rekey-safety bound, not
-a policy choice. The sidecar is the handshake initiator, and on an idle tunnel
-WireGuard rekeys the initiator only when it receives a packet in the narrow
-window before the session expires (~165–180s in). At 25s a keepalive lands
-inside that window and the session is refreshed before it can lapse; a larger
-interval (e.g. 60s) skips it, the session expires, and an idle peer
-intermittently loses rx and self-heals even though nothing is wrong. To get a
-longer liveness window, raise `keepalive_reap_count` rather than the interval.
-The 10s floor is set by the reaper's 20s sample cadence — the smallest window
-(`EnrollmentMinReapCount × keepalive`) must be at least one sample interval to
-remain resolvable.
+There is no upper bound on `keepalive_interval` — a longer interval just means
+fewer keepalive packets and a longer liveness window, a policy choice left to
+the operator. (An earlier build capped it at 25s for WireGuard rekey safety;
+that is moot now that the sidecar is the sole keepalive sender and checks
+liveness with an active ICMP probe that also drives rekeying off real traffic —
+see Cleanup below.) The 10s floor is set by the reaper's 20s sample cadence:
+the smallest window (`EnrollmentMinReapCount × keepalive`) must be at least one
+sample interval to remain resolvable.
 
 ## Security boundary
 

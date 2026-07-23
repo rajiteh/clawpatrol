@@ -27,9 +27,8 @@ data:
       }
 
       # Liveness window is derived: keepalive_interval × keepalive_reap_count.
-      # keepalive_interval is capped at 25s so WireGuard rekeys an idle tunnel
-      # before its session expires; lengthen the window with the reap count.
-      # Here: 25s × 3 = 75s.
+      # Here 25s × 3 = 75s. A longer interval means fewer keepalive packets and
+      # a longer window; keepalive_interval has no upper bound (min 10s).
       keepalive_interval   = "25s"
       keepalive_reap_count = 3
     }

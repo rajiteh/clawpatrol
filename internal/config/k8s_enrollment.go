@@ -56,12 +56,11 @@ type k8sEnrollmentBody struct {
 	// least one is required.
 	Matches []k8sMatchBody `hcl:"match,block"`
 	// KeepaliveInterval is the WireGuard persistent-keepalive interval
-	// (time.ParseDuration) applied to enrolled peers in both directions and
-	// pushed to the sidecar at enroll. Optional; defaults to 25s and must be
-	// between 10s and 25s. The 25s ceiling is a WireGuard rekey-safety bound:
-	// on an idle tunnel a keepalive must arrive before the session expires or
-	// the peer loses liveness and self-heals, so lengthen the liveness window
-	// with keepalive_reap_count rather than a larger interval.
+	// (time.ParseDuration) the sidecar applies to enrolled peers and pushed to
+	// it at enroll. Optional; defaults to 25s and must be at least 10s (the
+	// floor is pinned to the gateway reaper's sample cadence). There is no
+	// upper bound: a longer interval just means fewer keepalive packets and a
+	// longer liveness window (keepalive_interval × keepalive_reap_count).
 	KeepaliveInterval string `hcl:"keepalive_interval,optional"`
 	// KeepaliveReapCount is how many missed keepalives elapse before an
 	// enrolled peer is reaped; the liveness window is keepalive_interval ×

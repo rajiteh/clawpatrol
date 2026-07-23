@@ -221,11 +221,6 @@ profile "default" { credentials = [] }
 			want: "Invalid enrollment keepalive_interval",
 		},
 		{
-			name: "keepalive_interval above maximum",
-			body: strings.Replace(valid, `keepalive_interval = "20s"`, `keepalive_interval = "60s"`, 1),
-			want: "Invalid enrollment keepalive_interval",
-		},
-		{
 			name: "keepalive_reap_count of 1 rejected",
 			body: strings.Replace(valid, `keepalive_reap_count = 6`, `keepalive_reap_count = 1`, 1),
 			want: "Invalid enrollment keepalive_reap_count",
@@ -736,6 +731,16 @@ profile "default" { credentials = [] }
 			wantKeepalive:  config.EnrollmentDefaultKeepalive,
 			wantMultiplier: 0,
 			wantLiveness:   0, // reaping disabled
+		},
+		{
+			// No upper bound on keepalive_interval: a long interval is accepted
+			// (the 25s rekey-safety ceiling was lifted once the sidecar became
+			// the sole keepalive sender + ICMP-probe liveness).
+			name:           "long keepalive allowed",
+			knobs:          "  keepalive_interval = \"120s\"\n  keepalive_reap_count = 3\n",
+			wantKeepalive:  120 * time.Second,
+			wantMultiplier: 3,
+			wantLiveness:   6 * time.Minute,
 		},
 	}
 
