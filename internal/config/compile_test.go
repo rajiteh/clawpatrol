@@ -127,8 +127,8 @@ func TestEnrollmentConfigValidation(t *testing.T) {
     profiles        = ["default"]
   }
 
-  keepalive_interval = "40s"
-  keepalive_reap_count = 3
+  keepalive_interval = "20s"
+  keepalive_reap_count = 6
 }
 `
 	valid := `gateway {
@@ -160,8 +160,8 @@ profile "default" { credentials = [] }
 	if !ok {
 		t.Fatalf("enrollment body = %T, want *config.K8sEnrollment", ent.Body)
 	}
-	if ke.KeepaliveInterval != "40s" || ke.KeepaliveReapCount == nil || *ke.KeepaliveReapCount != 3 {
-		t.Fatalf("keepalive/reap = %q/%v, want 40s/3", ke.KeepaliveInterval, ke.KeepaliveReapCount)
+	if ke.KeepaliveInterval != "20s" || ke.KeepaliveReapCount == nil || *ke.KeepaliveReapCount != 6 {
+		t.Fatalf("keepalive/reap = %q/%v, want 20s/6", ke.KeepaliveInterval, ke.KeepaliveReapCount)
 	}
 	if len(ke.Matches) != 1 || ke.Matches[0].ProfileLabel != "clawpatrol.dev/profile" {
 		t.Fatalf("unexpected matches: %+v", ke.Matches)
@@ -176,13 +176,13 @@ profile "default" { credentials = [] }
 	if enr == nil {
 		t.Fatalf("compiled enrollment %q missing", "agents")
 	}
-	// Liveness is derived and shared: keepalive_interval × keepalive_reap_count = 40s×3 = 2m.
+	// Liveness is derived and shared: keepalive_interval × keepalive_reap_count = 20s×6 = 2m.
 	l, ok := cp.EnrollmentLivenessByName["agents"]
 	if !ok {
 		t.Fatal("compiled enrollment liveness missing")
 	}
-	if l.KeepaliveInterval != 40*time.Second || l.ReapCount != 3 || l.LivenessWindow() != 2*time.Minute {
-		t.Fatalf("compiled keepalive/reap/liveness = %s/%d/%s, want 40s/3/2m",
+	if l.KeepaliveInterval != 20*time.Second || l.ReapCount != 6 || l.LivenessWindow() != 2*time.Minute {
+		t.Fatalf("compiled keepalive/reap/liveness = %s/%d/%s, want 20s/6/2m",
 			l.KeepaliveInterval, l.ReapCount, l.LivenessWindow())
 	}
 
@@ -217,12 +217,17 @@ profile "default" { credentials = [] }
 		},
 		{
 			name: "keepalive_interval below minimum",
-			body: strings.Replace(valid, `keepalive_interval = "40s"`, `keepalive_interval = "5s"`, 1),
+			body: strings.Replace(valid, `keepalive_interval = "20s"`, `keepalive_interval = "5s"`, 1),
+			want: "Invalid enrollment keepalive_interval",
+		},
+		{
+			name: "keepalive_interval above maximum",
+			body: strings.Replace(valid, `keepalive_interval = "20s"`, `keepalive_interval = "60s"`, 1),
 			want: "Invalid enrollment keepalive_interval",
 		},
 		{
 			name: "keepalive_reap_count of 1 rejected",
-			body: strings.Replace(valid, `keepalive_reap_count = 3`, `keepalive_reap_count = 1`, 1),
+			body: strings.Replace(valid, `keepalive_reap_count = 6`, `keepalive_reap_count = 1`, 1),
 			want: "Invalid enrollment keepalive_reap_count",
 		},
 		{
