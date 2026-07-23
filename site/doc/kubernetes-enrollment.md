@@ -70,8 +70,10 @@ enrollment "kubernetes_token_review" "agents" {
     profiles        = ["default"]
   }
 
-  # Liveness is derived: keepalive_interval × keepalive_reap_count (60s×3 = 3m).
-  keepalive_interval = "60s"
+  # Liveness is derived: keepalive_interval × keepalive_reap_count (25s×3 = 75s).
+  # keepalive_interval is capped at 25s (WireGuard rekey safety); lengthen the
+  # liveness window with the reap count, not a larger interval.
+  keepalive_interval = "25s"
   keepalive_reap_count = 3
 }
 
@@ -90,13 +92,23 @@ Patrol profile from the pod label named by that match's `profile_label`
 `profiles` allowlist. The client does not get to submit its own profile.
 Add more `match { ... }` blocks to bind additional identities.
 
-`keepalive_interval` (default 25s, min 10s) is the WireGuard
+`keepalive_interval` (default 25s, range 10s–25s) is the WireGuard
 persistent-keepalive cadence applied to enrolled peers in both directions;
 `keepalive_reap_count` (default 3, or 0 to disable) is how many missed
 keepalives elapse before the reaper revokes a peer. The liveness window is
 derived — `keepalive_interval × keepalive_reap_count` — so the safety ratio is
 an integer that can't be misconfigured, and the resolved keepalive is pushed
 to the sidecar at enroll so both ends stay in sync.
+
+The 25s ceiling is a WireGuard rekey-safety bound, not a policy knob. The
+sidecar is the handshake initiator, and on an idle tunnel WireGuard rekeys the
+initiator only when it receives a packet in the short window before the
+session expires (~165–180s in). At 25s a keepalive lands inside that window so
+the session refreshes before it can lapse; a larger interval (e.g. 60s) skips
+it, the session expires, and an idle peer intermittently loses rx and
+self-heals with nothing actually wrong. Raise `keepalive_reap_count` — not the
+interval — for a longer window. The 10s floor is set by the reaper's 20s
+sample cadence: the smallest window must stay at least one sample wide.
 
 The complete standalone HCL example lives at
 [`examples/wireguard-enrollment-kubernetes.hcl`](https://github.com/denoland/clawpatrol/blob/main/examples/wireguard-enrollment-kubernetes.hcl).

@@ -21,9 +21,28 @@ const (
 	// EnrollmentDefaultKeepalive is the persistent-keepalive interval applied
 	// to enrolled peers (both directions) when keepalive_interval is omitted.
 	EnrollmentDefaultKeepalive = 25 * time.Second
-	// EnrollmentMinKeepalive is the floor for keepalive_interval — below this
-	// keepalive traffic is pure overhead with no liveness benefit.
+	// EnrollmentMinKeepalive is the floor for keepalive_interval. It is pinned
+	// to the reaper's sample cadence, not to WireGuard: the smallest liveness
+	// window is EnrollmentMinReapCount × keepalive, and for the reaper (which
+	// samples rx every enrollmentReaperInterval = 20s) to resolve that window
+	// at all it must be at least one sample interval — 2 × 10s = 20s. Below
+	// this the window is finer than the sampler and reap timing/miss counts
+	// stop being meaningful; going lower would require retuning the reaper and
+	// the client watchdog poll in lockstep, for no real gain (the gateway can
+	// never observe death faster than it samples).
 	EnrollmentMinKeepalive = 10 * time.Second
+	// EnrollmentMaxKeepalive is the ceiling for keepalive_interval, set by
+	// WireGuard's rekey timers rather than by policy. Our sidecar is the
+	// handshake initiator, and on an idle tunnel wireguard-go only rekeys the
+	// initiator when it receives a packet while the session age is in
+	// (RejectAfterTime − KeepaliveTimeout − RekeyTimeout, RejectAfterTime) =
+	// (165s, 180s). At 25s a keepalive lands at ~175s, inside that window, so
+	// the session is rekeyed before it can expire — zero-gap. Larger intervals
+	// (e.g. 60s: keepalives at 120s/180s) skip the window, the session lapses,
+	// and an idle peer intermittently loses rx and self-heals. To lengthen the
+	// liveness window, raise keepalive_reap_count, not this. 25s is also
+	// WireGuard's own recommended keepalive.
+	EnrollmentMaxKeepalive = 25 * time.Second
 	// EnrollmentDefaultReapCount is the number of missed keepalives before an
 	// enrolled peer is reaped when keepalive_reap_count is omitted.
 	EnrollmentDefaultReapCount = 3
@@ -82,7 +101,7 @@ func enrollmentDiag(ctx *BuildCtx, summary, detail string) *hcl.Diagnostic {
 }
 
 // validateEnrollmentKeepaliveInterval accepts an empty string (attr omitted)
-// or a Go duration ≥ EnrollmentMinKeepalive.
+// or a Go duration in [EnrollmentMinKeepalive, EnrollmentMaxKeepalive].
 func validateEnrollmentKeepaliveInterval(ctx *BuildCtx, name, raw string) hcl.Diagnostics {
 	if strings.TrimSpace(raw) == "" {
 		return nil
@@ -95,6 +114,10 @@ func validateEnrollmentKeepaliveInterval(ctx *BuildCtx, name, raw string) hcl.Di
 	if d < EnrollmentMinKeepalive {
 		return hcl.Diagnostics{enrollmentDiag(ctx, "Invalid enrollment keepalive_interval",
 			fmt.Sprintf("enrollment %q keepalive_interval = %q is below the %s minimum.", name, raw, EnrollmentMinKeepalive))}
+	}
+	if d > EnrollmentMaxKeepalive {
+		return hcl.Diagnostics{enrollmentDiag(ctx, "Invalid enrollment keepalive_interval",
+			fmt.Sprintf("enrollment %q keepalive_interval = %q is above the %s maximum. WireGuard rekeys an idle tunnel only if a keepalive lands before the session expires; a larger interval lets an idle peer lose liveness and self-heal. Lengthen the liveness window with keepalive_reap_count instead.", name, raw, EnrollmentMaxKeepalive))}
 	}
 	return nil
 }
