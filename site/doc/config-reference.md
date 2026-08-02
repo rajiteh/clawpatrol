@@ -135,7 +135,7 @@ profile "default" {
 
 Block syntax: `approver "<type>" "<name>" { ... }`
 
-Registered types: [`human_approver`](#approver-humanapprover), [`llm_approver`](#approver-llmapprover).
+Registered types: [`human_approver`](#approver-humanapprover), [`llm_approver`](#approver-llmapprover), [`webhook_approver`](#approver-webhookapprover).
 
 ### `approver "human_approver" "<name>"`
 
@@ -182,6 +182,69 @@ approver "llm_approver" "example" {
   credential = bearer_token.example
 }
 ```
+
+### `approver "webhook_approver" "<name>"`
+
+Posts a body-free request summary to an operator-owned HTTPS service and
+waits for a JSON `allow` or `deny` decision. The request uses an existing HTTP
+credential plugin for authentication. TLS authenticates the service response.
+Claw Patrol retries once after a transport error, HTTP `429`, or HTTP `5xx`.
+The retry uses `Retry-After` when supplied, or waits 500 milliseconds. The
+overall timeout includes both attempts. Other errors, timeouts, redirects, and
+invalid responses deny the action.
+
+| Attribute | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `url` | `string` | yes | Absolute HTTPS decision URL. User info, query strings, and fragments are rejected. |
+| `credential` | `ref(credential)` | yes | HTTP credential used to authenticate the webhook request. |
+| `timeout` | `int` | no | Overall timeout in seconds. Default `30`; maximum `600`. |
+
+```hcl
+credential "bearer_token" "approval-service" {}
+
+approver "webhook_approver" "access-control" {
+  url        = "https://approval.example.com/v1/decide"
+  credential = bearer_token.approval-service
+  timeout    = 90
+}
+```
+
+The request includes `peer:<agent-ip>` as `principal.id` and, when known, the
+device hostname as informational `principal.display_name`. The service must
+not use the display name for reusable grants. This version does not send body
+content and does not implement reusable or time-bound grants.
+
+Request body:
+
+```json
+{
+  "schema_version": 1,
+  "approver": "access-control",
+  "principal": {
+    "id": "peer:100.64.0.12",
+    "display_name": "build-agent-1",
+    "agent_ip": "100.64.0.12",
+    "profile": "production"
+  },
+  "policy": { "rule": "ssh-sensitive", "reason": "approval required" },
+  "target": { "endpoint": "build-host", "family": "ssh", "host": "build.example.com" },
+  "action": { "method": "exec", "path": "systemctl restart api" }
+}
+```
+
+The service returns HTTP `200` and exactly one JSON object:
+
+```json
+{
+  "schema_version": 1,
+  "decision": "allow",
+  "reason": "approved for this action",
+  "decided_by": "raj"
+}
+```
+
+`decision` must be exactly `allow` or `deny`. `reason` is optional and limited
+to 4 KiB. `decided_by` is optional and limited to 256 bytes.
 
 ## `credential` blocks
 
