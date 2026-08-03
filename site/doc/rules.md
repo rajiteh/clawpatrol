@@ -3,8 +3,8 @@
 Rules are how an operator decides what happens to a request:
 forward it, reject it, or route it through one or more
 **approvers** — a human acting from the dashboard or Slack, an
-LLM judging against a policy, or both in sequence (every approver
-must allow). Each rule is a block in `gateway.hcl` that targets
+LLM judging against a policy, an external HTTPS decision service,
+or a sequence of them (every approver must allow). Each rule is a block in `gateway.hcl` that targets
 one or more [endpoints](/docs/glossary/#endpoint), describes
 which requests it applies to (the `condition` CEL expression),
 and declares the outcome (`verdict = "allow" / "deny"`, or
@@ -382,6 +382,8 @@ Patrol also posts an approval message to the configured Slack channel.
 By default the message carries a link back to the dashboard; setting
 `interactive = true` on the approver embeds in-channel "approve" and
 "deny" buttons so the reviewer can decide without leaving Slack.
+Webhook approvers synchronously post the current action summary to their
+configured HTTPS service. Only a valid `allow` response advances the chain.
 
 ### Default allow
 

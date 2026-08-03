@@ -30,6 +30,7 @@ import (
 	sshfacet "github.com/denoland/clawpatrol/internal/config/plugins/facets/ssh"
 	cruntime "github.com/denoland/clawpatrol/internal/config/runtime"
 
+	_ "github.com/denoland/clawpatrol/internal/config/plugins/approvers"
 	_ "github.com/denoland/clawpatrol/internal/config/plugins/credentials"
 	_ "github.com/denoland/clawpatrol/internal/config/plugins/rules"
 )
@@ -226,6 +227,10 @@ func compileE2EPolicy(t *testing.T, hcl string) *config.CompiledPolicy {
 // the gateway on a localhost listener. Returns the gateway address, the
 // event sink, and the upstream recorder.
 func startGateway(t *testing.T, hcl string) (addr string, ev *eventSink, up *fakeUpstream) {
+	return startGatewayWithApprove(t, hcl, nil)
+}
+
+func startGatewayWithApprove(t *testing.T, hcl string, approve func(cruntime.ApproveCallRequest) cruntime.ApproveVerdict) (addr string, ev *eventSink, up *fakeUpstream) {
 	t.Helper()
 	policy := compileE2EPolicy(t, hcl)
 	ep := policy.Endpoints["build-host"]
@@ -262,6 +267,7 @@ func startGateway(t *testing.T, hcl string) (addr string, ev *eventSink, up *fak
 					Secrets:  secrets,
 					Blobs:    blobs,
 					Emit:     ev.add,
+					Approve:  approve,
 					DialUpstream: func(ctx context.Context, network, _ string) (net.Conn, error) {
 						return (&net.Dialer{}).DialContext(ctx, network, up.addr)
 					},
@@ -271,6 +277,61 @@ func startGateway(t *testing.T, hcl string) (addr string, ev *eventSink, up *fak
 	}()
 	t.Cleanup(func() { cancel(); _ = l.Close(); wg.Wait() })
 	return l.Addr().String(), ev, up
+}
+
+const webhookApprovalHCL = `
+endpoint "ssh" "build-host" {
+  hosts = ["build.example.com:2222"]
+}
+credential "ssh_key" "build-key" {
+  endpoint = ssh.build-host
+}
+approver "human_approver" "hold" {
+  channel = ""
+}
+rule "approve-exec" {
+  endpoint  = ssh.build-host
+  condition = "ssh.verb == 'exec'"
+  approve   = [human_approver.hold]
+}
+profile "default" {
+  credentials = [ssh_key.build-key]
+}
+`
+
+func TestE2EApprovalContextCanceledWhenSSHDisconnects(t *testing.T) {
+	started := make(chan struct{})
+	canceled := make(chan struct{})
+	approve := func(req cruntime.ApproveCallRequest) cruntime.ApproveVerdict {
+		close(started)
+		<-req.Context.Done()
+		close(canceled)
+		return cruntime.ApproveVerdict{Decision: "deny", Reason: "canceled"}
+	}
+	addr, _, _ := startGatewayWithApprove(t, webhookApprovalHCL, approve)
+	client := dialAgent(t, addr)
+	session, err := client.NewSession()
+	if err != nil {
+		t.Fatalf("new session: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- session.Run("echo hello") }()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("SSH approval did not start")
+	}
+	_ = client.Close()
+	select {
+	case <-canceled:
+	case <-time.After(time.Second):
+		t.Fatal("SSH disconnect did not cancel approval context")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("SSH command did not stop after disconnect")
+	}
 }
 
 func dialAgent(t *testing.T, addr string) *ssh.Client {

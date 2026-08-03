@@ -2,7 +2,7 @@
 
 A clawpatrol gateway config mixes **operational** settings in the
 required top-level `gateway { ... }` block with **policy** blocks.
-Policy blocks (`approver`, `credential`, `tunnel`, `endpoint`, `rule`)
+Policy blocks (`approver`, `credential`, `tunnel`, `endpoint`, `enrollment`, `rule`)
 dispatch to a plugin chosen by the block's first label.
 
 ## How to read this page
@@ -19,12 +19,12 @@ Each block section lists the attributes the loader accepts, with:
 - **Required** — `yes` if the loader rejects the block when the
   attribute is missing.
 
-Plugin-dispatched kinds (`approver`, `credential`, `tunnel`, `endpoint`, `rule`)
+Plugin-dispatched kinds (`approver`, `credential`, `tunnel`, `endpoint`, `enrollment`, `rule`)
 list one subsection per registered type.
 
 ## Top-level blocks
 
-Operational settings live under the required top-level `gateway { ... }` block. The optional `defaults { ... }` block carries policy fallbacks. Labeled policy blocks (`profile`, `approver`, `credential`, `endpoint`, `rule`, `tunnel`) are documented in their own sections.
+Operational settings live under the required top-level `gateway { ... }` block. The optional `defaults { ... }` block carries policy fallbacks. Labeled policy blocks (`profile`, `approver`, `credential`, `endpoint`, `enrollment`, `rule`, `tunnel`) are documented in their own sections.
 
 | Attribute | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -135,7 +135,7 @@ profile "default" {
 
 Block syntax: `approver "<type>" "<name>" { ... }`
 
-Registered types: [`human_approver`](#approver-humanapprover), [`llm_approver`](#approver-llmapprover).
+Registered types: [`human_approver`](#approver-humanapprover), [`llm_approver`](#approver-llmapprover), [`webhook_approver`](#approver-webhookapprover).
 
 ### `approver "human_approver" "<name>"`
 
@@ -182,6 +182,69 @@ approver "llm_approver" "example" {
   credential = bearer_token.example
 }
 ```
+
+### `approver "webhook_approver" "<name>"`
+
+Posts a body-free request summary to an operator-owned HTTPS service and
+waits for a JSON `allow` or `deny` decision. The request uses an existing HTTP
+credential plugin for authentication. TLS authenticates the service response.
+Claw Patrol retries once after a transport error, HTTP `429`, or HTTP `5xx`.
+The retry uses `Retry-After` when supplied, or waits 500 milliseconds. The
+overall timeout includes both attempts. Other errors, timeouts, redirects, and
+invalid responses deny the action.
+
+| Attribute | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `url` | `string` | yes | Absolute HTTPS decision URL. User info, query strings, and fragments are rejected. |
+| `credential` | `ref(credential)` | yes | HTTP credential used to authenticate the webhook request. |
+| `timeout` | `int` | no | Overall timeout in seconds. Default `30`; maximum `600`. |
+
+```hcl
+credential "bearer_token" "approval-service" {}
+
+approver "webhook_approver" "access-control" {
+  url        = "https://approval.example.com/v1/decide"
+  credential = bearer_token.approval-service
+  timeout    = 90
+}
+```
+
+The request includes `peer:<agent-ip>` as `principal.id` and, when known, the
+device hostname as informational `principal.display_name`. The service must
+not use the display name for reusable grants. This version does not send body
+content and does not implement reusable or time-bound grants.
+
+Request body:
+
+```json
+{
+  "schema_version": 1,
+  "approver": "access-control",
+  "principal": {
+    "id": "peer:100.64.0.12",
+    "display_name": "build-agent-1",
+    "agent_ip": "100.64.0.12",
+    "profile": "production"
+  },
+  "policy": { "rule": "ssh-sensitive", "reason": "approval required" },
+  "target": { "endpoint": "build-host", "family": "ssh", "host": "build.example.com" },
+  "action": { "method": "exec", "path": "systemctl restart api" }
+}
+```
+
+The service returns HTTP `200` and exactly one JSON object:
+
+```json
+{
+  "schema_version": 1,
+  "decision": "allow",
+  "reason": "approved for this action",
+  "decided_by": "raj"
+}
+```
+
+`decision` must be exactly `allow` or `deny`. `reason` is optional and limited
+to 4 KiB. `decided_by` is optional and limited to 256 bytes.
 
 ## `credential` blocks
 
@@ -317,6 +380,14 @@ credential "google_gke_credential" "example" {}
 ```
 
 ### `credential "header_token" "<name>"`
+
+Stamps the secret onto an arbitrary HTTP header,
+optionally prefixed.
+
+When a header_token credential uses a placeholder disambiguator, the
+incoming request must contain the exact configured header value
+`prefix + placeholder`. Placeholders found in other headers or
+embedded inside a larger header value do not select this credential.
 
 | Attribute | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -593,6 +664,49 @@ Family: `ssh`.
 ```hcl
 endpoint "ssh" "example" {
   hosts = ["api.example.com"]
+}
+```
+
+## `enrollment` blocks
+
+Block syntax: `enrollment "<type>" "<name>" { ... }`
+
+Registered types: [`kubernetes_token_review`](#enrollment-kubernetestokenreview).
+
+### `enrollment "kubernetes_token_review" "<name>"`
+
+The body of an `enrollment
+"kubernetes_token_review" "<name>"` block. It authorizes Kubernetes
+workloads to self-enroll as transient WireGuard peers by verifying a
+projected ServiceAccount token with the Kubernetes TokenReview API.
+
+| Attribute | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `audience` | `string` | yes | Passed to Kubernetes TokenReview and must match the projected ServiceAccount token's audience. Required. |
+| `match` | `block` | yes | The repeated `match { ... }` rules. Each binds one namespace + service_account identity to a profile allowlist. At least one is required. |
+| `keepalive_interval` | `string` | no | The WireGuard persistent-keepalive interval (time.ParseDuration) the sidecar applies to enrolled peers and pushed to it at enroll. Optional; defaults to 25s and must be at least 10s (the floor is pinned to the gateway reaper's sample cadence). There is no upper bound: a longer interval just means fewer keepalive packets and a longer liveness window (keepalive_interval × keepalive_reap_count). |
+| `keepalive_reap_count` | `int` | no | How many missed keepalives elapse before an enrolled peer is reaped; the liveness window is keepalive_interval × keepalive_reap_count. Expressing it as a count keeps the safety ratio an integer that can't be misconfigured. Optional; defaults to 3. Set to 0 to disable reaping (and the sidecar's self-heal escalation) entirely; any other value must be 2 or greater. |
+
+**Nested block `match {}`:**
+
+One identity → profile-binding rule inside a
+kubernetes_token_review enrollment.
+
+| Attribute | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `namespace` | `string` | yes | The pod must run in. Required. |
+| `service_account` | `string` | yes | The pod's token must belong to. Required. |
+| `profile_label` | `string` | no | The Pod label the clawpatrol profile is read from. Optional; defaults to "clawpatrol.dev/profile". |
+| `profiles` | `[]string` | yes | The allowlist of profiles a matched pod may bind. The value of the profile_label pod label must appear here. Required (at least one), and each must be a declared `profile "<name>"`. |
+
+```hcl
+enrollment "kubernetes_token_review" "example" {
+  audience = "example"
+  match {
+    namespace = "example"
+    service_account = "example"
+    profiles = ["example"]
+  }
 }
 ```
 

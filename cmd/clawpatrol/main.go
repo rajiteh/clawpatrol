@@ -375,11 +375,20 @@ type Gateway struct {
 	blobs runtime.BlobStore
 	// pluginMgr supervises the external plugin subprocesses; the
 	// dashboard reads it for the Plugins page.
-	pluginMgr *extplugin.Manager
-	oauth     *OAuthRegistry
-	agents    *AgentRegistry
-	hitl      *HITLRegistry
-	onboard   *onboardRegistry
+	pluginMgr    *extplugin.Manager
+	oauth        *OAuthRegistry
+	agents       *AgentRegistry
+	hitl         *HITLRegistry
+	onboard      *onboardRegistry
+	enrollmentMu sync.Mutex
+	// enrollLive tracks per-peer WireGuard rx_bytes progress for the
+	// enrollment liveness reaper. Guarded by enrollmentMu.
+	enrollLive map[string]enrollmentLiveness
+	// k8sVerifier lets tests inject a fake Kubernetes verifier. In
+	// production it stays nil and each register request builds a
+	// short-lived in-cluster client, which re-reads the rotating
+	// ServiceAccount token, so there is nothing to cache here.
+	k8sVerifier k8sRegistrationVerifier
 	// secrets hands credential plugins the secret bytes they inject
 	// at request time. gatewaySecretStore stacks the credential_secrets
 	// table (dashboard slots), OAuthRegistry (refreshed access tokens),
@@ -1846,6 +1855,7 @@ func (g *Gateway) handlePostgresConn(c net.Conn, dstIP string) {
 	if eventHost == "" {
 		eventHost = dstIP
 	}
+	principalID, principalDisplayName := g.approvalPrincipal(agentPip)
 	ch := &runtime.ConnHandle{
 		Conn:     c,
 		Endpoint: ep,
@@ -1881,8 +1891,13 @@ func (g *Gateway) handlePostgresConn(c net.Conn, dstIP string) {
 			})
 		},
 		Approve: func(req runtime.ApproveCallRequest) runtime.ApproveVerdict {
-			return g.runApproveChain(context.Background(), req.Stages, runApproveCtx{
+			approveCtx := req.Context
+			if approveCtx == nil {
+				approveCtx = context.Background()
+			}
+			return g.runApproveChain(approveCtx, req.Stages, runApproveCtx{
 				AgentIP: agentPip, Host: eventHost, Method: req.Verb, Path: req.Summary,
+				PrincipalID: principalID, PrincipalDisplayName: principalDisplayName,
 				Reason:   ifNotEmpty(req.Rule, func(r *config.CompiledRule) string { return r.Outcome.Reason }),
 				Endpoint: ep, Rule: req.Rule, Profile: profile,
 			})
@@ -2001,6 +2016,7 @@ func (g *Gateway) dispatchConnEndpoint(c net.Conn, dstIP string, dstPort uint16,
 	if eventHost == "" {
 		eventHost = dstIP
 	}
+	principalID, principalDisplayName := g.approvalPrincipal(agentPip)
 	ch := &runtime.ConnHandle{
 		Conn:         c,
 		Endpoint:     ep,
@@ -2054,8 +2070,13 @@ func (g *Gateway) dispatchConnEndpoint(c net.Conn, dstIP string, dstPort uint16,
 			})
 		},
 		Approve: func(req runtime.ApproveCallRequest) runtime.ApproveVerdict {
-			return g.runApproveChain(context.Background(), req.Stages, runApproveCtx{
+			approveCtx := req.Context
+			if approveCtx == nil {
+				approveCtx = context.Background()
+			}
+			return g.runApproveChain(approveCtx, req.Stages, runApproveCtx{
 				AgentIP: agentPip, Host: eventHost, Method: req.Verb, Path: req.Summary,
+				PrincipalID: principalID, PrincipalDisplayName: principalDisplayName,
 				Reason:   ifNotEmpty(req.Rule, func(r *config.CompiledRule) string { return r.Outcome.Reason }),
 				Endpoint: ep, Rule: req.Rule, Profile: profile,
 			})
@@ -2462,6 +2483,7 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 		var asyncOp HITLOperation
 		var asyncSyncWait time.Duration
 		if cr != nil && len(cr.Outcome.Approve) > 0 && !hitlRetryBypassedApproval {
+			principalID, principalDisplayName := g.approvalPrincipal(agentAddr)
 			if approverID, asyncApprover, ok := g.asyncHumanApproverFor(cr.Outcome.Approve); ok {
 				start, started, err := g.maybeStartAsyncHITLOperation(req.Context(), hitlAsyncOperationInput{
 					ProfileID:   profile,
@@ -2485,6 +2507,7 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 			}
 			v := g.runApproveChain(req.Context(), cr.Outcome.Approve, runApproveCtx{
 				AgentIP: agentAddr, Host: host, Method: req.Method, Path: req.URL.RequestURI(),
+				PrincipalID: principalID, PrincipalDisplayName: principalDisplayName,
 				UA: req.Header.Get("User-Agent"), BodySample: string(matchBody), Reason: cr.Outcome.Reason,
 				ThreadTS:      req.Header.Get("X-HITL-Thread-TS"),
 				NotifyChannel: req.Header.Get("X-HITL-Channel"),
@@ -2932,6 +2955,8 @@ func secretEnvName(credName string) string {
 // HITL prompt fields + the matching rule + the device's profile.
 type runApproveCtx struct {
 	AgentIP                   string
+	PrincipalID               string
+	PrincipalDisplayName      string
 	Host                      string
 	Method                    string
 	Path                      string
@@ -2991,6 +3016,8 @@ func (g *Gateway) runApproveChain(ctx context.Context, stages []config.ApproveSt
 			Request:                   c.Request,
 			ApproverName:              st.Name,
 			AgentIP:                   c.AgentIP,
+			PrincipalID:               c.PrincipalID,
+			PrincipalDisplayName:      c.PrincipalDisplayName,
 			Profile:                   c.Profile,
 			Method:                    c.Method,
 			Host:                      c.Host,
@@ -3036,6 +3063,14 @@ func (g *Gateway) runApproveChain(ctx context.Context, stages []config.ApproveSt
 	return runtime.ApproveVerdict{Decision: "allow"}
 }
 
+func (g *Gateway) approvalPrincipal(agentIP string) (id, displayName string) {
+	id = hitlPeerPrincipalID(agentIP)
+	if g.onboard != nil {
+		displayName = g.onboard.HostnameForIP(agentIP)
+	}
+	return id, displayName
+}
+
 // ifNotEmpty returns f(v) when v != nil, else "".
 func ifNotEmpty(r *config.CompiledRule, f func(*config.CompiledRule) string) string {
 	if r == nil {
@@ -3059,6 +3094,10 @@ func main() {
 		runJoin(os.Args[2:])
 	case "run":
 		runRun(os.Args[2:])
+	case "bridge":
+		// Foreground data plane: self-enroll through an authorizer, bring up
+		// and host a userspace WireGuard tunnel, route the netns, stay up.
+		runBridge(os.Args[2:])
 	case "daemon-internal":
 		// internal: re-exec'd by `clawpatrol run` (Linux only) to host
 		// the per-user tsnet daemon. Hidden from usage(); name carries
@@ -3171,6 +3210,9 @@ usage:
                                          with no public URL (creds discarded
                                          once join completes)
   clawpatrol run -- <cmd> [args...]      route one process tree through gateway
+  clawpatrol bridge --authorizer <type>/<name> [flags]
+                                         resident sidecar: self-enroll, host the
+                                         WireGuard tunnel, route the netns
   clawpatrol status                      report install + tunnel state
   clawpatrol uninstall                   remove local join state and tunnel config
   clawpatrol env                         print shell exports for sourcing
@@ -3438,6 +3480,16 @@ func runGateway(args []string) {
 			log.Fatalf("wireguard: %v", err)
 		}
 		setWGServer(wg)
+		// Restore any persisted enrolled peers into the device + registry,
+		// then run the liveness reaper. Both are always-on once WireGuard is
+		// up: enrollment can be turned on by a later config reload, and any
+		// peers left behind must keep getting reaped after the feature is
+		// turned off. The reaper is a cheap no-op while there are none.
+		g.logEnrollmentReconcile(context.Background())
+		go g.startEnrollmentReaper(context.Background())
+		if cfg.IsEnrollmentEnabled() {
+			log.Printf("enrollment: enabled")
+		}
 		dashMux := newWebMux(g, cfg.Join(), cfg.PublicURL())
 		dashPort := portOf(dashListen)
 		tcpDispatch := func(c net.Conn, dstIP string, dstPort uint16) {
