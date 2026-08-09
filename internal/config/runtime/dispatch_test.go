@@ -858,6 +858,51 @@ profile "default" {
 	}
 }
 
+func TestResolveCredentialKubernetesPlaceholderWithFallback(t *testing.T) {
+	cp := compileFixture(t, `
+endpoint "kubernetes" "cluster" {
+  server = "cluster.example.com"
+}
+credential "bearer_token" "reader"   { endpoint = kubernetes.cluster }
+credential "bearer_token" "admin"    { endpoint = kubernetes.cluster }
+credential "bearer_token" "fallback" { endpoint = kubernetes.cluster }
+profile "default" {
+  credentials = [
+    { credential = bearer_token.reader, placeholder = "PH_k8s" },
+    { credential = bearer_token.admin, placeholder = "PH_k8s_admin" },
+    bearer_token.fallback,
+  ]
+}
+`)
+	ep := cp.Endpoints["cluster"]
+	resolve := func(authorization string) string {
+		headers := make(http.Header)
+		if authorization != "" {
+			headers.Set("Authorization", authorization)
+		}
+		credential := runtime.ResolveCredential(cp, "default", ep, &match.Request{Family: "k8s", Headers: headers})
+		if credential == nil {
+			return ""
+		}
+		return credential.Credential.Symbol.Name
+	}
+
+	tests := []struct {
+		authorization string
+		want          string
+	}{
+		{authorization: "Bearer PH_k8s", want: "reader"},
+		{authorization: "Bearer PH_k8s_admin", want: "admin"},
+		{authorization: "Bearer PH_unknown", want: "fallback"},
+		{want: "fallback"},
+	}
+	for _, tt := range tests {
+		if got := resolve(tt.authorization); got != tt.want {
+			t.Errorf("Authorization %q selected %q, want %q", tt.authorization, got, tt.want)
+		}
+	}
+}
+
 // TestResolveCredentialDatabaseOnly: SQL credentials dispatch on
 // req.Database alone — the discriminator lives on the credential
 // body's `database` attr, not on the profile entry.
@@ -1195,6 +1240,113 @@ profile "default" { credentials = [basic_auth.test, basic_auth.prod, basic_auth.
 		got = runtime.ResolveCredential(cp, "default", ep, mkReq("agent", "unknown"))
 		if got == nil || got.Credential.Symbol.Name != "fallback" {
 			t.Errorf("no Basic placeholder match should fall back, got %+v", got)
+		}
+	})
+
+	t.Run("header_token routes by exact configured header placeholder", func(t *testing.T) {
+		src := `
+endpoint "https" "ep" { hosts = ["gitlab.example.com"] }
+credential "header_token" "test" {
+  endpoint = https.ep
+  header   = "PRIVATE-TOKEN"
+}
+credential "header_token" "prod" {
+  endpoint = https.ep
+  header   = "PRIVATE-TOKEN"
+}
+credential "header_token" "fallback" {
+  endpoint = https.ep
+  header   = "PRIVATE-TOKEN"
+}
+profile "default" {
+  credentials = [
+    { credential = header_token.test, placeholder = "PH_test" },
+    { credential = header_token.prod, placeholder = "PH_prod" },
+    header_token.fallback,
+  ]
+}
+`
+		cp := compileFixture(t, src)
+		ep := cp.Endpoints["ep"]
+		mkReq := func(headers http.Header) *match.Request {
+			return &match.Request{Family: "http", Headers: headers}
+		}
+		got := runtime.ResolveCredential(cp, "default", ep, mkReq(http.Header{"Private-Token": {"PH_prod"}}))
+		if got == nil || got.Credential.Symbol.Name != "prod" {
+			t.Errorf("PRIVATE-TOKEN=PH_prod should select prod, got %+v", got)
+		}
+		got = runtime.ResolveCredential(cp, "default", ep, mkReq(http.Header{"Private-Token": {"prefix PH_prod suffix"}}))
+		if got == nil || got.Credential.Symbol.Name != "fallback" {
+			t.Errorf("embedded PRIVATE-TOKEN placeholder should fall back, got %+v", got)
+		}
+		got = runtime.ResolveCredential(cp, "default", ep, mkReq(http.Header{"X-Other": {"PH_prod"}}))
+		if got == nil || got.Credential.Symbol.Name != "fallback" {
+			t.Errorf("placeholder in unrelated header should fall back, got %+v", got)
+		}
+		got = runtime.ResolveCredential(cp, "default", ep, mkReq(http.Header{"Private-Token": {"PH_unknown"}}))
+		if got == nil || got.Credential.Symbol.Name != "fallback" {
+			t.Errorf("unknown PRIVATE-TOKEN placeholder should fall back, got %+v", got)
+		}
+		got = runtime.ResolveCredential(cp, "default", ep, mkReq(http.Header{"Private-Token": {"noise", "PH_test"}}))
+		if got == nil || got.Credential.Symbol.Name != "test" {
+			t.Errorf("any exact PRIVATE-TOKEN header value should select test, got %+v", got)
+		}
+	})
+
+	t.Run("header_token routes by exact prefixed placeholder", func(t *testing.T) {
+		src := `
+endpoint "https" "ep" { hosts = ["api.example.com"] }
+credential "header_token" "prod" {
+  endpoint = https.ep
+  header   = "Authorization"
+  prefix   = "Token "
+}
+credential "header_token" "fallback" {
+  endpoint = https.ep
+  header   = "Authorization"
+  prefix   = "Token "
+}
+profile "default" {
+  credentials = [
+    { credential = header_token.prod, placeholder = "PH_prod" },
+    header_token.fallback,
+  ]
+}
+`
+		cp := compileFixture(t, src)
+		ep := cp.Endpoints["ep"]
+		mkReq := func(authz string) *match.Request {
+			h := http.Header{}
+			h.Set("Authorization", authz)
+			return &match.Request{Family: "http", Headers: h}
+		}
+		got := runtime.ResolveCredential(cp, "default", ep, mkReq("Token PH_prod"))
+		if got == nil || got.Credential.Symbol.Name != "prod" {
+			t.Errorf("Authorization=Token PH_prod should select prod, got %+v", got)
+		}
+		got = runtime.ResolveCredential(cp, "default", ep, mkReq("PH_prod"))
+		if got == nil || got.Credential.Symbol.Name != "fallback" {
+			t.Errorf("missing header_token prefix should fall back, got %+v", got)
+		}
+		got = runtime.ResolveCredential(cp, "default", ep, mkReq("Bearer PH_prod"))
+		if got == nil || got.Credential.Symbol.Name != "fallback" {
+			t.Errorf("wrong Authorization scheme should fall back, got %+v", got)
+		}
+	})
+
+	t.Run("single header_token credential resolves without placeholder", func(t *testing.T) {
+		src := `
+endpoint "https" "ep" { hosts = ["gitlab.example.com"] }
+credential "header_token" "only" {
+  endpoint = https.ep
+  header   = "PRIVATE-TOKEN"
+}
+profile "default" { credentials = [header_token.only] }
+`
+		cp := compileFixture(t, src)
+		got := runtime.ResolveCredential(cp, "default", cp.Endpoints["ep"], &match.Request{Family: "http", Headers: http.Header{}})
+		if got == nil || got.Credential.Symbol.Name != "only" {
+			t.Errorf("single header_token credential should resolve without placeholder, got %+v", got)
 		}
 	})
 }

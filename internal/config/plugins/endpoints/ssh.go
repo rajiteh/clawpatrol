@@ -251,7 +251,9 @@ func (rt *SSHEndpointRuntime) HandleConn(ctx context.Context, ch *runtime.ConnHa
 	// mirrors the postgres per-statement path: build a match.Request,
 	// run MatchRequest, honor an approve chain through ch.Approve, and
 	// default-deny an approve-gated action when HITL isn't wired.
-	gate := rt.makeGate(ch, emit, agentUser, cc.Credential.Symbol.Name)
+	approvalCtx, cancelApprovals := context.WithCancel(ctx)
+	defer cancelApprovals()
+	gate := rt.makeGate(approvalCtx, ch, emit, agentUser, cc.Credential.Symbol.Name)
 	agentHooks := sshHooks{emit: emit, gate: gate}
 
 	// Step 6: bidirectional pump. Two waitgroups — `dispatch` covers
@@ -282,6 +284,7 @@ func (rt *SSHEndpointRuntime) HandleConn(ctx context.Context, ch *runtime.ConnHa
 	go func() { _ = srvConn.Wait(); exit <- struct{}{} }()
 	go func() { _ = clientConn.Wait(); exit <- struct{}{} }()
 	<-exit
+	cancelApprovals()
 	// Drain in-flight channel proxies — proxyChannel handles its own
 	// teardown gracefully (forwards exit-status, then Closes) so by
 	// the time chans.Wait() returns every byte that was going to flow
@@ -914,7 +917,7 @@ type (
 // boolean. Mirrors the postgres per-statement decision path
 // (endpoints/postgres.go): MatchRequest, then an approve chain via
 // ch.Approve with a default-deny when HITL isn't configured.
-func (rt *SSHEndpointRuntime) makeGate(ch *runtime.ConnHandle, emit func(runtime.ConnEvent), agentUser, credName string) func(*sshfacet.Meta) (bool, string) {
+func (rt *SSHEndpointRuntime) makeGate(ctx context.Context, ch *runtime.ConnHandle, emit func(runtime.ConnEvent), agentUser, credName string) func(*sshfacet.Meta) (bool, string) {
 	return func(m *sshfacet.Meta) (bool, string) {
 		if m.User == "" {
 			m.User = agentUser
@@ -954,7 +957,7 @@ func (rt *SSHEndpointRuntime) makeGate(ch *runtime.ConnHandle, emit func(runtime
 				return true, "approval required but HITL is not configured"
 			}
 			v := ch.Approve(runtime.ApproveCallRequest{
-				Stages: cr.Outcome.Approve, Verb: m.Verb, Summary: summary, Rule: cr,
+				Context: ctx, Stages: cr.Outcome.Approve, Verb: m.Verb, Summary: summary, Rule: cr,
 			})
 			if v.Decision != "allow" {
 				reason := v.Reason

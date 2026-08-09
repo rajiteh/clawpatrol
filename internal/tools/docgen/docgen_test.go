@@ -39,6 +39,22 @@ func TestGeneratedDocIsFresh(t *testing.T) {
 		len(wantLines), len(gotLines), firstDiff(wantLines, gotLines))
 }
 
+func TestWebhookApproverReferenceIsGenerated(t *testing.T) {
+	got, err := render.Generate()
+	if err != nil {
+		t.Fatalf("render.Generate: %v", err)
+	}
+	for _, want := range []string{
+		"Posts a body-free request summary to an operator-owned HTTPS service",
+		`"principal": {`,
+		"`decision` must be exactly `allow` or `deny`",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("generated webhook approver reference missing %q", want)
+		}
+	}
+}
+
 func TestGatewayPluginBlockIsOptional(t *testing.T) {
 	got, err := render.Generate()
 	if err != nil {
@@ -47,6 +63,46 @@ func TestGatewayPluginBlockIsOptional(t *testing.T) {
 	const row = "| `plugin` | `block` | no |"
 	if !strings.Contains(got, row) {
 		t.Fatalf("generated config reference should mark top-level plugin blocks optional; missing row prefix %q", row)
+	}
+}
+
+func TestEnrollmentRequiredFields(t *testing.T) {
+	got, err := render.Generate()
+	if err != nil {
+		t.Fatalf("render.Generate: %v", err)
+	}
+	const heading = "### `enrollment \"kubernetes_token_review\" \"<name>\"`"
+	start := strings.Index(got, heading)
+	if start < 0 {
+		t.Fatalf("generated config reference missing %s", heading)
+	}
+	section := got[start:]
+	if end := strings.Index(section, "\n## "); end >= 0 {
+		section = section[:end]
+	}
+	for _, row := range []string{
+		"| `audience` | `string` | yes |",
+		"| `match` | `block` | yes |",
+		"| `keepalive_interval` | `string` | no |",
+		"| `keepalive_reap_count` | `int` | no |",
+		"| `namespace` | `string` | yes |",
+		"| `service_account` | `string` | yes |",
+		"| `profile_label` | `string` | no |",
+		"| `profiles` | `[]string` | yes |",
+	} {
+		if !strings.Contains(section, row) {
+			t.Errorf("generated config reference missing row prefix %q", row)
+		}
+	}
+	if !strings.Contains(section, `enrollment "kubernetes_token_review" "example" {
+  audience = "example"
+  match {
+    namespace = "example"
+    service_account = "example"
+    profiles = ["example"]
+  }
+}`) {
+		t.Error("generated Kubernetes enrollment example omits required fields")
 	}
 }
 

@@ -25,11 +25,16 @@ func (a captureApproveRequestApprover) Approve(_ context.Context, req runtime.Ap
 
 func TestGatewayRunApproveChainWiresPendingMessageUpdateSink(t *testing.T) {
 	approver := captureApproveRequestApprover{got: make(chan runtime.ApproveRequest, 1)}
-	g := &Gateway{hitl: newHITLRegistry(nil)}
+	g := &Gateway{hitl: newHITLRegistry(nil), onboard: newOnboardRegistry()}
 	g.cfg.Store(&config.Gateway{})
 	g.policy.Store(&config.CompiledPolicy{Approvers: map[string]*config.Entity{"ops": {Body: approver}}})
+	g.onboard.SetHostname("100.64.0.12", "build-agent-1")
+	principalID, displayName := g.approvalPrincipal("100.64.0.12")
 
-	verdict := g.runApproveChain(context.Background(), []config.ApproveStage{{Name: "ops"}}, runApproveCtx{Host: "api.example.test", Method: "POST", Path: "/v1/write"})
+	verdict := g.runApproveChain(context.Background(), []config.ApproveStage{{Name: "ops"}}, runApproveCtx{
+		AgentIP: "100.64.0.12", PrincipalID: principalID, PrincipalDisplayName: displayName,
+		Host: "api.example.test", Method: "POST", Path: "/v1/write",
+	})
 	if verdict.Decision != "allow" {
 		t.Fatalf("runApproveChain verdict = %#v, want allow", verdict)
 	}
@@ -37,6 +42,9 @@ func TestGatewayRunApproveChainWiresPendingMessageUpdateSink(t *testing.T) {
 	case req := <-approver.got:
 		if req.PendingMessageUpdateSink == nil {
 			t.Fatal("ApproveRequest PendingMessageUpdateSink is nil; sync HITL Slack prompts cannot record terminal-update message refs")
+		}
+		if req.PrincipalID != "peer:100.64.0.12" || req.PrincipalDisplayName != "build-agent-1" {
+			t.Fatalf("principal = (%q, %q)", req.PrincipalID, req.PrincipalDisplayName)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("approver was not invoked")

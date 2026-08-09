@@ -47,6 +47,7 @@ func (r *renderer) run() (string, error) {
 		config.KindApprover,
 		config.KindCredential,
 		config.KindEndpoint,
+		config.KindEnrollment,
 		config.KindRule,
 		config.KindTunnel,
 	} {
@@ -60,7 +61,7 @@ func (r *renderer) writeHeader() {
 
 A clawpatrol gateway config mixes **operational** settings in the
 required top-level ` + "`gateway { ... }`" + ` block with **policy** blocks.
-Policy blocks (` + "`approver`, `credential`, `tunnel`, `endpoint`, `rule`" + `)
+Policy blocks (` + "`approver`, `credential`, `tunnel`, `endpoint`, `enrollment`, `rule`" + `)
 dispatch to a plugin chosen by the block's first label.
 
 ## How to read this page
@@ -77,7 +78,7 @@ Each block section lists the attributes the loader accepts, with:
 - **Required** — ` + "`yes`" + ` if the loader rejects the block when the
   attribute is missing.
 
-Plugin-dispatched kinds (` + "`approver`, `credential`, `tunnel`, `endpoint`, `rule`" + `)
+Plugin-dispatched kinds (` + "`approver`, `credential`, `tunnel`, `endpoint`, `enrollment`, `rule`" + `)
 list one subsection per registered type.
 
 `)
@@ -146,7 +147,7 @@ func upperFirst(s string) string {
 
 func (r *renderer) writeOperational() {
 	r.out.WriteString("## Top-level blocks\n\n")
-	r.out.WriteString("Operational settings live under the required top-level `gateway { ... }` block. The optional `defaults { ... }` block carries policy fallbacks. Labeled policy blocks (`profile`, `approver`, `credential`, `endpoint`, `rule`, `tunnel`) are documented in their own sections.\n\n")
+	r.out.WriteString("Operational settings live under the required top-level `gateway { ... }` block. The optional `defaults { ... }` block carries policy fallbacks. Labeled policy blocks (`profile`, `approver`, `credential`, `endpoint`, `enrollment`, `rule`, `tunnel`) are documented in their own sections.\n\n")
 	r.writeStructTable("config", "Gateway", reflect.TypeOf(config.Gateway{}))
 	r.out.WriteString("## `gateway { ... }`\n\n")
 	r.out.WriteString("The gateway block carries operational settings — listen addresses, the WireGuard / Tailscale transport sub-blocks, session and retention windows, telemetry, and the resolver.\n\n")
@@ -200,6 +201,10 @@ func (r *renderer) writePlugin(kind config.Kind, p *config.Plugin) {
 	} else {
 		fmt.Fprintf(&r.out, "### `%s \"%s\" \"<name>\"`\n\n", kind, p.Type)
 	}
+	if kind == config.KindApprover && p.Type == "webhook_approver" {
+		r.writeWebhookApproverReference()
+		return
+	}
 
 	rt := pluginStructType(p)
 	pkgName := pkgNameOf(rt)
@@ -220,6 +225,73 @@ func (r *renderer) writePlugin(kind config.Kind, p *config.Plugin) {
 	r.writeStructTable(pkgName, typeName, rt)
 
 	r.writeExample(string(kind), p.Type, rt, true)
+}
+
+func (r *renderer) writeWebhookApproverReference() {
+	r.out.WriteString(strings.Join([]string{
+		"Posts a body-free request summary to an operator-owned HTTPS service and",
+		"waits for a JSON `allow` or `deny` decision. The request uses an existing HTTP",
+		"credential plugin for authentication. TLS authenticates the service response.",
+		"Claw Patrol retries once after a transport error, HTTP `429`, or HTTP `5xx`.",
+		"The retry uses `Retry-After` when supplied, or waits 500 milliseconds. The",
+		"overall timeout includes both attempts. Other errors, timeouts, redirects, and",
+		"invalid responses deny the action.",
+		"",
+		"| Attribute | Type | Required | Description |",
+		"|-----------|------|----------|-------------|",
+		"| `url` | `string` | yes | Absolute HTTPS decision URL. User info, query strings, and fragments are rejected. |",
+		"| `credential` | `ref(credential)` | yes | HTTP credential used to authenticate the webhook request. |",
+		"| `timeout` | `int` | no | Overall timeout in seconds. Default `30`; maximum `600`. |",
+		"",
+		"```hcl",
+		"credential \"bearer_token\" \"approval-service\" {}",
+		"",
+		"approver \"webhook_approver\" \"access-control\" {",
+		"  url        = \"https://approval.example.com/v1/decide\"",
+		"  credential = bearer_token.approval-service",
+		"  timeout    = 90",
+		"}",
+		"```",
+		"",
+		"The request includes `peer:<agent-ip>` as `principal.id` and, when known, the",
+		"device hostname as informational `principal.display_name`. The service must",
+		"not use the display name for reusable grants. This version does not send body",
+		"content and does not implement reusable or time-bound grants.",
+		"",
+		"Request body:",
+		"",
+		"```json",
+		"{",
+		"  \"schema_version\": 1,",
+		"  \"approver\": \"access-control\",",
+		"  \"principal\": {",
+		"    \"id\": \"peer:100.64.0.12\",",
+		"    \"display_name\": \"build-agent-1\",",
+		"    \"agent_ip\": \"100.64.0.12\",",
+		"    \"profile\": \"production\"",
+		"  },",
+		"  \"policy\": { \"rule\": \"ssh-sensitive\", \"reason\": \"approval required\" },",
+		"  \"target\": { \"endpoint\": \"build-host\", \"family\": \"ssh\", \"host\": \"build.example.com\" },",
+		"  \"action\": { \"method\": \"exec\", \"path\": \"systemctl restart api\" }",
+		"}",
+		"```",
+		"",
+		"The service returns HTTP `200` and exactly one JSON object:",
+		"",
+		"```json",
+		"{",
+		"  \"schema_version\": 1,",
+		"  \"decision\": \"allow\",",
+		"  \"reason\": \"approved for this action\",",
+		"  \"decided_by\": \"raj\"",
+		"}",
+		"```",
+		"",
+		"`decision` must be exactly `allow` or `deny`. `reason` is optional and limited",
+		"to 4 KiB. `decided_by` is optional and limited to 256 bytes.",
+		"",
+		"",
+	}, "\n"))
 }
 
 // pluginStructType invokes plugin.New() and returns the underlying
@@ -345,6 +417,9 @@ func (r *renderer) collectFields(pkgName, typeName string, rt reflect.Type) []fi
 		if pkgName == "config" && typeName == "Gateway" && f.Name == "Settings" {
 			required = true
 		}
+		if pkgName == "config" && typeName == "k8sEnrollmentBody" && f.Name == "Matches" {
+			required = true
+		}
 		row := fieldRow{
 			Name:        name,
 			Type:        typeStr,
@@ -373,7 +448,7 @@ func skipPublicConfigReferenceField(pkgName, typeName, fieldName string) bool {
 func (r *renderer) fieldRefs(pkgName, typeName string) map[string]string {
 	out := map[string]string{}
 	for _, kind := range []config.Kind{
-		config.KindApprover, config.KindCredential, config.KindTunnel, config.KindEndpoint, config.KindRule,
+		config.KindApprover, config.KindCredential, config.KindTunnel, config.KindEndpoint, config.KindRule, config.KindEnrollment,
 	} {
 		for _, p := range config.AllPlugins(kind) {
 			rt := pluginStructType(p)
@@ -484,6 +559,13 @@ func exampleBody(kind, typ string, rt reflect.Type) string {
 			continue
 		}
 		fmt.Fprintf(&sb, "  %s = %s\n", name, val)
+	}
+	if kind == "enrollment" && typ == "kubernetes_token_review" {
+		fmt.Fprintln(&sb, "  match {")
+		fmt.Fprintln(&sb, `    namespace = "example"`)
+		fmt.Fprintln(&sb, `    service_account = "example"`)
+		fmt.Fprintln(&sb, `    profiles = ["example"]`)
+		fmt.Fprintln(&sb, "  }")
 	}
 	return sb.String()
 }

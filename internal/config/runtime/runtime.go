@@ -281,6 +281,10 @@ type ConnHandle struct {
 // chain. Verb / Summary populate the dashboard's HITL request card;
 // Stages drives which approvers fire in which order.
 type ApproveCallRequest struct {
+	// Context follows the originating connection action. Conn endpoint
+	// plugins set it so a disconnected client cancels a pending approver.
+	// The host falls back to context.Background for older callers.
+	Context context.Context
 	Stages  []config.ApproveStage
 	Verb    string // SQL verb / k8s verb / etc., for the dashboard
 	Summary string // one-liner the operator sees in the HITL prompt
@@ -481,6 +485,13 @@ type ApproveRequest struct {
 	// AgentIP is the WireGuard source IP of the originating peer.
 	// Used as the HITLPending.AgentIP key and as a log identifier.
 	AgentIP string
+	// PrincipalID is the request-scoped identity available for this action.
+	// The minimal built-in form is "peer:<agent-ip>"; it is not an
+	// enrollment-stable identity for reusable grants.
+	PrincipalID string
+	// PrincipalDisplayName is the operator-facing device hostname. It is
+	// informational and must not be used as a reusable grant identity.
+	PrincipalDisplayName string
 	// Profile is the tenant profile the originating peer is bound to
 	// (e.g. "dev2"). Informational — approvers use it as a
 	// human-readable label in slack cards / log lines / message
@@ -818,6 +829,19 @@ var ErrUnsupported = errors.New("plugin runtime not implemented")
 // calling it.
 type PlaceholderDetector interface {
 	DetectPlaceholder(req *Request, candidates []string) string
+}
+
+// CredentialPlaceholderMatcher is an optional credential-runtime hook
+// for credential types whose placeholder must be matched against their
+// own request slot, not the endpoint's generic placeholder search.
+//
+// ResolveCredential treats this hook as authoritative for the
+// credential entry that implements it: returning false means the
+// credential's placeholder constraint did not match, even if the
+// endpoint-wide PlaceholderDetector saw the same bytes somewhere else
+// in the request.
+type CredentialPlaceholderMatcher interface {
+	MatchPlaceholder(req *Request, placeholder string) bool
 }
 
 // SQLParser is the optional contract a SQL-family endpoint plugin's
