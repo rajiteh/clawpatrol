@@ -1846,6 +1846,7 @@ func (g *Gateway) handlePostgresConn(c net.Conn, dstIP string) {
 	if eventHost == "" {
 		eventHost = dstIP
 	}
+	principalID, principalDisplayName := g.approvalPrincipal(agentPip)
 	ch := &runtime.ConnHandle{
 		Conn:     c,
 		Endpoint: ep,
@@ -1881,8 +1882,13 @@ func (g *Gateway) handlePostgresConn(c net.Conn, dstIP string) {
 			})
 		},
 		Approve: func(req runtime.ApproveCallRequest) runtime.ApproveVerdict {
-			return g.runApproveChain(context.Background(), req.Stages, runApproveCtx{
+			approveCtx := req.Context
+			if approveCtx == nil {
+				approveCtx = context.Background()
+			}
+			return g.runApproveChain(approveCtx, req.Stages, runApproveCtx{
 				AgentIP: agentPip, Host: eventHost, Method: req.Verb, Path: req.Summary,
+				PrincipalID: principalID, PrincipalDisplayName: principalDisplayName,
 				Reason:   ifNotEmpty(req.Rule, func(r *config.CompiledRule) string { return r.Outcome.Reason }),
 				Endpoint: ep, Rule: req.Rule, Profile: profile,
 			})
@@ -2001,6 +2007,7 @@ func (g *Gateway) dispatchConnEndpoint(c net.Conn, dstIP string, dstPort uint16,
 	if eventHost == "" {
 		eventHost = dstIP
 	}
+	principalID, principalDisplayName := g.approvalPrincipal(agentPip)
 	ch := &runtime.ConnHandle{
 		Conn:         c,
 		Endpoint:     ep,
@@ -2054,8 +2061,13 @@ func (g *Gateway) dispatchConnEndpoint(c net.Conn, dstIP string, dstPort uint16,
 			})
 		},
 		Approve: func(req runtime.ApproveCallRequest) runtime.ApproveVerdict {
-			return g.runApproveChain(context.Background(), req.Stages, runApproveCtx{
+			approveCtx := req.Context
+			if approveCtx == nil {
+				approveCtx = context.Background()
+			}
+			return g.runApproveChain(approveCtx, req.Stages, runApproveCtx{
 				AgentIP: agentPip, Host: eventHost, Method: req.Verb, Path: req.Summary,
+				PrincipalID: principalID, PrincipalDisplayName: principalDisplayName,
 				Reason:   ifNotEmpty(req.Rule, func(r *config.CompiledRule) string { return r.Outcome.Reason }),
 				Endpoint: ep, Rule: req.Rule, Profile: profile,
 			})
@@ -2462,6 +2474,7 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 		var asyncOp HITLOperation
 		var asyncSyncWait time.Duration
 		if cr != nil && len(cr.Outcome.Approve) > 0 && !hitlRetryBypassedApproval {
+			principalID, principalDisplayName := g.approvalPrincipal(agentAddr)
 			if approverID, asyncApprover, ok := g.asyncHumanApproverFor(cr.Outcome.Approve); ok {
 				start, started, err := g.maybeStartAsyncHITLOperation(req.Context(), hitlAsyncOperationInput{
 					ProfileID:   profile,
@@ -2485,6 +2498,7 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 			}
 			v := g.runApproveChain(req.Context(), cr.Outcome.Approve, runApproveCtx{
 				AgentIP: agentAddr, Host: host, Method: req.Method, Path: req.URL.RequestURI(),
+				PrincipalID: principalID, PrincipalDisplayName: principalDisplayName,
 				UA: req.Header.Get("User-Agent"), BodySample: string(matchBody), Reason: cr.Outcome.Reason,
 				ThreadTS:      req.Header.Get("X-HITL-Thread-TS"),
 				NotifyChannel: req.Header.Get("X-HITL-Channel"),
@@ -2932,6 +2946,8 @@ func secretEnvName(credName string) string {
 // HITL prompt fields + the matching rule + the device's profile.
 type runApproveCtx struct {
 	AgentIP                   string
+	PrincipalID               string
+	PrincipalDisplayName      string
 	Host                      string
 	Method                    string
 	Path                      string
@@ -2991,6 +3007,8 @@ func (g *Gateway) runApproveChain(ctx context.Context, stages []config.ApproveSt
 			Request:                   c.Request,
 			ApproverName:              st.Name,
 			AgentIP:                   c.AgentIP,
+			PrincipalID:               c.PrincipalID,
+			PrincipalDisplayName:      c.PrincipalDisplayName,
 			Profile:                   c.Profile,
 			Method:                    c.Method,
 			Host:                      c.Host,
@@ -3034,6 +3052,14 @@ func (g *Gateway) runApproveChain(ctx context.Context, stages []config.ApproveSt
 		}
 	}
 	return runtime.ApproveVerdict{Decision: "allow"}
+}
+
+func (g *Gateway) approvalPrincipal(agentIP string) (id, displayName string) {
+	id = hitlPeerPrincipalID(agentIP)
+	if g.onboard != nil {
+		displayName = g.onboard.HostnameForIP(agentIP)
+	}
+	return id, displayName
 }
 
 // ifNotEmpty returns f(v) when v != nil, else "".

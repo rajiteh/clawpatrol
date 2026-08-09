@@ -39,6 +39,22 @@ func TestGeneratedDocIsFresh(t *testing.T) {
 		len(wantLines), len(gotLines), firstDiff(wantLines, gotLines))
 }
 
+func TestWebhookApproverReferenceIsGenerated(t *testing.T) {
+	got, err := render.Generate()
+	if err != nil {
+		t.Fatalf("render.Generate: %v", err)
+	}
+	for _, want := range []string{
+		"Posts a body-free request summary to an operator-owned HTTPS service",
+		`"principal": {`,
+		"`decision` must be exactly `allow` or `deny`",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("generated webhook approver reference missing %q", want)
+		}
+	}
+}
+
 func TestGatewayPluginBlockIsOptional(t *testing.T) {
 	got, err := render.Generate()
 	if err != nil {
