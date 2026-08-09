@@ -348,8 +348,8 @@ func requireJSONEOF(dec *json.Decoder) error {
 	return err
 }
 
-func safeWebhookText(s string, max int) bool {
-	if len(s) > max || !utf8.ValidString(s) {
+func safeWebhookText(s string, maxBytes int) bool {
+	if len(s) > maxBytes || !utf8.ValidString(s) {
 		return false
 	}
 	for _, r := range s {
@@ -360,12 +360,12 @@ func safeWebhookText(s string, max int) bool {
 	return true
 }
 
-func boundedWebhookText(s string, max int) string {
+func boundedWebhookText(s string, maxBytes int) string {
 	s = strings.TrimSpace(s)
-	if len(s) <= max {
+	if len(s) <= maxBytes {
 		return s
 	}
-	s = s[:max]
+	s = s[:maxBytes]
 	for !utf8.ValidString(s) {
 		s = s[:len(s)-1]
 	}
