@@ -190,6 +190,13 @@ device. The gateway answers DNS that arrives through the tunnel. A workload
 container can set the mark only with `CAP_NET_ADMIN` or `CAP_NET_RAW`, so
 workload containers must drop both.
 
+The bridge also adds a last-resort IPv4 default route to loopback with the
+highest metric in the main table. Pods run loose reverse-path filtering, and
+`/proc/sys` is read-only, so while the tunnel is down a main table with no
+default route would drop the replies from DNS and the gateway API to the
+bridge, and it could not re-enroll. Unmarked packets that use the loopback
+route are dropped, so the gap still fails closed.
+
 The CNI can also leave link and subnet routes in the main table, and
 unmarked traffic could use them to leave outside the tunnel. So the bridge
 loads its own nftables table (`inet clawpatrol`, from

@@ -75,6 +75,7 @@ func TestEgressFilterInNetns(t *testing.T) {
 		_ = exec.Command("ip", "rule", "del", "pref", "90").Run()
 		_ = exec.Command("ip", "rule", "del", "pref", "91").Run()
 		_ = exec.Command("ip", "route", "flush", "table", "111").Run()
+		_ = exec.Command("ip", "route", "del", "default", "dev", "lo", "metric", bridgeFallbackMetric).Run()
 		if c, err := nftables.New(); err == nil {
 			c.DelTable(&nftables.Table{Family: nftables.TableFamilyINet, Name: bridgeNftTable})
 			_ = c.Flush()
