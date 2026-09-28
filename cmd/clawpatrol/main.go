@@ -355,6 +355,15 @@ type gatewayDialer interface {
 }
 
 type Gateway struct {
+	// credSaveLocks serialises /api/credentials/set and /clear per
+	// credential id (value: *sync.Mutex). The save handler snapshots
+	// the stored slots, probes the provider and records the outcome;
+	// overlapping mutations of the same credential would otherwise
+	// race on the single credential_verifications row and could
+	// commit a stale verdict last. Entries are never removed — the
+	// set is bounded by the number of declared credentials.
+	credSaveLocks sync.Map
+
 	// cfg is the live operational *config.Gateway. Stored as an
 	// atomic pointer because dashboard handlers and the reload loop
 	// read it without holding configMu; configMu only serialises
@@ -375,11 +384,27 @@ type Gateway struct {
 	blobs runtime.BlobStore
 	// pluginMgr supervises the external plugin subprocesses; the
 	// dashboard reads it for the Plugins page.
-	pluginMgr *extplugin.Manager
-	oauth     *OAuthRegistry
-	agents    *AgentRegistry
-	hitl      *HITLRegistry
-	onboard   *onboardRegistry
+	pluginMgr    *extplugin.Manager
+	oauth        *OAuthRegistry
+	agents       *AgentRegistry
+	hitl         *HITLRegistry
+	onboard      *onboardRegistry
+	enrollmentMu sync.Mutex
+	// enrollLive tracks per-peer WireGuard rx_bytes progress for the
+	// enrollment liveness reaper. Guarded by enrollmentMu.
+	enrollLive map[string]enrollmentLiveness
+	// peerStats overrides globalWG.PeerStats for the reaper. Tests only.
+	peerStats func() map[string]wgDevPeerStat
+	// k8sVerifier lets tests inject a fake Kubernetes verifier. In
+	// production it stays nil and k8sRegistrationVerifier builds k8sClient
+	// once, guarded by k8sClientMu.
+	k8sVerifier k8sRegistrationVerifier
+	k8sClientMu sync.Mutex
+	k8sClient   *inClusterK8sClient
+	// enrollRegisterSem bounds concurrent enrollment registrations across
+	// every listener. Created once by acquireRegisterSlot.
+	enrollRegisterOnce sync.Once
+	enrollRegisterSem  chan struct{}
 	// secrets hands credential plugins the secret bytes they inject
 	// at request time. gatewaySecretStore stacks the credential_secrets
 	// table (dashboard slots), OAuthRegistry (refreshed access tokens),
@@ -667,12 +692,53 @@ func (g *Gateway) reloadConfigFromFileLocked(path string) error {
 		}
 	}
 	// Hot-swap the operational *config.Gateway too. Listen / CA dir /
-	// Tailscale process changes are still restart-only.
+	// Tailscale process / log_path changes are still restart-only.
+	if prev := g.cfg.Load(); prev != nil && prev.LogPath() != next.LogPath() {
+		log.Printf("config reload: log_path changed to %q; takes effect on restart", next.LogPath())
+	}
 	g.cfg.Store(next)
 	log.Printf("config reloaded: %d endpoints across %d profile(s)",
 		len(policy.Endpoints), len(policy.Profiles))
 	logDashboardAuthState(g.db, next)
 	return nil
+}
+
+// teeGatewayLog makes the standard logger write every line to path
+// (created 0600, appended) as well as stderr. This is gateway.log_path:
+// a durable copy of what the journal / stderr already shows, for
+// deployments where stderr is not captured. Opened once at startup;
+// the file is never rotated or truncated by the gateway.
+func teeGatewayLog(path string) error {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	// File first: a write to a broken stderr pipe can still end the
+	// process with SIGPIPE (Go's default for fds 1 and 2), and the
+	// file should have the line by then.
+	log.SetOutput(logTee{f, os.Stderr})
+	log.Printf("log: also writing to %s", path)
+	// 0600 applies only when the file is created; an existing file
+	// keeps its mode, and the log carries denied request paths. Said
+	// after the tee is installed so the warning lands in the file,
+	// which is the sink an operator who set log_path actually reads.
+	if fi, err := f.Stat(); err == nil && fi.Mode().IsRegular() && fi.Mode().Perm()&0o077 != 0 {
+		log.Printf("warning: %s has mode %#o (want 0600); tighten with: chmod 0600 %s", path, fi.Mode().Perm(), path)
+	}
+	return nil
+}
+
+// logTee writes every line to all sinks in order and never reports an
+// error: unlike io.MultiWriter it does not stop at the first failing
+// writer, so a closed stderr does not silence the log file (and vice
+// versa). The standard logger discards write errors anyway.
+type logTee []io.Writer
+
+func (t logTee) Write(p []byte) (int, error) {
+	for _, w := range t {
+		_, _ = w.Write(p)
+	}
+	return len(p), nil
 }
 
 // logDashboardAuthState emits a one-line summary of dashboard-auth
@@ -1685,12 +1751,26 @@ func (g *Gateway) handle(raw net.Conn, dstIP string, dstPort uint16) {
 	profile := g.profileFor(pip)
 	ep, authority, certHost := g.httpsMITMEndpoint(profile, host, dstPort)
 	if ep == nil {
-		if policy := g.Policy(); policy != nil && policy.UnknownHost == "deny" {
+		policy := g.Policy()
+		switch unknownHostPolicy(policy) {
+		case "deny":
 			log.Printf("sni: %s: unknown host denied", host)
 			return
+		case "inspect":
+			if policy != nil {
+				ep = policy.Endpoints[config.UnknownInspectEndpoint]
+			}
+			if ep == nil {
+				log.Printf("sni: %s: unknown host denied", host)
+				return
+			}
+			log.Printf("sni: %s: unknown host inspect", host)
+			g.mitmHTTPSWithCertHost(c, host, host, ep)
+			return
+		default:
+			g.splice(c, host)
+			return
 		}
-		g.splice(c, host)
-		return
 	}
 	if isHTTPSMITMFamily(ep.Family) {
 		// Every facet whose Transport() is "https-mitm" — https and
@@ -1738,6 +1818,13 @@ func (g *Gateway) shouldHandleHTTPSMITM(c net.Conn, dstIP string, dstPort uint16
 	profile := g.profileFor(peerIP(c))
 	ep, _, _ := g.httpsMITMEndpoint(profile, dstIP, dstPort)
 	return ep != nil && isHTTPSMITMFamily(ep.Family)
+}
+
+func unknownHostPolicy(policy *config.CompiledPolicy) string {
+	if policy == nil || policy.UnknownHost == "" {
+		return "passthrough"
+	}
+	return policy.UnknownHost
 }
 
 func (g *Gateway) httpsMITMEndpoint(profile, host string, dstPort uint16) (*config.CompiledEndpoint, string, string) {
@@ -1875,6 +1962,7 @@ func (g *Gateway) handlePostgresConn(c net.Conn, dstIP string) {
 				Action: ev.Action, Reason: ev.Reason,
 				Facets:   ev.Facets,
 				Endpoint: ep.Name, Rule: ev.Rule,
+				Credential:   ev.Credential,
 				Approver:     ev.Approver,
 				ApproverType: ev.ApproverType,
 				ApproverBy:   ev.ApproverBy,
@@ -2046,6 +2134,7 @@ func (g *Gateway) dispatchConnEndpoint(c net.Conn, dstIP string, dstPort uint16,
 				Action: ev.Action, Reason: ev.Reason,
 				Facets:   ev.Facets,
 				Endpoint: ep.Name, Rule: ev.Rule,
+				Credential:   ev.Credential,
 				Approver:     ev.Approver,
 				ApproverType: ev.ApproverType,
 				ApproverBy:   ev.ApproverBy,
@@ -2250,25 +2339,44 @@ func (w *countWriter) Write(p []byte) (int, error) {
 const maxHTTPMatchBody = int(config.DefaultBodyBufferLimit)
 
 func bufferHTTPBodyForMatch(req *http.Request, capBytes int) []byte {
-	b, _ := bufferHTTPBodyForMatchTruncated(req, capBytes)
-	return b
+	return bufferHTTPBodyForMatchResult(req, capBytes).body
 }
 
 // bufferHTTPBodyForMatchTruncated is bufferHTTPBodyForMatch with the
-// overflow signal exposed: it reads one byte past the cap to detect
-// truncation, then re-attaches whatever it pulled (cap + 1 byte) in
-// front of the original stream so upstream still receives the body
-// byte-for-byte. truncated is true iff the body extended beyond
-// maxHTTPMatchBody; callers stash this on match.Request.Truncated so
-// http.body / http.body_json become CEL unknowns and rules whose
-// outcome depends on them fail-close.
+// incomplete-body signal exposed. It reads one byte past the cap and
+// re-attaches whatever it pulled in front of the original stream so upstream
+// still receives those bytes. truncated is true when the body exceeds the cap
+// or cannot be read to EOF; callers stash this on match.Request.Truncated so
+// http.body / http.body_json become CEL unknowns and rules whose outcome
+// depends on them fail-close.
 func bufferHTTPBodyForMatchTruncated(req *http.Request, capBytes int) (body []byte, truncated bool) {
+	result := bufferHTTPBodyForMatchResult(req, capBytes)
+	return result.body, result.truncated
+}
+
+type bufferedHTTPBodyResult struct {
+	body      []byte
+	truncated bool
+	complete  bool
+	readErr   error
+}
+
+func bufferHTTPBodyForMatchResult(req *http.Request, capBytes int) bufferedHTTPBodyResult {
 	if req.Body == nil {
-		return nil, false
+		return bufferedHTTPBodyResult{complete: true}
 	}
 	b, err := io.ReadAll(io.LimitReader(req.Body, int64(capBytes)+1))
 	if err != nil {
-		return nil, false
+		// Preserve bytes returned alongside the error for both the audit trail
+		// and any later attempt to forward the request. The matcher must still
+		// treat the body as incomplete rather than a known prefix (or empty
+		// body), so surface the same fail-closed signal used for capped input.
+		req.Body = io.NopCloser(io.MultiReader(bytes.NewReader(b), req.Body))
+		body := b
+		if len(body) > capBytes {
+			body = body[:capBytes]
+		}
+		return bufferedHTTPBodyResult{body: body, truncated: true, readErr: err}
 	}
 	if len(b) > capBytes {
 		// Pulled one byte past the cap — body is over-sized. Keep
@@ -2276,14 +2384,80 @@ func bufferHTTPBodyForMatchTruncated(req *http.Request, capBytes int) (body []by
 		// full read (including the probe byte) in front of the
 		// remaining stream so the upstream forward stays byte-exact.
 		req.Body = io.NopCloser(io.MultiReader(bytes.NewReader(b), req.Body))
-		return b[:capBytes], true
+		return bufferedHTTPBodyResult{body: b[:capBytes], truncated: true}
 	}
 	// Body fit inside the cap (or was exactly cap bytes). Re-attach
 	// what we read — req.Body may still hold bytes past it on a
 	// chunked / unknown-length stream that just hadn't surfaced
 	// before the ReadAll returned.
 	req.Body = io.NopCloser(io.MultiReader(bytes.NewReader(b), req.Body))
-	return b, false
+	return bufferedHTTPBodyResult{body: b, complete: true}
+}
+
+func applyTerminalRequestCapture(ev *Event, req *http.Request, buffered bufferedHTTPBodyResult, capBytes int) {
+	contentLength := req.ContentLength
+	if buffered.truncated {
+		// The matcher retained only a prefix, so equality with a declared
+		// length cannot prove that this audit sample is the whole body.
+		contentLength = -1
+	}
+	s := newSampler(capBytes, contentLength)
+	_, _ = s.Write(buffered.body)
+	switch {
+	case buffered.readErr != nil:
+		s.finishRead(buffered.readErr)
+	case buffered.complete:
+		s.finishRead(io.EOF)
+	}
+	applyRequestBodySnapshot(ev, s.snapshot(req.Header.Get("Content-Encoding")), nil)
+	ev.ReqHeaders = flatHeaders(req.Header)
+}
+
+const maxMITMRequestReadLogHostBytes = 255
+
+func sanitizeMITMRequestReadLogHost(host string) string {
+	if len(host) > maxMITMRequestReadLogHostBytes {
+		host = host[:maxMITMRequestReadLogHostBytes]
+	}
+	if host == "" {
+		return "unknown"
+	}
+	b := []byte(host)
+	for i, c := range b {
+		switch {
+		case c >= 'a' && c <= 'z':
+		case c >= 'A' && c <= 'Z':
+		case c >= '0' && c <= '9':
+		case c == '.', c == '-', c == '_', c == ':', c == '[', c == ']':
+		default:
+			b[i] = '_'
+		}
+	}
+	return string(b)
+}
+
+func mitmRequestReadErrorReason(err error) string {
+	if errors.Is(err, io.ErrUnexpectedEOF) {
+		return "incomplete_request"
+	}
+	if errors.Is(err, bufio.ErrBufferFull) {
+		return "request_too_large"
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		if netErr.Timeout() {
+			return "timeout"
+		}
+		return "network_error"
+	}
+	return "invalid_request"
+}
+
+func logMITMRequestReadError(host string, err error) {
+	// net/http parser errors can embed the request line or malformed
+	// header verbatim. Keep err out of the log and emit only a fixed
+	// category derived from its type.
+	log.Printf("mitm_request_read_error host=%q reason=%s", sanitizeMITMRequestReadLogHost(host), mitmRequestReadErrorReason(err))
 }
 
 // mitmHTTPS handles an SNI-matched TLS connection for an HTTPS-family
@@ -2332,7 +2506,7 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 		req, err := http.ReadRequest(br)
 		if err != nil {
 			if !errors.Is(err, io.EOF) {
-				log.Printf("mitm read req %s: %v", host, err)
+				logMITMRequestReadError(host, err)
 			}
 			return
 		}
@@ -2352,11 +2526,14 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 		// unbuffered (rare for agent traffic) but surface as
 		// Truncated=true so the dispatcher/retry relay can fail-close
 		// any path that needed the complete body.
+		var bufferedBody bufferedHTTPBodyResult
 		var matchBody []byte
 		var truncated bool
 		retryOperationID := strings.TrimSpace(req.Header.Get(hitlRetryOperationHeader))
 		if req.Method == "POST" || req.Method == "PUT" || req.Method == "PATCH" || retryOperationID != "" {
-			matchBody, truncated = bufferHTTPBodyForMatchTruncated(req, g.cfg.Load().BodyBufferLimit())
+			bufferedBody = bufferHTTPBodyForMatchResult(req, g.cfg.Load().BodyBufferLimit())
+			matchBody = bufferedBody.body
+			truncated = bufferedBody.truncated
 		}
 
 		mreq := &match.Request{
@@ -2401,8 +2578,9 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 			Family: ep.Family,
 			Host:   host,
 			Method: req.Method, Path: req.URL.Path,
-			AgentIP:  agentAddr,
-			Endpoint: ep.Name,
+			AgentIP:    agentAddr,
+			Endpoint:   ep.Name,
+			Credential: mreq.Credential,
 		}
 		if fac != nil {
 			ev.Facets = fac.Report(mreq)
@@ -2533,6 +2711,7 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 				ev.ApproverBy = v.By
 				ev.Reason = reason
 				ev.Ms = time.Since(start).Milliseconds()
+				applyTerminalRequestCapture(&ev, req, bufferedBody, g.cfg.Load().BodyStorageLimit())
 				g.emitEnd(ev)
 				return
 			}
@@ -2549,6 +2728,9 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 			ev.Approver = v.ApproverName
 			ev.ApproverType = v.ApproverType
 			ev.ApproverBy = v.By
+			// Non-empty only when the chain allowed for a reason worth
+			// recording, such as llm_fail_mode = "open".
+			ev.Reason = v.Reason
 		}
 
 		// Verdict.
@@ -2568,6 +2750,7 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 			ev.Action = "deny"
 			ev.Reason = reason
 			ev.Ms = time.Since(start).Milliseconds()
+			applyTerminalRequestCapture(&ev, req, bufferedBody, g.cfg.Load().BodyStorageLimit())
 			g.emitEnd(ev)
 			return
 		}
@@ -2681,11 +2864,17 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 					switch {
 					case wantsSign:
 						reqBodySecretRedactions = appendCredentialSecretRedactions(reqBodySecretRedactions, sec)
+						headersBefore := req.Header.Clone()
 						if err := signer.SignHTTPRequest(req.Context(), req, sec, ep.Body); err != nil {
 							log.Printf("sign %s: %v", cc.Credential.Symbol.Name, err)
 						}
+						for _, v := range injectedHeaderSecrets(headersBefore, req.Header) {
+							reqBodySecretRedactions = appendCredentialSecretRedaction(reqBodySecretRedactions, v)
+						}
 					case wantsHTTP:
 						reqBodySecretRedactions = appendCredentialSecretRedactions(reqBodySecretRedactions, sec)
+						rewriter, isRewriter := injector.(runtime.HTTPRequestRewriter)
+						rewritesRequest := isRewriter && rewriter.RewritesHTTPRequest()
 						// Match existing request-signing behavior: an injection failure is logged,
 						// then the request continues with the agent's placeholder. The upstream
 						// service should reject that placeholder without exposing gateway secrets.
@@ -2694,8 +2883,9 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 						// consumes the request body during injection, so on failure the request
 						// is corrupted, not merely un-injected — fail closed instead of
 						// forwarding a half-transformed request.
+						bodyBefore, urlBefore, headersBefore := req.Body, req.URL.String(), req.Header.Clone()
 						if err := injector.InjectHTTP(req.Context(), req, sec); err != nil {
-							if rw, ok := injector.(runtime.HTTPRequestRewriter); ok && rw.RewritesHTTPRequest() {
+							if rewritesRequest {
 								log.Printf("transform %s: %v; failing closed", cc.Credential.Symbol.Name, err)
 								_, _ = fmt.Fprintf(tc, "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
 								ev.Status = "502"
@@ -2706,11 +2896,20 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 								return
 							}
 							log.Printf("inject %s: %v; forwarding without injection", cc.Credential.Symbol.Name, err)
+						} else if rewritesRequest || req.Body != bodyBefore || req.URL.String() != urlBefore {
+							// Built-in credentials that edit the body or URL
+							// (Slack strips a form field, Gemini a query
+							// param) do not declare it; detect the edit so
+							// the capture is never exported as the original.
+							ev.ReqTransformed = true
 						}
 						if rp, ok := injector.(runtime.HTTPCredentialRedactionProvider); ok {
 							for _, secret := range rp.ConsumeHTTPRedactions(req) {
 								reqBodySecretRedactions = appendCredentialSecretRedaction(reqBodySecretRedactions, secret)
 							}
+						}
+						for _, v := range injectedHeaderSecrets(headersBefore, req.Header) {
+							reqBodySecretRedactions = appendCredentialSecretRedaction(reqBodySecretRedactions, v)
 						}
 					}
 					if wantsWS && isWSUpgrade(req) {
@@ -2783,7 +2982,7 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 		if trackKind != "" && len(trackedReqBody) > 0 && g.agents != nil {
 			g.preCreateLLMSession(c, trackKind, req.URL.Path, trackedReqBody, sessionHint)
 		}
-		reqS := newSampler(g.cfg.Load().BodyStorageLimit())
+		reqS := newSampler(g.cfg.Load().BodyStorageLimit(), req.ContentLength)
 		if req.Body != nil {
 			req.Body = wrapBodySampler(req.Body, reqS)
 		}
@@ -2808,9 +3007,8 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 			ev.Action = "error"
 			ev.Reason = err.Error()
 			ev.Ms = time.Since(start).Milliseconds()
-			ev.ReqSha = reqS.sha()
-			ev.ReqBody = redactCredentialSample(reqS.sample(req.Header.Get("Content-Encoding")), reqBodySecretRedactions)
-			ev.In = reqS.n
+			reqSnapshot := reqS.snapshot(req.Header.Get("Content-Encoding"))
+			applyRequestBodySnapshot(&ev, reqSnapshot, reqBodySecretRedactions)
 			g.emitEnd(ev)
 			return
 		}
@@ -2830,7 +3028,7 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 				resp.Body = io.NopCloser(io.TeeReader(resp.Body, trackBuf))
 			}
 		}
-		respS := newSampler(g.cfg.Load().BodyStorageLimit())
+		respS := newSampler(g.cfg.Load().BodyStorageLimit(), responseBodyContentLength(req.Method, resp))
 		resp.Body = wrapBodySampler(resp.Body, respS)
 		// Close-delimited responses (no Content-Length, no Transfer-
 		// Encoding) come from h2 upstreams that we forced to http/1.1
@@ -2899,16 +3097,14 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 		}
 		ev.Status = strconv.Itoa(resp.StatusCode)
 		ev.ReqHeaders = flatHeadersRedacted(req.Header, reqBodySecretRedactions)
-		ev.In = reqS.n
-		ev.Out = respS.n
-		ev.ReqSha = reqS.sha()
-		ev.ReqBody = redactCredentialSample(reqS.sample(req.Header.Get("Content-Encoding")), reqBodySecretRedactions)
-		ev.RespSha = respS.sha()
-		ev.RespBody = respS.sample(resp.Header.Get("Content-Encoding"))
+		reqSnapshot := reqS.snapshot(req.Header.Get("Content-Encoding"))
+		respSnapshot := respS.snapshot(resp.Header.Get("Content-Encoding"))
+		applyRequestBodySnapshot(&ev, reqSnapshot, reqBodySecretRedactions)
+		applyResponseBodySnapshot(&ev, respSnapshot, reqBodySecretRedactions)
 		ev.Ms = time.Since(start).Milliseconds()
 		g.emitEnd(ev)
 		if g.agents != nil && agentAddr != "" {
-			g.agents.trackUA(agentAddr, host, req.UserAgent(), reqS.n, respS.n)
+			g.agents.trackUA(agentAddr, host, req.UserAgent(), reqSnapshot.n, respSnapshot.n)
 		}
 
 		if writeErr != nil {
@@ -2955,6 +3151,11 @@ type runApproveCtx struct {
 // `dashboard` is handled inline (no policy entity needed).
 func (g *Gateway) runApproveChain(ctx context.Context, stages []config.ApproveStage, c runApproveCtx) runtime.ApproveVerdict {
 	policy := g.Policy()
+	// failOpen remembers a stage that allowed only because
+	// llm_fail_mode = "open" resolved an undecided verdict, so the
+	// final allow carries that reason and attribution into the
+	// action log instead of looking like a clean model decision.
+	var failOpen *runtime.ApproveVerdict
 	for _, st := range stages {
 		var ar runtime.ApproverRuntime
 		approverType := ""
@@ -3023,17 +3224,47 @@ func (g *Gateway) runApproveChain(ctx context.Context, stages []config.ApproveSt
 		if err != nil {
 			return runtime.ApproveVerdict{Decision: "deny", Reason: err.Error(), By: "gateway", ApproverName: v.ApproverName, ApproverType: v.ApproverType}
 		}
-		if v.Decision != "allow" {
-			if v.Decision == "" {
-				v.Decision = "deny"
-				if v.Reason == "" {
-					v.Reason = "approver " + st.Name + " timed out"
-				}
+		if v.Decision == "" {
+			v = resolveUndecidedVerdict(policy, st.Name, approverType, v)
+			if v.Decision == "allow" && failOpen == nil {
+				fo := v
+				failOpen = &fo
 			}
+		}
+		if v.Decision != "allow" {
 			return v
 		}
 	}
+	if failOpen != nil {
+		return *failOpen
+	}
 	return runtime.ApproveVerdict{Decision: "allow"}
+}
+
+// resolveUndecidedVerdict turns an approver's empty Decision (it could
+// not decide: timeout, model-call failure) into a final verdict. LLM
+// approvers honor defaults.llm_fail_mode: "open" allows and records
+// why; anything else denies. Every other approver type denies.
+func resolveUndecidedVerdict(policy *config.CompiledPolicy, name, approverType string, v runtime.ApproveVerdict) runtime.ApproveVerdict {
+	if v.Reason == "" {
+		v.Reason = "approver " + name + " timed out"
+	}
+	if approverType == "llm_approver" && policy != nil && policy.LLMFailMode == "open" {
+		v.Decision = "allow"
+		v.Reason = "llm_fail_mode = open: " + v.Reason
+		if v.By == "" {
+			v.By = "gateway"
+		}
+		// The HTTPS path logs "approved ..." without the reason and
+		// the other families log nothing for allowed requests, so a
+		// fail-open gets its own journal line: an ongoing judge outage
+		// should be visible without reading per-action reasons. The
+		// reason may carry a proxy's error page; keep it to one line.
+		log.Printf("approver %s: %q", name, truncate(v.Reason, 200))
+		return v
+	}
+	v.Decision = "deny"
+	return v
 }
 
 // ifNotEmpty returns f(v) when v != nil, else "".
@@ -3059,6 +3290,10 @@ func main() {
 		runJoin(os.Args[2:])
 	case "run":
 		runRun(os.Args[2:])
+	case "bridge":
+		// Foreground data plane: self-enroll through an authorizer, bring up
+		// and host a userspace WireGuard tunnel, route the netns, stay up.
+		runBridge(os.Args[2:])
 	case "daemon-internal":
 		// internal: re-exec'd by `clawpatrol run` (Linux only) to host
 		// the per-user tsnet daemon. Hidden from usage(); name carries
@@ -3115,11 +3350,11 @@ func peerIP(c net.Conn) string {
 	return canonicalPeerIP(host)
 }
 
-// canonicalPeerIP collapses a wg-side v6 source (fd77::<n>) into its
-// v4 equivalent (<wg-subnet-prefix>.<n>) so the agent registry,
-// onboard registry, and dashboard track one device per peer
-// regardless of which IP family the inbound flow used. Non-wg
-// addresses pass through unchanged.
+// canonicalPeerIP collapses a wg-side v6 source (fd77::<host-bits>) into
+// its v4 equivalent in the wg subnet so the agent registry, onboard
+// registry, and dashboard track one device per peer regardless of which
+// IP family the inbound flow used. Non-wg addresses pass through
+// unchanged.
 func canonicalPeerIP(ip string) string {
 	if !strings.Contains(ip, ":") {
 		return ip
@@ -3128,27 +3363,22 @@ func canonicalPeerIP(ip string) string {
 	if err != nil || !a.Is6() {
 		return ip
 	}
-	b := a.As16()
-	if b[0] != 0xfd || b[1] != 0x77 {
-		return ip
+	// Use the configured wg subnet to reconstruct the v4. Fall back to the
+	// example config's subnet when nothing's loaded yet (early-boot).
+	prefix := defaultWGPrefix
+	if globalWG != nil && globalWG.prefix.IsValid() {
+		prefix = globalWG.prefix
 	}
-	last := b[15]
-	// Use the configured wg subnet prefix to reconstruct the v4. Fall
-	// back to 10.55.0.0/24 — same default the example config uses —
-	// when nothing's loaded yet (early-boot).
-	prefixV4 := defaultWGV4Prefix
-	if globalWG != nil && globalWG.serverIP.Is4() {
-		s := globalWG.serverIP.As4()
-		prefixV4 = [3]byte{s[0], s[1], s[2]}
+	if v4, ok := wgV4FromV6(prefix, a); ok {
+		return v4.String()
 	}
-	v4 := netip.AddrFrom4([4]byte{prefixV4[0], prefixV4[1], prefixV4[2], last})
-	return v4.String()
+	return ip
 }
 
-// defaultWGV4Prefix matches the example config's wg_subnet_cidr
+// defaultWGPrefix matches the example config's wg_subnet_cidr
 // (10.55.0.0/24). Lets canonicalPeerIP work before the WGServer is
 // up.
-var defaultWGV4Prefix = [3]byte{10, 55, 0}
+var defaultWGPrefix = netip.MustParsePrefix("10.55.0.0/24")
 
 func printVersion() {
 	v := buildVersion
@@ -3171,6 +3401,9 @@ usage:
                                          with no public URL (creds discarded
                                          once join completes)
   clawpatrol run -- <cmd> [args...]      route one process tree through gateway
+  clawpatrol bridge --authorizer <type>/<name> [flags]
+                                         resident sidecar: self-enroll, host the
+                                         WireGuard tunnel, route the netns
   clawpatrol status                      report install + tunnel state
   clawpatrol uninstall                   remove local join state and tunnel config
   clawpatrol env                         print shell exports for sourcing
@@ -3256,8 +3489,23 @@ func runGateway(args []string) {
 		log.Fatalf("config: %v", err)
 	}
 	stateDir := resolveStateDir(cfg)
+	// Tee the log as early as possible so the file sees the rest of
+	// startup, including a state-dir failure. A log_path inside a
+	// state_dir that does not exist yet (first run) gets one retry
+	// after the directory is created. Lines logged while parsing the
+	// config itself (plugin load messages included) are stderr-only.
+	logPath := cfg.LogPath()
+	teeErr := error(nil)
+	if logPath != "" {
+		teeErr = teeGatewayLog(logPath)
+	}
 	if err := os.MkdirAll(stateDir, 0o700); err != nil {
 		log.Fatalf("state dir: %v", err)
+	}
+	if teeErr != nil {
+		if teeErr = teeGatewayLog(logPath); teeErr != nil {
+			log.Fatalf("log_path: %v", teeErr)
+		}
 	}
 	if err := checkDirWritable(stateDir); err != nil {
 		log.Fatalf("state dir: cannot create files in state_dir %s as uid %d: %v\n      Fix: run the gateway as the user that owns it, `chown` it to that user, or set a writable state_dir in the gateway block of %s.", stateDir, os.Getuid(), err, cfgPath)
@@ -3438,6 +3686,16 @@ func runGateway(args []string) {
 			log.Fatalf("wireguard: %v", err)
 		}
 		setWGServer(wg)
+		// Restore any persisted enrolled peers into the device + registry,
+		// then run the liveness reaper. Both are always-on once WireGuard is
+		// up: enrollment can be turned on by a later config reload, and any
+		// peers left behind must keep getting reaped after the feature is
+		// turned off. The reaper is a cheap no-op while there are none.
+		g.logEnrollmentReconcile(context.Background())
+		go g.startEnrollmentReaper(context.Background())
+		if cfg.IsEnrollmentEnabled() {
+			log.Printf("enrollment: enabled")
+		}
 		dashMux := newWebMux(g, cfg.Join(), cfg.PublicURL())
 		dashPort := portOf(dashListen)
 		tcpDispatch := func(c net.Conn, dstIP string, dstPort uint16) {
@@ -3469,26 +3727,29 @@ func runGateway(args []string) {
 				g.wgRelay(c, dstIP, int(dstPort))
 			}
 		}
+		// UDP: the port decision is udpPortDisposition, shared with the
+		// tsnet catch-all. UDP/443 (QUIC) is refused by refuseUDPPort
+		// before an endpoint exists, so the netstack answers ICMP port
+		// unreachable and the client falls back to TCP/443 at once;
+		// UDP/53 is answered by dnsvip; the rest relays.
 		udpDispatch := func(c net.Conn, dstIP string, dstPort uint16) bool {
-			if dstPort == 53 {
+			switch udpPortDisposition(dstPort) {
+			case udpDNS:
 				g.dnsvip.ServeUDP(c, dstIP)
 				return true
-			}
-			if dstPort == 443 && g.dnsvip.IsVIP(dstIP) {
-				// QUIC / HTTP-3 to an intercepted (VIP'd) host: drop so
-				// the client falls back to TCP/443, which we MITM.
-				// Relaying it would let that host's HTTPS bypass
-				// interception. UDP/443 to a passed-through host falls
-				// through to relayUDP — we don't intercept it.
+			case udpDrop:
+				// Already refused by refuseUDPPort before an endpoint
+				// existed; kept so the flow is closed rather than
+				// relayed should the two hooks ever disagree.
 				_ = c.Close()
 				return true
 			}
 			return false
 		}
-		if err := wg.EnablePromiscuousForwarder(tcpDispatch, udpDispatch); err != nil {
+		if err := wg.EnablePromiscuousForwarder(tcpDispatch, refuseUDPPort, udpDispatch); err != nil {
 			log.Fatalf("wireguard forwarder: %v", err)
 		}
-		log.Printf("wireguard promiscuous forwarder ready (any dst → :443=mitm, UDP/443→drop(quic) for VIPs, :5432=pg, :53=dns-vip, VIP=ssh|ch_native, :%d=dash, plugins=conn-index, else=relay)", dashPort)
+		log.Printf("wireguard promiscuous forwarder ready (any dst → :443=mitm, UDP/443→refuse(quic, icmp unreachable), :5432=pg, :53=dns-vip, VIP=ssh|ch_native, :%d=dash, plugins=conn-index, else=relay)", dashPort)
 	}
 
 	tsnetServer, ln, err := openListener(cfg, stateDir)
@@ -3628,15 +3889,17 @@ func runGateway(args []string) {
 				log.Printf("tsnet: dnsvip UDP listener on %s:53", g.tailscaleIP)
 				serveTsnetDNSUDP(pc, g.dnsvip)
 			}()
-			// Layer a UDP catch-all onto tsnet's underlying netstack so
-			// exit-node clients' UDP reaches clawpatrol: UDP/53 to any
-			// resolver IP reaches dnsvip (the IP-bound listener above only
-			// catches packets aimed at the gateway's own tailnet IP), and
-			// other UDP from onboarded peers is relayed. tsnet has no public
-			// UDP fallback hook, so this reaches through Sys().Netstack (see
-			// installTsnetUDPCatchAll).
-			g.installTsnetUDPCatchAll(tsnetServer)
 		}
+		// Layer a UDP catch-all onto tsnet's underlying netstack so
+		// exit-node clients' UDP reaches clawpatrol: UDP/53 to any
+		// resolver IP reaches dnsvip (the IP-bound listener above only
+		// catches packets aimed at the gateway's own tailnet IP), UDP/443
+		// is refused, and other UDP from onboarded peers is relayed. tsnet
+		// has no public UDP fallback hook, so this reaches through
+		// Sys().Netstack (see installTsnetUDPCatchAll). Installed
+		// unconditionally: without it tsnet's default forwarder would
+		// relay UDP/443 unchecked, dnsvip or not.
+		g.installTsnetUDPCatchAll(tsnetServer)
 		// Intercept all TCP forwarded through this exit node (whole-machine
 		// clients). dst is the original internet destination — same dispatch
 		// as the per-process PROXY-header path and the WG promiscuous forwarder.

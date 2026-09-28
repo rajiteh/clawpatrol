@@ -28,6 +28,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/andybalholm/brotli"
 	"github.com/klauspost/compress/zstd"
@@ -55,6 +56,18 @@ type webMux struct {
 	// stateCacheTTL (1s). 99% of polls are RLock-only.
 	stateCacheMu sync.RWMutex
 	stateCache   map[string]stateCacheEntry
+}
+
+// lockCredentialSave takes the per-credential mutation lock (set and
+// clear) and returns the unlock func. The lock lives on the Gateway,
+// not the mux, because the dashboard is served by one webMux per
+// listener (loopback, WireGuard, tsnet) and saves through different
+// listeners must still serialise.
+func (w *webMux) lockCredentialSave(id string) func() {
+	mu, _ := w.g.credSaveLocks.LoadOrStore(id, &sync.Mutex{})
+	m := mu.(*sync.Mutex)
+	m.Lock()
+	return m.Unlock
 }
 
 type authRequirement int
@@ -124,9 +137,14 @@ func (w *webMux) dashboardPasswordPrincipal() principal {
 	return principal{Kind: principalDashboardPassword, Owner: dashboardRootUsername}
 }
 
+// routeAuthIndex maps each path to its auth requirement. Auth is per path, so
+// rows that share a path (one per method) must agree on it.
 func routeAuthIndex(routes []webRoute) map[string]authRequirement {
 	out := make(map[string]authRequirement, len(routes))
 	for _, route := range routes {
+		if prev, ok := out[route.Path]; ok && prev != route.Auth {
+			panic("web route " + route.Path + " has conflicting auth requirements")
+		}
 		out[route.Path] = route.Auth
 	}
 	return out
@@ -199,10 +217,17 @@ func (w *webMux) handler() http.Handler {
 	mux := http.NewServeMux()
 	routes := w.routes()
 	w.routeAuth = routeAuthIndex(routes)
+	registered := map[string]bool{}
 	for _, route := range routes {
 		if route.Method == "" {
 			panic("web route missing method: " + route.Path)
 		}
+		// A handler that serves several methods has one row per method;
+		// the mux dispatches on path only.
+		if registered[route.Path] {
+			continue
+		}
+		registered[route.Path] = true
 		mux.HandleFunc(route.Path, route.Handler)
 	}
 	w.mountCredentialWebhooks(mux)
@@ -255,6 +280,10 @@ func (w *webMux) routes() []webRoute {
 		{Method: http.MethodPost, Path: "/api/onboard/claim", Auth: authPublic, Handler: w.apiOnboardClaim},
 		{Method: http.MethodGet, Path: "/api/env-pushdown", Auth: authSelfAuthenticating, Handler: w.apiEnvPushdown},
 		{Method: http.MethodPost, Path: "/api/peer/tsnet/register", Auth: authSelfAuthenticating, Handler: w.apiPeerTsnetRegister},
+		{Method: http.MethodPost, Path: enrollmentRegisterPath, Auth: authSelfAuthenticating, Handler: w.apiEnrollmentRegister},
+		// DELETE deregisters; the handler checks the peer API token.
+		{Method: http.MethodDelete, Path: enrollmentRegisterPath, Auth: authSelfAuthenticating, Handler: w.apiEnrollmentRegister},
+		{Method: http.MethodGet, Path: "/api/enrollment/peers", Auth: authDashboard, Handler: w.apiEnrollmentList},
 		// /__login is the auth point itself — it MUST be reachable
 		// without a credential. The handler dispatches on r.Method
 		// (GET renders the form, POST validates + mints a session
@@ -586,12 +615,14 @@ func (w *webMux) tailnetGate(next http.Handler) http.Handler {
 			next.ServeHTTP(rw, r)
 			return
 		}
-		// Two ways to prove tailnet membership:
-		//   1. peer IP whois (direct tailnet → gateway, no proxy).
-		//   2. Tailscale-User-Login header from `tailscale serve` —
-		//      ONLY trusted when the proxy hop is local (127.0.0.1 /
-		//      ::1). Anyone hitting us via funnel can otherwise forge
-		//      the header trivially.
+		// The only proof of tailnet membership is a whois of the
+		// peer address of a direct tailnet connection. Requests that
+		// arrive through a local reverse proxy are anonymous: the
+		// Tailscale-User-Login and X-Forwarded-For headers a
+		// `tailscale serve` hop sets are indistinguishable from ones
+		// an attacker sends through any other proxy on the host, so
+		// they are not consulted. In Tailscale mode the dashboard is
+		// served on the tsnet node itself, which is the direct path.
 		host := r.RemoteAddr
 		if i := strings.LastIndex(host, ":"); i >= 0 {
 			host = host[:i]
@@ -603,12 +634,6 @@ func (w *webMux) tailnetGate(next http.Handler) http.Handler {
 				device = who.Node.StableID
 				displayHost = who.Node.HostName
 			}
-		}
-		if login == "" && isLoopback(host) {
-			// `tailscale serve` proxy hop. The header is authoritative
-			// here because nothing public can reach loopback.
-			login = r.Header.Get("Tailscale-User-Login")
-			displayHost = host
 		}
 		if login == "" {
 			http.Error(rw, "tailnet access required — onboard via `clawpatrol join <gateway>`", http.StatusForbidden)
@@ -1033,14 +1058,11 @@ func (w *webMux) caFingerprint() string {
 // callerIdentity resolves the (user, device) of the request peer via
 // tailscale whois. May be empty if Tailscale is not available.
 func (w *webMux) callerIdentity(r *http.Request) (user, device, displayHost string) {
-	host := r.Header.Get("X-Forwarded-For")
-	if host == "" {
-		ipPort := r.RemoteAddr
-		if i := strings.LastIndex(ipPort, ":"); i >= 0 {
-			host = ipPort[:i]
-		} else {
-			host = ipPort
-		}
+	// The peer address only. X-Forwarded-For is client-controlled and
+	// the tailnet gate no longer consults it either.
+	host := r.RemoteAddr
+	if i := strings.LastIndex(host, ":"); i >= 0 {
+		host = host[:i]
 	}
 	if w.g.agents == nil {
 		return "", "", host
@@ -1157,6 +1179,7 @@ func (w *webMux) apiState(rw http.ResponseWriter, r *http.Request) {
 		"whoami":                  w.whoamiData(r),
 		"integrations":            w.statusList(r),
 		"agents":                  w.agentsList(),
+		"enrolled_peers":          w.enrolledPeersForState(),
 		"update":                  currentUpdateBanner.Load(),
 		"config_file":             filepath.Base(w.g.cfgPath),
 		"dashboard_config_writes": w.g.cfg.Load().DashboardConfigWrites(),
@@ -1177,6 +1200,18 @@ func (w *webMux) apiState(rw http.ResponseWriter, r *http.Request) {
 	w.stateCacheMu.Unlock()
 
 	serveState(rw, r, body, tag)
+}
+
+// enrolledPeersForState returns the enrolled-peer views bundled into
+// /api/state for the dashboard. Errors (and the no-enrollment case)
+// degrade to an empty slice so a DB hiccup never blanks the whole
+// dashboard, and the JSON is always [] rather than null.
+func (w *webMux) enrolledPeersForState() []enrolledPeerView {
+	views, err := w.g.listEnrolledPeerViews()
+	if err != nil || views == nil {
+		return []enrolledPeerView{}
+	}
+	return views
 }
 
 const stateCacheTTL = 1 * time.Second
@@ -1211,6 +1246,33 @@ func serveState(rw http.ResponseWriter, r *http.Request, body []byte, tag string
 //
 // Multi-slot credentials (mtls, slack tokens) pass multiple keys.
 // Empty values clear the slot.
+//
+// After persisting, if the credential plugin implements
+// runtime.CredentialVerifier the handler synchronously calls the
+// verification primitive (Slack auth.test, Discord users/@me, …) and
+// records the outcome in credential_verifications. The response body
+// surfaces the verification result so the connect form can show
+// "credential verified" or the inline failure inside one round-trip:
+//
+//	{ "ok": true, "verified": true }
+//	{ "ok": true, "verified": false, "error": "slack auth.test: invalid_auth" }
+//	{ "ok": true, "verified": false, "unverified": true,
+//	  "error": "could not verify: Post …: connection refused" }
+//	{ "ok": true }                       // plugin has no Verifier
+//
+// A save that changes the stored material drops the previous verdict
+// before probing, so no verdict ever describes bytes other than the
+// ones on disk. Only a *runtime.CredentialRejectedError (the provider
+// answered and rejected the token) is recorded as a failure. Any other
+// probe error — unreachable provider, timeout, 5xx, rate limit — is
+// reported as "unverified" and records nothing, so a provider outage
+// never flips a working credential to failed. A re-POST of the same
+// slots re-runs the probe; that is the retry path.
+//
+// Saves and disconnects are serialised per credential
+// (lockCredentialSave) so two overlapping saves cannot record their
+// verdicts out of order, and a disconnect cannot interleave with a
+// save's probe and leave a verdict behind for slots that are gone.
 func (w *webMux) apiCredentialsSet(rw http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		http.Error(rw, "POST", http.StatusMethodNotAllowed)
@@ -1239,6 +1301,19 @@ func (w *webMux) apiCredentialsSet(rw http.ResponseWriter, r *http.Request) {
 		http.Error(rw, "credential is OAuth-flow, use /api/oauth/start", 400)
 		return
 	}
+	defer w.lockCredentialSave(body.ID)()
+	verifier, hasVerifier := ent.Body.(runtime.CredentialVerifier)
+	// Snapshot the material before the write so an inconclusive probe
+	// can tell whether the stored verdict still describes what is now
+	// on disk.
+	var before runtime.Secret
+	if hasVerifier {
+		var err error
+		if before, _, err = readCredentialSecrets(w.g.db, body.ID); err != nil {
+			http.Error(rw, err.Error(), 500)
+			return
+		}
+	}
 	valid := map[string]bool{}
 	for _, s := range sp.SecretSlots() {
 		valid[s.Name] = true
@@ -1264,7 +1339,104 @@ func (w *webMux) apiCredentialsSet(rw http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	writeJSON(rw, map[string]any{"ok": true})
+	resp := map[string]any{"ok": true}
+	if hasVerifier {
+		sec, found, err := readCredentialSecrets(w.g.db, body.ID)
+		if err != nil {
+			http.Error(rw, err.Error(), 500)
+			return
+		}
+		if !found {
+			// Every slot was cleared: there is nothing to probe, and a
+			// stale "failed" row would otherwise keep reporting the
+			// previous outcome (or "no token to verify") for a
+			// credential that is simply empty.
+			if err := clearCredentialVerification(w.g.db, body.ID); err != nil {
+				log.Printf("credentials: clear verification for %s: %v", body.ID, err)
+			}
+			w.bustStateCache()
+			writeJSON(rw, resp)
+			return
+		}
+		if !secretsEqual(before, sec) {
+			// The stored verdict described bytes that are gone. Drop it
+			// before probing so a crash or an inconclusive probe cannot
+			// leave an old "ok" attached to never-verified material;
+			// /api/state falls back to slot presence meanwhile.
+			if err := clearCredentialVerification(w.g.db, body.ID); err != nil {
+				http.Error(rw, err.Error(), 500)
+				return
+			}
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+		defer cancel()
+		verifyErr := verifier.VerifyCredential(ctx, sec)
+		var rejected *runtime.CredentialRejectedError
+		switch {
+		case verifyErr == nil:
+			if err := w.recordVerification(rw, body.ID, "ok", ""); err != nil {
+				return
+			}
+			resp["verified"] = true
+		case errors.As(verifyErr, &rejected):
+			reason := truncateVerifyReason(rejected.Reason)
+			if err := w.recordVerification(rw, body.ID, "failed", reason); err != nil {
+				return
+			}
+			resp["verified"] = false
+			resp["error"] = reason
+		default:
+			// No verdict, so an outage is not mistaken for a bad
+			// token. Unchanged material keeps its last verdict; changed
+			// material had its verdict dropped above.
+			log.Printf("credentials: could not verify %s: %v", body.ID, verifyErr)
+			resp["verified"] = false
+			resp["unverified"] = true
+			resp["error"] = truncateVerifyReason("could not verify: " + verifyErr.Error())
+		}
+	}
+	w.bustStateCache()
+	writeJSON(rw, resp)
+}
+
+// secretsEqual reports whether two dashboard-slot snapshots carry the
+// same material (main slot bytes and every named slot).
+func secretsEqual(a, b runtime.Secret) bool {
+	if !bytes.Equal(a.Bytes, b.Bytes) || len(a.Extras) != len(b.Extras) {
+		return false
+	}
+	for k, v := range a.Extras {
+		if bv, ok := b.Extras[k]; !ok || bv != v {
+			return false
+		}
+	}
+	return true
+}
+
+// recordVerification persists a verification verdict. On a write
+// failure it answers the request with a 500 (the slots are saved but
+// the outcome is not; without a row /api/state would fall back to
+// slot presence and report a rejected token as connected) and returns
+// the error so the caller stops.
+func (w *webMux) recordVerification(rw http.ResponseWriter, id, status, reason string) error {
+	err := setCredentialVerification(w.g.db, id, status, reason)
+	if err != nil {
+		log.Printf("credentials: persist verification for %s: %v", id, err)
+		w.bustStateCache()
+		http.Error(rw, "credential saved but verification result could not be recorded: "+err.Error(), 500)
+	}
+	return err
+}
+
+// bustStateCache forces the next /api/state request to recompute from
+// fresh data instead of returning the 1s TTL'd memo. Called from
+// handlers that mutate the data the state slice reads — credentials,
+// disconnect, etc. — so an operator action shows up on the dashboard
+// without waiting for the cache window to elapse.
+func (w *webMux) bustStateCache() {
+	w.stateCacheMu.Lock()
+	w.stateCache = nil
+	w.stateCacheMu.Unlock()
 }
 
 // apiCredentialsClear drops every slot for the credential. Disconnect
@@ -1285,10 +1457,22 @@ func (w *webMux) apiCredentialsClear(rw http.ResponseWriter, r *http.Request) {
 		http.Error(rw, "missing id", 400)
 		return
 	}
+	// Validate against the policy before taking the keyed lock: the
+	// lock map is never pruned, so an unknown id must not create an
+	// entry.
+	if policy := w.g.policy.Load(); policy == nil || policy.Credentials[body.ID] == nil {
+		http.Error(rw, "unknown credential: "+body.ID, 404)
+		return
+	}
+	defer w.lockCredentialSave(body.ID)()
 	if err := clearCredentialSecrets(w.g.db, body.ID); err != nil {
 		http.Error(rw, err.Error(), 500)
 		return
 	}
+	if err := clearCredentialVerification(w.g.db, body.ID); err != nil {
+		log.Printf("credentials: clear verification for %s: %v", body.ID, err)
+	}
+	w.bustStateCache()
 	writeJSON(rw, map[string]any{"ok": true})
 }
 
@@ -1627,10 +1811,6 @@ func (w *webMux) apiHITLDecide(rw http.ResponseWriter, r *http.Request) {
 	writeJSON(rw, result)
 }
 
-func isLoopback(host string) bool {
-	return host == "127.0.0.1" || host == "::1" || strings.HasPrefix(host, "127.")
-}
-
 func (w *webMux) apiEventsSSE(rw http.ResponseWriter, r *http.Request) {
 	rw.Header().Set("Content-Type", "text/event-stream")
 	rw.Header().Set("Cache-Control", "no-cache")
@@ -1752,47 +1932,51 @@ func (w *webMux) loadAction(actionID string) (*Event, error) {
 		return nil, fmt.Errorf("missing id")
 	}
 	var (
-		e            Event
-		tsNs         int64
-		mode         sql.NullString
-		family       sql.NullString
-		agentIP      sql.NullString
-		method       sql.NullString
-		path         sql.NullString
-		status       sql.NullString
-		in, ot       sql.NullInt64
-		ms           sql.NullInt64
-		action       sql.NullString
-		reason       sql.NullString
-		reqSha       sql.NullString
-		respSha      sql.NullString
-		reqBody      sql.NullString
-		respBody     sql.NullString
-		reqHeaders   sql.NullString
-		respHeaders  sql.NullString
-		extra        sql.NullString
-		endpoint     sql.NullString
-		rule         sql.NullString
-		approver     sql.NullString
-		approverType sql.NullString
-		approverBy   sql.NullString
+		e              Event
+		tsNs           int64
+		mode           sql.NullString
+		family         sql.NullString
+		agentIP        sql.NullString
+		method         sql.NullString
+		path           sql.NullString
+		status         sql.NullString
+		in, ot         sql.NullInt64
+		ms             sql.NullInt64
+		action         sql.NullString
+		reason         sql.NullString
+		reqSha         sql.NullString
+		respSha        sql.NullString
+		reqBody        sql.NullString
+		respBody       sql.NullString
+		reqBodyState   sql.NullString
+		respBodyState  sql.NullString
+		reqTransformed sql.NullBool
+		reqHeaders     sql.NullString
+		respHeaders    sql.NullString
+		extra          sql.NullString
+		endpoint       sql.NullString
+		rule           sql.NullString
+		credential     sql.NullString
+		approver       sql.NullString
+		approverType   sql.NullString
+		approverBy     sql.NullString
 	)
 	err := w.g.db.QueryRow(`
 		SELECT ts_ns, mode, family, agent_ip, host, method, path,
 		       status, bytes_in, bytes_out, ms, action,
 		       reason, req_sha, resp_sha,
-		       req_body, resp_body,
+		       req_body, resp_body, req_body_state, resp_body_state, req_transformed,
 		       req_headers, resp_headers, extra,
-		       endpoint, rule,
+		       endpoint, rule, credential,
 		       approver, approver_type, approver_by
 		FROM actions WHERE action_id = ?`, actionID,
 	).Scan(
 		&tsNs, &mode, &family, &agentIP, &e.Host,
 		&method, &path, &status, &in, &ot, &ms,
 		&action, &reason, &reqSha, &respSha,
-		&reqBody, &respBody,
+		&reqBody, &respBody, &reqBodyState, &respBodyState, &reqTransformed,
 		&reqHeaders, &respHeaders, &extra,
-		&endpoint, &rule,
+		&endpoint, &rule, &credential,
 		&approver, &approverType, &approverBy,
 	)
 	if err != nil {
@@ -1815,6 +1999,9 @@ func (w *webMux) loadAction(actionID string) (*Event, error) {
 	e.RespSha = respSha.String
 	e.ReqBody = reqBody.String
 	e.RespBody = respBody.String
+	e.ReqBodyState = reqBodyState.String
+	e.RespBodyState = respBodyState.String
+	e.ReqTransformed = reqTransformed.Bool
 	unmarshalHeaders(reqHeaders.String, &e.ReqHeaders)
 	unmarshalHeaders(respHeaders.String, &e.RespHeaders)
 	if extra.String != "" {
@@ -1822,6 +2009,7 @@ func (w *webMux) loadAction(actionID string) (*Event, error) {
 	}
 	e.Endpoint = endpoint.String
 	e.Rule = rule.String
+	e.Credential = credential.String
 	e.Approver = approver.String
 	e.ApproverType = approverType.String
 	e.ApproverBy = approverBy.String
@@ -1881,9 +2069,17 @@ func (w *webMux) writeActionFixture(rw http.ResponseWriter, ev *Event) {
 	// the bare DB-recorded name; the policy supplies the type.
 	m.Endpoint = endpointRef(ep)
 
-	fx := &Fixture{Match: m, Action: Action{PeerIP: ev.AgentIP}}
+	// Credential is the bare name the dispatch site resolved before
+	// matching. Without it a fixture for a request whose rule pinned
+	// one of several credentials bound to the endpoint replays with an
+	// empty credential and never reaches that rule.
+	fx := &Fixture{Match: m, Action: Action{PeerIP: ev.AgentIP, Credential: ev.Credential}}
 	switch ep.Family {
 	case "http":
+		if err := validateHTTPFixtureBodyCapture(ev); err != nil {
+			http.Error(rw, err.Error(), http.StatusBadRequest)
+			return
+		}
 		fx.Action.Host = ev.Host
 		fx.Action.HTTP = exportHTTP(ev)
 	case "k8s":
@@ -1928,6 +2124,56 @@ func (w *webMux) writeActionFixture(rw http.ResponseWriter, ev *Event) {
 	enc := json.NewEncoder(rw)
 	enc.SetIndent("", "  ")
 	_ = enc.Encode(fx)
+}
+
+func validateHTTPFixtureBodyCapture(ev *Event) error {
+	if ev.ReqTransformed {
+		return fmt.Errorf("request was transformed by a credential; cannot export as fixture")
+	}
+	switch ev.ReqBodyState {
+	case bodyCaptureComplete:
+	case bodyCaptureIncomplete, bodyCaptureAborted:
+		return fmt.Errorf("request body capture is %s; cannot export as fixture", ev.ReqBodyState)
+	case "":
+		switch {
+		case strings.HasSuffix(ev.ReqBody, legacyBodyIncompleteMarker):
+			return fmt.Errorf("request body capture is incomplete; cannot export as fixture")
+		case strings.HasSuffix(ev.ReqBody, legacyBodyAbortedMarker):
+			return fmt.Errorf("request body capture is aborted; cannot export as fixture")
+		default:
+			return fmt.Errorf("request body capture completion is unknown; cannot export as fixture")
+		}
+	default:
+		return fmt.Errorf("request body capture state %q is not complete; cannot export as fixture", ev.ReqBodyState)
+	}
+	if strings.HasSuffix(ev.ReqBody, bodyTruncatedMarker) {
+		return fmt.Errorf("request body capture is truncated; cannot export as fixture")
+	}
+	if encoding := eventHeaderValue(ev.ReqHeaders, "Content-Encoding"); encoding != "" && !strings.EqualFold(strings.TrimSpace(encoding), "identity") {
+		return fmt.Errorf("request body capture is content-encoded; cannot export as fixture")
+	}
+	if strings.HasPrefix(ev.ReqBody, "binary:") {
+		return fmt.Errorf("request body capture is a binary preview; cannot export as fixture")
+	}
+	if strings.HasSuffix(ev.ReqBody, decodedSampleTruncatedMarker) {
+		return fmt.Errorf("request body decoded preview is truncated; cannot export as fixture")
+	}
+	if strings.Contains(ev.ReqBody, credentialSampleRedaction) {
+		return fmt.Errorf("request body capture was redacted; cannot export as fixture")
+	}
+	if !utf8.ValidString(ev.ReqBody) {
+		return fmt.Errorf("request body capture is not valid UTF-8; cannot export as fixture")
+	}
+	return nil
+}
+
+func eventHeaderValue(headers map[string]string, name string) string {
+	for key, value := range headers {
+		if strings.EqualFold(key, name) {
+			return value
+		}
+	}
+	return ""
 }
 
 // matchFromEvent maps post-chain Event.Action onto the fixture's
@@ -2441,15 +2687,21 @@ type Event struct {
 	// / llm_approver / dashboard), and the approver-specific "By"
 	// string (Slack handle, llm:<model>, ...). All empty for rule-
 	// driven verdicts.
-	Approver     string            `json:"approver,omitempty"`
-	ApproverType string            `json:"approver_type,omitempty"`
-	ApproverBy   string            `json:"approver_by,omitempty"`
-	ReqSha       string            `json:"req_sha,omitempty"`
-	ReqBody      string            `json:"req_body,omitempty"`
-	RespSha      string            `json:"resp_sha,omitempty"`
-	RespBody     string            `json:"resp_body,omitempty"`
-	ReqHeaders   map[string]string `json:"req_headers,omitempty"`
-	RespHeaders  map[string]string `json:"resp_headers,omitempty"`
+	Approver     string `json:"approver,omitempty"`
+	ApproverType string `json:"approver_type,omitempty"`
+	ApproverBy   string `json:"approver_by,omitempty"`
+	ReqSha       string `json:"req_sha,omitempty"`
+	ReqBody      string `json:"req_body,omitempty"`
+	ReqBodyState string `json:"req_body_state,omitempty"`
+	// ReqTransformed records that credential injection successfully rewrote
+	// the request after policy matching. Such an audit body is not a faithful
+	// fixture input and must not be exported as one.
+	ReqTransformed bool              `json:"req_transformed,omitempty"`
+	RespSha        string            `json:"resp_sha,omitempty"`
+	RespBody       string            `json:"resp_body,omitempty"`
+	RespBodyState  string            `json:"resp_body_state,omitempty"`
+	ReqHeaders     map[string]string `json:"req_headers,omitempty"`
+	RespHeaders    map[string]string `json:"resp_headers,omitempty"`
 	// Frame is set for Phase="frame" only — a single WS frame's text
 	// payload (truncated at sampleCap). Direction is "c→s" or "s→c"
 	// to disambiguate masked client frames from unmasked server frames.
@@ -2476,6 +2728,14 @@ type Event struct {
 	// the rule that produced its verdict (site/doc/clawpatrol-test.md).
 	Endpoint string `json:"endpoint,omitempty"`
 	Rule     string `json:"rule,omitempty"`
+
+	// Credential is the bare name of the credential the dispatch site
+	// resolved for this request (what it set on
+	// match.Request.Credential before matching), "" when none was
+	// resolved. The fixture exporter stamps it into action.credential
+	// so a replay reaches the same credential-pinned rules the gateway
+	// evaluated.
+	Credential string `json:"credential,omitempty"`
 }
 
 // eventPacket carries an event plus its marshaled JSON bytes. drain()
@@ -2540,8 +2800,9 @@ func readTailEvents(db *sql.DB, n int) ([]Event, error) {
 	rows, err := db.Query(`
 		SELECT action_id, ts_ns, mode, family, agent_ip, host,
 		       method, path, status, bytes_in, bytes_out,
-		       ms, action, reason, req_sha, resp_sha, extra,
-		       endpoint, rule,
+		       ms, action, reason, req_sha, resp_sha,
+		       req_body_state, resp_body_state, req_transformed, extra,
+		       endpoint, rule, credential,
 		       approver, approver_type, approver_by
 		FROM actions ORDER BY id DESC LIMIT ?`, n)
 	if err != nil {
@@ -2551,33 +2812,38 @@ func readTailEvents(db *sql.DB, n int) ([]Event, error) {
 	out := make([]Event, 0, n)
 	for rows.Next() {
 		var (
-			e            Event
-			actionID     sql.NullString
-			tsNs         int64
-			mode         sql.NullString
-			family       sql.NullString
-			agentIP      sql.NullString
-			method       sql.NullString
-			path         sql.NullString
-			status       sql.NullString
-			in, ot       sql.NullInt64
-			ms           sql.NullInt64
-			action       sql.NullString
-			reason       sql.NullString
-			reqSha       sql.NullString
-			respSha      sql.NullString
-			extra        sql.NullString
-			endpoint     sql.NullString
-			rule         sql.NullString
-			approver     sql.NullString
-			approverType sql.NullString
-			approverBy   sql.NullString
+			e              Event
+			actionID       sql.NullString
+			tsNs           int64
+			mode           sql.NullString
+			family         sql.NullString
+			agentIP        sql.NullString
+			method         sql.NullString
+			path           sql.NullString
+			status         sql.NullString
+			in, ot         sql.NullInt64
+			ms             sql.NullInt64
+			action         sql.NullString
+			reason         sql.NullString
+			reqSha         sql.NullString
+			respSha        sql.NullString
+			reqBodyState   sql.NullString
+			respBodyState  sql.NullString
+			reqTransformed sql.NullBool
+			extra          sql.NullString
+			endpoint       sql.NullString
+			rule           sql.NullString
+			credential     sql.NullString
+			approver       sql.NullString
+			approverType   sql.NullString
+			approverBy     sql.NullString
 		)
 		if err := rows.Scan(
 			&actionID, &tsNs, &mode, &family, &agentIP, &e.Host,
 			&method, &path, &status, &in, &ot, &ms,
-			&action, &reason, &reqSha, &respSha, &extra,
-			&endpoint, &rule,
+			&action, &reason, &reqSha, &respSha,
+			&reqBodyState, &respBodyState, &reqTransformed, &extra,
+			&endpoint, &rule, &credential,
 			&approver, &approverType, &approverBy,
 		); err != nil {
 			return nil, err
@@ -2588,6 +2854,7 @@ func readTailEvents(db *sql.DB, n int) ([]Event, error) {
 		e.Family = family.String
 		e.Endpoint = endpoint.String
 		e.Rule = rule.String
+		e.Credential = credential.String
 		e.AgentIP = agentIP.String
 		e.Method = method.String
 		e.Path = path.String
@@ -2599,6 +2866,9 @@ func readTailEvents(db *sql.DB, n int) ([]Event, error) {
 		e.Reason = reason.String
 		e.ReqSha = reqSha.String
 		e.RespSha = respSha.String
+		e.ReqBodyState = reqBodyState.String
+		e.RespBodyState = respBodyState.String
+		e.ReqTransformed = reqTransformed.Bool
 		if extra.String != "" {
 			_ = json.Unmarshal([]byte(extra.String), &e.Facets)
 		}
@@ -2702,19 +2972,19 @@ func (s *Sink) drain() {
 				 (action_id, ts_ns, mode, family, agent_ip, host,
 				  method, path, status, bytes_in, bytes_out,
 				  ms, action, reason, req_sha, resp_sha,
-				  req_body, resp_body,
+				  req_body, resp_body, req_body_state, resp_body_state, req_transformed,
 				  req_headers, resp_headers, extra,
-				  endpoint, rule,
+				  endpoint, rule, credential,
 				  approver, approver_type, approver_by)
-				VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+				VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 			`, e.ID, e.Ts.UnixNano(), e.Mode, e.Family, e.AgentIP,
 				e.Host, e.Method, e.Path, e.Status,
 				e.In, e.Out, e.Ms, e.Action, e.Reason,
 				e.ReqSha, e.RespSha,
-				e.ReqBody, e.RespBody,
+				e.ReqBody, e.RespBody, e.ReqBodyState, e.RespBodyState, e.ReqTransformed,
 				string(rqhJSON), string(rshJSON),
 				string(extraJSON),
-				e.Endpoint, e.Rule,
+				e.Endpoint, e.Rule, e.Credential,
 				e.Approver, e.ApproverType, e.ApproverBy)
 		}
 
@@ -2814,10 +3084,36 @@ func (s *Sink) Subscribe() (<-chan eventPacket, func()) {
 }
 
 type sampler struct {
-	hash hash.Hash
-	cap  int
-	buf  bytes.Buffer
-	n    int64
+	mu            sync.Mutex
+	hash          hash.Hash
+	cap           int
+	contentLength int64
+	buf           bytes.Buffer
+	n             int64
+	state         samplerState
+	// snapshotStartForTest is a deterministic test seam used to prove that
+	// an event snapshot reaches the sampler while Write holds mu.
+	snapshotStartForTest func()
+}
+
+type samplerState string
+
+const (
+	samplerStatePending  samplerState = "pending"
+	samplerStateComplete samplerState = "complete"
+	samplerStateAborted  samplerState = "aborted"
+
+	bodyCaptureComplete   = "complete"
+	bodyCaptureIncomplete = "incomplete"
+	bodyCaptureAborted    = "aborted"
+)
+
+type samplerSnapshot struct {
+	sha       string
+	sample    string
+	n         int64
+	truncated bool
+	state     samplerState
 }
 
 func unmarshalHeaders(s string, dst *map[string]string) {
@@ -2846,12 +3142,41 @@ func flatHeadersRedacted(h http.Header, redactions []string) map[string]string {
 	return out
 }
 
-func newSampler(capBytes int) *sampler {
-	return &sampler{hash: sha256.New(), cap: capBytes}
+func newSampler(capBytes int, contentLength int64) *sampler {
+	state := samplerStatePending
+	if contentLength == 0 {
+		state = samplerStateComplete
+	}
+	return &sampler{
+		hash:          sha256.New(),
+		cap:           capBytes,
+		contentLength: contentLength,
+		state:         state,
+	}
+}
+
+func responseBodyContentLength(method string, resp *http.Response) int64 {
+	if resp == nil {
+		return 0
+	}
+	if method == http.MethodHead ||
+		(resp.StatusCode >= 100 && resp.StatusCode <= 199) ||
+		resp.StatusCode == http.StatusNoContent ||
+		resp.StatusCode == http.StatusNotModified {
+		return 0
+	}
+	if (resp.Body == nil || resp.Body == http.NoBody) && resp.ContentLength <= 0 {
+		return 0
+	}
+	return resp.ContentLength
 }
 
 func (s *sampler) Write(p []byte) (int, error) {
-	s.hash.Write(p)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	wasComplete := s.state == samplerStateComplete
+	_, _ = s.hash.Write(p)
 	s.n += int64(len(p))
 	if remain := s.cap - s.buf.Len(); remain > 0 {
 		take := len(p)
@@ -2860,14 +3185,17 @@ func (s *sampler) Write(p []byte) (int, error) {
 		}
 		s.buf.Write(p[:take])
 	}
-	return len(p), nil
-}
-
-func (s *sampler) sha() string {
-	if s.n == 0 {
-		return ""
+	if wasComplete && len(p) > 0 {
+		s.state = samplerStateAborted
+	} else if s.contentLength >= 0 {
+		switch {
+		case s.n > s.contentLength:
+			s.state = samplerStateAborted
+		case s.n == s.contentLength && s.state == samplerStatePending:
+			s.state = samplerStateComplete
+		}
 	}
-	return hex.EncodeToString(s.hash.Sum(nil))
+	return len(p), nil
 }
 
 // bodyTruncatedMarker is appended to a persisted body sample when the
@@ -2877,9 +3205,18 @@ func (s *sampler) sha() string {
 // parsing/rendering; see HttpBody in dashboard RequestDetailPage.tsx.
 const bodyTruncatedMarker = "\n[clawpatrol:body-truncated]"
 
+const (
+	legacyBodyIncompleteMarker = "\n[clawpatrol:body-incomplete]"
+	legacyBodyAbortedMarker    = "\n[clawpatrol:body-aborted]"
+)
+
 // truncated reports whether the sampler saw more bytes than it kept,
 // i.e. the persisted sample is a prefix of the real body.
-func (s *sampler) truncated() bool { return s.n > int64(s.cap) }
+func (s *sampler) truncated() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.n > int64(s.cap)
+}
 
 // sample returns the audit-log preview of the captured body. When
 // encoding names a compression we know how to decode (gzip, br,
@@ -2887,27 +3224,121 @@ func (s *sampler) truncated() bool { return s.n > int64(s.cap) }
 // JSON response doesn't get rendered as "binary:<hex>" just because
 // it's still on the wire compressed.
 func (s *sampler) sample(encoding string) string {
-	if s.buf.Len() == 0 {
+	return s.snapshot(encoding).sample
+}
+
+// snapshot atomically copies every mutable sampler field. Decoding happens
+// after the lock is released against the copied prefix. The SHA is populated
+// only after EOF or the full declared Content-Length has been observed.
+func (s *sampler) snapshot(encoding string) samplerSnapshot {
+	if s.snapshotStartForTest != nil {
+		s.snapshotStartForTest()
+	}
+	s.mu.Lock()
+	n := s.n
+	state := s.state
+	capBytes := s.cap
+	raw := bytes.Clone(s.buf.Bytes())
+	var sha string
+	if state == samplerStateComplete && n > 0 {
+		sha = hex.EncodeToString(s.hash.Sum(nil))
+	}
+	s.mu.Unlock()
+
+	truncated := n > int64(capBytes)
+	return samplerSnapshot{
+		sha:       sha,
+		sample:    sampledBody(raw, truncated, encoding),
+		n:         n,
+		truncated: truncated,
+		state:     state,
+	}
+}
+
+func sampledBody(raw []byte, truncated bool, encoding string) string {
+	if len(raw) == 0 {
 		// An empty buffer with bytes counted means the cap was 0 (or the
 		// body never reached the buffer); still flag truncation so the
 		// dashboard doesn't render a capped body as the full thing.
-		if s.truncated() {
+		if truncated {
 			return bodyTruncatedMarker
 		}
 		return ""
 	}
-	raw := s.buf.Bytes()
 	body := maybeDecode(raw, encoding)
+	if truncated {
+		// The storage cap cuts on a byte boundary, so a text body can
+		// end inside a multibyte rune; that must not turn the whole
+		// preview into a hex dump.
+		body = trimIncompleteRune(body)
+	}
 	var out string
 	if isPrintable(body) {
 		out = string(body)
 	} else {
 		out = "binary:" + hex.EncodeToString(raw[:min(64, len(raw))])
 	}
-	if s.truncated() {
+	if truncated {
 		out += bodyTruncatedMarker
 	}
 	return out
+}
+
+func (s samplerSnapshot) captureState() string {
+	switch s.state {
+	case samplerStatePending:
+		return bodyCaptureIncomplete
+	case samplerStateAborted:
+		return bodyCaptureAborted
+	default:
+		return bodyCaptureComplete
+	}
+}
+
+func applyRequestBodySnapshot(ev *Event, snapshot samplerSnapshot, redactions []string) {
+	ev.In = snapshot.n
+	ev.ReqSha = snapshot.sha
+	ev.ReqBody = redactCredentialSample(snapshot.sample, redactions)
+	ev.ReqBodyState = snapshot.captureState()
+}
+
+// applyResponseBodySnapshot records the response sample with the same
+// credential redactions as the request: an upstream that echoes the
+// injected secret back (401 bodies, debug pages, error messages)
+// must not get it persisted or displayed.
+func applyResponseBodySnapshot(ev *Event, snapshot samplerSnapshot, redactions []string) {
+	ev.Out = snapshot.n
+	ev.RespSha = snapshot.sha
+	ev.RespBody = redactCredentialSample(snapshot.sample, redactions)
+	ev.RespBodyState = snapshot.captureState()
+}
+
+func (s *sampler) finishRead(err error) {
+	if err == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.state != samplerStatePending {
+		return
+	}
+	if errors.Is(err, io.EOF) {
+		if s.contentLength < 0 || s.n == s.contentLength {
+			s.state = samplerStateComplete
+		} else {
+			s.state = samplerStateAborted
+		}
+		return
+	}
+	s.state = samplerStateAborted
+}
+
+func (s *sampler) abort() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.state == samplerStatePending {
+		s.state = samplerStateAborted
+	}
 }
 
 const (
@@ -2965,7 +3396,29 @@ func maybeDecode(buf []byte, encoding string) []byte {
 	return out
 }
 
+// trimIncompleteRune drops a trailing partial UTF-8 sequence (at most
+// three bytes) left by a byte-level cut. Complete or invalid input is
+// returned unchanged.
+func trimIncompleteRune(b []byte) []byte {
+	for i := 1; i <= 3 && i <= len(b); i++ {
+		tail := b[len(b)-i:]
+		if utf8.FullRune(tail) {
+			if r, _ := utf8.DecodeRune(tail); r == utf8.RuneError {
+				continue
+			}
+			return b
+		}
+		if utf8.RuneStart(tail[0]) {
+			return b[:len(b)-i]
+		}
+	}
+	return b
+}
+
 func isPrintable(b []byte) bool {
+	if !utf8.Valid(b) {
+		return false
+	}
 	for _, x := range b {
 		if x == 0 || (x < 0x20 && x != '\n' && x != '\r' && x != '\t') {
 			return false
@@ -2974,19 +3427,30 @@ func isPrintable(b []byte) bool {
 	return true
 }
 
-type teeReadCloser struct {
-	r io.Reader
-	c io.Closer
+type sampledReadCloser struct {
+	rc io.ReadCloser
+	s  *sampler
 }
 
-func (t teeReadCloser) Read(p []byte) (int, error) { return t.r.Read(p) }
-func (t teeReadCloser) Close() error               { return t.c.Close() }
+func (r *sampledReadCloser) Read(p []byte) (int, error) {
+	n, err := r.rc.Read(p)
+	if n > 0 {
+		_, _ = r.s.Write(p[:n])
+	}
+	r.s.finishRead(err)
+	return n, err
+}
+
+func (r *sampledReadCloser) Close() error {
+	r.s.abort()
+	return r.rc.Close()
+}
 
 func wrapBodySampler(rc io.ReadCloser, s *sampler) io.ReadCloser {
 	if rc == nil {
 		return nil
 	}
-	return teeReadCloser{r: io.TeeReader(rc, s), c: rc}
+	return &sampledReadCloser{rc: rc, s: s}
 }
 
 // HITL — human-in-the-loop request approval. Rules with `approve = [...]`
@@ -3015,7 +3479,7 @@ type HITLRegistry struct {
 	terminal              map[string]terminalHITLEntry
 	sink                  *Sink // SSE fan-out for the dashboard
 	asyncGrantResolver    func(operationID string, d runtime.HITLDecision) runtime.HITLResolveResult
-	pendingMessageUpdater func(ctx context.Context, pending runtime.HITLPending, ref string, result runtime.HITLResolveResult)
+	pendingMessageUpdater func(ctx context.Context, pending runtime.HITLPending, ref string, result runtime.HITLResolveResult, decidedBy string)
 }
 
 type pendingEntry struct {
@@ -3025,9 +3489,13 @@ type pendingEntry struct {
 }
 
 type terminalHITLEntry struct {
-	result    runtime.HITLResolveResult
-	pending   runtime.HITLPending
-	refs      []string
+	result  runtime.HITLResolveResult
+	pending runtime.HITLPending
+	refs    []string
+	// decidedBy is the operator behind an approve/deny terminal
+	// state, kept so a message ref recorded after the decision still
+	// renders "approved by ...". Empty for timeouts and cancels.
+	decidedBy string
 	expiresAt time.Time
 }
 
@@ -3168,13 +3636,19 @@ func (r *HITLRegistry) DecideWithResult(id string, d runtime.HITLDecision) runti
 	pend := e.p
 	e.decision <- d
 	delete(r.pending, id)
+	// Keep the pending entry and decider on the terminal record so a
+	// notifier that finishes posting after the decision (see
+	// RecordMessageRef) can still edit its message.
 	r.terminal[id] = terminalHITLEntry{
 		result:    runtime.HITLResolveResult{OK: false, State: state, Reason: reason},
+		pending:   terminalHITLPending(pend),
+		refs:      refs,
+		decidedBy: d.By,
 		expiresAt: now.Add(hitlTerminalTTL),
 	}
 	r.mu.Unlock()
 	result := runtime.HITLResolveResult{OK: true, State: state, Reason: reason}
-	r.updateRecordedMessageRefs(context.Background(), pend, refs, result)
+	r.updateRecordedMessageRefs(context.Background(), pend, refs, result, d.By)
 	return result
 }
 
@@ -3195,7 +3669,7 @@ func (r *HITLRegistry) Cancel(id string, state runtime.HITLState, reason string)
 	}
 	e, result := r.resolve(id, state, reason)
 	if e != nil && result.OK {
-		r.updateRecordedMessageRefs(context.Background(), e.p, e.messageRefs, result)
+		r.updateRecordedMessageRefs(context.Background(), e.p, e.messageRefs, result, "")
 	}
 	return result
 }
@@ -3214,8 +3688,18 @@ func (r *HITLRegistry) resolve(id string, state runtime.HITLState, reason string
 	}
 	delete(r.pending, id)
 	terminal := runtime.HITLResolveResult{OK: false, State: state, Reason: reason}
-	r.terminal[id] = terminalHITLEntry{result: terminal, pending: e.p, refs: append([]string(nil), e.messageRefs...), expiresAt: now.Add(hitlTerminalTTL)}
+	r.terminal[id] = terminalHITLEntry{result: terminal, pending: terminalHITLPending(e.p), refs: append([]string(nil), e.messageRefs...), expiresAt: now.Add(hitlTerminalTTL)}
 	return e, runtime.HITLResolveResult{OK: true, State: state, Reason: reason}
+}
+
+// terminalHITLPending is the copy of a pending entry kept on its
+// terminal record for hitlTerminalTTL. Late message updates only need
+// the routing/rendering fields, so the body sample — the one field
+// that can be large — is dropped rather than retained for 30 minutes
+// per decision.
+func terminalHITLPending(p runtime.HITLPending) runtime.HITLPending {
+	p.BodySample = ""
+	return p
 }
 
 // RecordMessageRef records the channel-specific message id for a pending sync
@@ -3229,6 +3713,7 @@ func (r *HITLRegistry) RecordMessageRef(_ context.Context, pendingID, ref string
 	}
 	var pending runtime.HITLPending
 	var result runtime.HITLResolveResult
+	var decidedBy string
 	var shouldUpdate bool
 	now := time.Now()
 	r.mu.Lock()
@@ -3243,16 +3728,21 @@ func (r *HITLRegistry) RecordMessageRef(_ context.Context, pendingID, ref string
 		r.terminal[pendingID] = terminal
 		pending = terminal.pending
 		result = terminal.result
+		decidedBy = terminal.decidedBy
 		shouldUpdate = true
 	}
 	r.mu.Unlock()
 	if shouldUpdate {
-		r.updateRecordedMessageRefs(context.Background(), pending, []string{ref}, result)
+		r.updateRecordedMessageRefs(context.Background(), pending, []string{ref}, result, decidedBy)
 	}
 	return nil
 }
 
-func (r *HITLRegistry) updateRecordedMessageRefs(ctx context.Context, pending runtime.HITLPending, refs []string, result runtime.HITLResolveResult) {
+// updateRecordedMessageRefs pushes a terminal result to every channel
+// message posted for the pending entry. decidedBy is the operator
+// behind an approve/deny decision and empty for timeouts, cancels, and
+// client disconnects.
+func (r *HITLRegistry) updateRecordedMessageRefs(ctx context.Context, pending runtime.HITLPending, refs []string, result runtime.HITLResolveResult, decidedBy string) {
 	if r == nil || r.pendingMessageUpdater == nil {
 		return
 	}
@@ -3260,7 +3750,7 @@ func (r *HITLRegistry) updateRecordedMessageRefs(ctx context.Context, pending ru
 		if strings.TrimSpace(ref) == "" {
 			continue
 		}
-		r.pendingMessageUpdater(ctx, pending, ref, result)
+		r.pendingMessageUpdater(ctx, pending, ref, result, decidedBy)
 	}
 }
 

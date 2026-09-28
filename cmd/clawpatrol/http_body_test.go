@@ -1,11 +1,13 @@
 package main
 
 import (
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestBufferHTTPBodyForMatchPreservesUpstreamForwardingBody(t *testing.T) {
@@ -227,5 +229,68 @@ func TestBufferHTTPBodyForMatchHonorsCustomCap(t *testing.T) {
 	_ = resp.Body.Close()
 	if upstreamLen != len(body) {
 		t.Fatalf("upstream got %d bytes, want %d (custom cap must not drop forwarded bytes)", upstreamLen, len(body))
+	}
+}
+
+func TestBufferHTTPBodyForMatchReadErrorPreservesPartialBodyAndFailsClosed(t *testing.T) {
+	const prefix = `{"partial":true}`
+	wantErr := errors.New("request body failed")
+	req := &http.Request{
+		Body:          &dataThenErrorReader{data: []byte(prefix), err: wantErr},
+		ContentLength: int64(len(prefix) + 10),
+		Header:        make(http.Header),
+	}
+
+	result := bufferHTTPBodyForMatchResult(req, maxHTTPMatchBody)
+	if string(result.body) != prefix {
+		t.Fatalf("match body = %q, want partial prefix %q", result.body, prefix)
+	}
+	if !result.truncated {
+		t.Fatal("truncated = false, want true so body-dependent policy evaluation fails closed")
+	}
+	if result.complete {
+		t.Fatal("complete = true after read error")
+	}
+	if !errors.Is(result.readErr, wantErr) {
+		t.Fatalf("read error = %v, want %v", result.readErr, wantErr)
+	}
+
+	forwarded, err := io.ReadAll(req.Body)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("restored request body error = %v, want %v", err, wantErr)
+	}
+	if string(forwarded) != prefix {
+		t.Fatalf("restored request body = %q, want %q", forwarded, prefix)
+	}
+
+	ev := Event{}
+	applyTerminalRequestCapture(&ev, req, result, maxHTTPMatchBody)
+	if ev.ReqBodyState != bodyCaptureAborted {
+		t.Fatalf("capture state = %q, want %q", ev.ReqBodyState, bodyCaptureAborted)
+	}
+	if ev.ReqBody != prefix {
+		t.Fatalf("captured request body = %q, want partial prefix %q", ev.ReqBody, prefix)
+	}
+	if ev.ReqSha != "" {
+		t.Fatalf("aborted request SHA = %q, want empty", ev.ReqSha)
+	}
+}
+
+func TestSampledBodyTruncatedInsideRuneStaysText(t *testing.T) {
+	full := []byte("café — résumé 日本語")
+	// Cut inside the last multibyte rune.
+	cut := full[:len(full)-1]
+	if utf8.Valid(cut) {
+		t.Fatalf("test setup: cut is still valid utf8")
+	}
+	got := sampledBody(cut, true, "")
+	if strings.HasPrefix(got, "binary:") {
+		t.Fatalf("truncated text rendered as binary: %q", got)
+	}
+	if !strings.HasPrefix(got, "café — résumé 日本") || !strings.HasSuffix(got, bodyTruncatedMarker) {
+		t.Fatalf("unexpected sample %q", got)
+	}
+	if got := trimIncompleteRune(full); string(got) != string(full) {
+		t.Fatalf("complete input altered: %q", got)
 	}
 }

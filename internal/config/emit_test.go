@@ -137,3 +137,27 @@ profile "default" { credentials = [basic_auth.api] }
 		t.Fatalf("re-load emitted bytes:\n--- emitted ---\n%s\n--- diags ---\n%v", emitted, diags)
 	}
 }
+
+func TestEmitSignalCLIDeleteOnDecision(t *testing.T) {
+	gw, diags := config.LoadBytes([]byte(`gateway {
+  wireguard {
+    subnet_cidr = "10.55.0.0/24"
+    endpoint    = "127.0.0.1:51820"
+  }
+}
+
+credential "signal_cli" "ops" {
+  delete_on_decision = true
+}
+`), "signal.hcl")
+	if diags.HasErrors() {
+		t.Fatalf("load: %v", diags)
+	}
+	emitted, err := config.Emit(gw)
+	if err != nil {
+		t.Fatalf("emit: %v", err)
+	}
+	if !strings.Contains(string(emitted), "delete_on_decision = true") {
+		t.Fatalf("emitted config lost delete_on_decision:\n%s", emitted)
+	}
+}

@@ -2,7 +2,7 @@
 
 A clawpatrol gateway config mixes **operational** settings in the
 required top-level `gateway { ... }` block with **policy** blocks.
-Policy blocks (`approver`, `credential`, `tunnel`, `endpoint`, `rule`)
+Policy blocks (`approver`, `credential`, `tunnel`, `endpoint`, `enrollment`, `rule`)
 dispatch to a plugin chosen by the block's first label.
 
 ## How to read this page
@@ -19,12 +19,12 @@ Each block section lists the attributes the loader accepts, with:
 - **Required** — `yes` if the loader rejects the block when the
   attribute is missing.
 
-Plugin-dispatched kinds (`approver`, `credential`, `tunnel`, `endpoint`, `rule`)
+Plugin-dispatched kinds (`approver`, `credential`, `tunnel`, `endpoint`, `enrollment`, `rule`)
 list one subsection per registered type.
 
 ## Top-level blocks
 
-Operational settings live under the required top-level `gateway { ... }` block. The optional `defaults { ... }` block carries policy fallbacks. Labeled policy blocks (`profile`, `approver`, `credential`, `endpoint`, `rule`, `tunnel`) are documented in their own sections.
+Operational settings live under the required top-level `gateway { ... }` block. The optional `defaults { ... }` block carries policy fallbacks. Labeled policy blocks (`profile`, `approver`, `credential`, `endpoint`, `enrollment`, `rule`, `tunnel`) are documented in their own sections.
 
 | Attribute | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -43,9 +43,9 @@ The gateway block carries operational settings — listen addresses, the WireGua
 | `public_url` | `string` | no | The canonical externally-reachable gateway URL. Used in generated control-plane links such as join targets, OAuth redirect URIs, and (when public_url has a host but wireguard.endpoint doesn't) the host clients dial for WireGuard. |
 | `state_dir` | `string` | no | The directory holding clawpatrol.db (and anything a plugin persists to disk under it). Defaults to ${HOME}/.clawpatrol. |
 | `dashboard_session_ttl` | `string` | no | How long a dashboard login session stays valid after the operator types the password. time.ParseDuration format ("24h", "30m"). Default 24h. |
-| `dashboard_config_writes` | `bool` | no | Allows authenticated dashboard users to append generated config snippets to the gateway HCL. Default false: config remains read-only and changes happen out-of-band. |
+| `dashboard_config_writes` | `bool` | no | Allows authenticated dashboard users to append generated config snippets to the gateway HCL. Default false: config remains read-only and changes happen out-of-band. Enabling it hands every dashboard login full control of the gateway: rules, credential bindings, and tunnels, including `local_command` tunnels that run a program as the gateway's service user. Treat the dashboard password as a root credential when this is on, and keep it off for gateways whose dashboard is reachable beyond the operators you trust with that. |
 | `resolver` | `string` | no | The DNS resolver address the gateway uses for upstream lookups when the runtime needs an explicit resolver. |
-| `log_path` | `string` | no | An optional file path for gateway log output. |
+| `log_path` | `string` | no | LogPath, when set, appends every gateway log line (the same lines written to stderr: startup, config reloads, denials, tunnel and plugin events) to this file, created 0600. It is not an audit log: allowed requests are recorded in the state database and shown in the dashboard, not logged. The gateway never rotates the file. Opened right after state_dir is created, so a path inside state_dir works on a first run; lines logged while the config itself is being parsed go to stderr only. Changing it requires a restart. |
 | `telemetry` | `bool` | no | Opts in/out of the update-checker / anonymous usage ping (doc/telemetry.md). nil = default on; explicit `telemetry = false` silences the goroutine. Env vars CLAWPATROL_TELEMETRY=0 and DO_NOT_TRACK=1 also work. |
 | `session_keep` | `string` | no | The hard retention floor for the sessions table. Sessions whose last_at is older than this get deleted by the background sweeper. Default 720h (30d), "0" / "off" disables. time.ParseDuration format. |
 | `actions_keep` | `string` | no | The global default retention floor for the actions table (captured request/response logs — the gateway's largest table). Rows whose ts_ns is older than this are deleted by the background sweeper. Each endpoint may override this with its own `retention = "..."`. Default 720h (30d), "0" / "off" disables the default sweep (per-endpoint retention still applies). time.ParseDuration format. |
@@ -143,7 +143,8 @@ Targets one channel. Timeout / require_approvers
 override the global defaults block on a per-approver basis.
 
 Credential references a credential whose body satisfies HITLNotifier
-(slack_tokens today; future Discord / Telegram / SMTP credentials).
+(slack_tokens and signal_cli today; future Discord / Telegram / SMTP
+credentials).
 Leave empty for a dashboard-only approver (no channel notification;
 operator clicks approve/deny on the dashboard).
 
@@ -187,7 +188,7 @@ approver "llm_approver" "example" {
 
 Block syntax: `credential "<type>" "<name>" { ... }`
 
-Registered types: [`anthropic_manual_key`](#credential-anthropicmanualkey), [`anthropic_oauth_subscription`](#credential-anthropicoauthsubscription), [`aws_credential`](#credential-awscredential), [`basic_auth`](#credential-basicauth), [`bearer_token`](#credential-bearertoken), [`clickhouse_credential`](#credential-clickhousecredential), [`cookie_token`](#credential-cookietoken), [`discord_bot_token`](#credential-discordbottoken), [`gemini_api_key`](#credential-geminiapikey), [`github_oauth`](#credential-githuboauth), [`google_gke_credential`](#credential-googlegkecredential), [`header_token`](#credential-headertoken), [`mtls_credential`](#credential-mtlscredential), [`notion_mcp_oauth`](#credential-notionmcpoauth), [`notion_oauth`](#credential-notionoauth), [`openai_codex_oauth`](#credential-openaicodexoauth), [`passthrough`](#credential-passthrough), [`postgres_credential`](#credential-postgrescredential), [`slack_tokens`](#credential-slacktokens), [`ssh_key`](#credential-sshkey), [`tailscale_auth`](#credential-tailscaleauth), [`telegram_bot_token`](#credential-telegrambottoken).
+Registered types: [`anthropic_manual_key`](#credential-anthropicmanualkey), [`anthropic_oauth_subscription`](#credential-anthropicoauthsubscription), [`aws_credential`](#credential-awscredential), [`basic_auth`](#credential-basicauth), [`bearer_token`](#credential-bearertoken), [`clickhouse_credential`](#credential-clickhousecredential), [`cookie_token`](#credential-cookietoken), [`discord_bot_token`](#credential-discordbottoken), [`gemini_api_key`](#credential-geminiapikey), [`github_oauth`](#credential-githuboauth), [`google_gke_credential`](#credential-googlegkecredential), [`header_token`](#credential-headertoken), [`mtls_credential`](#credential-mtlscredential), [`notion_mcp_oauth`](#credential-notionmcpoauth), [`notion_oauth`](#credential-notionoauth), [`openai_codex_oauth`](#credential-openaicodexoauth), [`passthrough`](#credential-passthrough), [`postgres_credential`](#credential-postgrescredential), [`signal_cli`](#credential-signalcli), [`slack_tokens`](#credential-slacktokens), [`ssh_key`](#credential-sshkey), [`tailscale_auth`](#credential-tailscaleauth), [`telegram_bot_token`](#credential-telegrambottoken).
 
 ### `credential "anthropic_manual_key" "<name>"`
 
@@ -398,6 +399,41 @@ the catchall (one allowed per (profile, endpoint)).
 credential "postgres_credential" "example" {}
 ```
 
+### `credential "signal_cli" "<name>"`
+
+A notification-only HITL notifier that delivers approval
+prompts to Signal via a signal-cli-rest-api instance
+(https://github.com/bbernhard/signal-cli-rest-api). Signal has no
+interactive buttons, so the prompt is plain text ending in an
+"Open dashboard" link where the operator approves or denies.
+
+Connection details live in the secret store as named slots, filled via the
+dashboard: api_url (base URL of the signal-cli-rest-api), number (the
+registered E.164 sender), and auth (optional "user:pass" for HTTP basic
+auth). The recipient is the human_approver's channel - an E.164 number or a
+"group.<base64-id>".
+
+DeleteOnDecision remote-deletes the prompt once the operation is decided,
+so a conversation does not fill up with dead approve/deny links. It runs
+off the runtime's HITLMessageUpdater hook - the same one the Slack notifier
+uses to edit its message - so a prompt is only ever removed after the
+decision lands, never on a timer while the operator is still expected to
+act.
+
+Remote-delete needs a real peer: a group with another member, or a
+different number. It does NOT work for Note-to-Self (channel = the
+account's own number): signal-cli returns the sync-envelope timestamp for
+self-sends, not the message timestamp remote-delete needs, so the delete is
+a no-op on the linked phone.
+
+| Attribute | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `delete_on_decision` | `bool` | no | Remote-deletes the sent prompt once the HITL operation is decided. Off by default, which leaves the prompts in the conversation as a record of what was asked. |
+
+```hcl
+credential "signal_cli" "example" {}
+```
+
 ### `credential "slack_tokens" "<name>"`
 
 _No configurable attributes._
@@ -593,6 +629,49 @@ Family: `ssh`.
 ```hcl
 endpoint "ssh" "example" {
   hosts = ["api.example.com"]
+}
+```
+
+## `enrollment` blocks
+
+Block syntax: `enrollment "<type>" "<name>" { ... }`
+
+Registered types: [`kubernetes_token_review`](#enrollment-kubernetestokenreview).
+
+### `enrollment "kubernetes_token_review" "<name>"`
+
+The body of an `enrollment
+"kubernetes_token_review" "<name>"` block. It authorizes Kubernetes
+workloads to self-enroll as transient WireGuard peers by verifying a
+projected ServiceAccount token with the Kubernetes TokenReview API.
+
+| Attribute | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `audience` | `string` | yes | Passed to Kubernetes TokenReview and must match the projected ServiceAccount token's audience. Required. |
+| `match` | `block` | yes | The repeated `match { ... }` rules. Each binds one namespace + service_account identity to a profile allowlist. At least one is required. |
+| `keepalive_interval` | `string` | no | The WireGuard persistent-keepalive interval (time.ParseDuration) the sidecar applies to enrolled peers and pushed to it at enroll. Optional; defaults to 25s and must be at least 10s (the floor is pinned to the gateway reaper's sample cadence). There is no upper bound: a longer interval just means fewer keepalive packets and a longer liveness window (keepalive_interval × keepalive_reap_count). |
+| `keepalive_reap_count` | `int` | no | How many missed keepalives elapse before an enrolled peer is reaped; the liveness window is keepalive_interval × keepalive_reap_count. Expressing it as a count keeps the safety ratio an integer that can't be misconfigured. Optional; defaults to 3. Set to 0 to disable reaping (and the sidecar's self-heal escalation) entirely; any other value must be 2 or greater. |
+
+**Nested block `match {}`:**
+
+One identity → profile-binding rule inside a
+kubernetes_token_review enrollment.
+
+| Attribute | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `namespace` | `string` | yes | The pod must run in. Required. |
+| `service_account` | `string` | yes | The pod's token must belong to. Required. |
+| `profile_label` | `string` | no | The Pod label the clawpatrol profile is read from. Optional; defaults to "clawpatrol.dev/profile". |
+| `profiles` | `[]string` | yes | The allowlist of profiles a matched pod may bind. The value of the profile_label pod label must appear here. Required (at least one), and each must be a declared `profile "<name>"`. |
+
+```hcl
+enrollment "kubernetes_token_review" "example" {
+  audience = "example"
+  match {
+    namespace = "example"
+    service_account = "example"
+    profiles = ["example"]
+  }
 }
 ```
 

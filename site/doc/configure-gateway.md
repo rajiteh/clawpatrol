@@ -47,6 +47,11 @@ non-tailnet devices reach the gateway over Tailscale Funnel.
 Both blocks can coexist — peers from either transport land in the
 same MITM handler. Drop either block to disable that transport.
 
+For same-cluster Kubernetes deployments with stateless agent pods, use
+[Kubernetes Enrollment](/docs/kubernetes-enrollment/). That mode
+lets each pod self-register as a short-lived WireGuard peer using
+Kubernetes TokenReview while the execution container remains restricted.
+
 #### Required tailnet ACL
 
 The gateway routes client traffic by acting as their **Tailscale
@@ -90,6 +95,19 @@ wireguard {
   endpoint    = "wg.example.com:51820"    # advertised in client wg.conf
 }
 ```
+
+### WireGuard over a narrower path
+
+Peers that reach the gateway through a path with a smaller MTU than
+Ethernet, most commonly a Tailscale address (1280-byte interface),
+need no configuration. The gateway sends WireGuard packets in
+batches; if the kernel refuses a batch because the path cannot carry
+full-size segments, the gateway logs one line and switches to one
+datagram per send for that device, which the kernel then fragments
+as needed. Linux per-process clients do the same on their side. The
+symptom this replaces, on older versions, was a steady trickle of
+`sendmmsg: message too long` in the gateway log and transfers over
+about 16 KiB that never finished.
 
 ### Single-host (loopback) WireGuard
 

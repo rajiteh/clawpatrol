@@ -81,6 +81,12 @@ export type Integration = {
   // Zero/undefined for declared-only credentials that have never
   // been touched.
   updated_at?: number;
+  // Operator-readable failure reason from the credential plugin's
+  // last synchronous verification probe (e.g. Slack's
+  // "invalid_auth"). Present when the plugin has a verifier and the
+  // most recent probe failed; absent for verified-ok credentials and
+  // for plugins without a verifier.
+  verify_error?: string;
 };
 
 // tailscaleConnect asks the gateway for the live tsnet login URL.
@@ -107,13 +113,33 @@ export async function tailscaleDisconnect(disconnectURL: string): Promise<void> 
   if (!r.ok) throw new Error(await r.text());
 }
 
-export async function setCredentialSlots(id: string, slots: Record<string, string>): Promise<void> {
+// setCredentialSlots persists touched slots for a non-OAuth credential
+// and returns the backend's synchronous verification outcome. `verified`
+// is undefined when the plugin has no Verifier; true on a successful
+// probe; false (with `error`) when the probe rejected the saved
+// material so the connect form can surface the failure inline. When
+// the probe could not reach a verdict (provider unreachable, timeout,
+// 5xx) `unverified` is true, `error` starts with "could not verify:",
+// and the gateway keeps the credential's last known state; saving the
+// same values again re-runs the probe.
+export type SetCredentialResult = {
+  ok: boolean;
+  verified?: boolean;
+  unverified?: boolean;
+  error?: string;
+};
+
+export async function setCredentialSlots(
+  id: string,
+  slots: Record<string, string>,
+): Promise<SetCredentialResult> {
   const r = await fetch("/api/credentials/set", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ id, slots }),
   });
   if (!r.ok) throw new Error(await r.text());
+  return r.json();
 }
 
 export async function clearCredential(id: string): Promise<void> {
@@ -414,7 +440,10 @@ export type Whoami = {
 };
 
 export async function logout(): Promise<void> {
-  const r = await fetch("/__logout", { method: "POST", credentials: "same-origin" });
+  const r = await fetch("/__logout", {
+    method: "POST",
+    credentials: "same-origin",
+  });
   if (!r.ok && r.status !== 401) throw new Error(await r.text());
 }
 
@@ -426,7 +455,9 @@ export async function getStatus(profile?: string): Promise<Integration[]> {
 }
 
 export async function deleteAgent(ip: string): Promise<void> {
-  const r = await api(`/api/agents/delete?ip=${encodeURIComponent(ip)}`, { method: "POST" });
+  const r = await api(`/api/agents/delete?ip=${encodeURIComponent(ip)}`, {
+    method: "POST",
+  });
   if (!r.ok) throw new Error(await r.text());
 }
 
@@ -445,10 +476,35 @@ export type UpdateBanner = {
   advisory?: string;
 };
 
+// EnrolledPeer mirrors the backend enrolledPeerView bundled into
+// /api/state. Enrolled (self-registered) WireGuard peers are keyed by
+// their wg IP, same as an Agent — join on peer_ip === agent.ip. The
+// liveness window (keepalive_interval_seconds × reap_count) and the
+// missed-interval count are derived in the UI; last_rx_at is when the
+// gateway last saw the peer's rx advance.
+export type EnrolledPeer = {
+  peer_ip: string;
+  transport: string;
+  authorizer_type: string;
+  authorizer_name: string;
+  subject_key: string;
+  display_name: string;
+  owner: string;
+  profile: string;
+  public_key?: string;
+  metadata?: Record<string, string>;
+  created_at: string;
+  last_handshake?: string;
+  keepalive_interval_seconds?: number;
+  reap_count?: number;
+  last_rx_at?: string;
+};
+
 type StateResp = {
   whoami: Whoami;
   integrations: Integration[];
   agents: Agent[];
+  enrolled_peers?: EnrolledPeer[];
   update?: UpdateBanner | null;
   // Basename of the gateway config file (e.g. "gateway.hcl",
   // "dev.hcl"). Surfaced in UI hints so operators see the actual
@@ -541,6 +597,9 @@ export type EventRecord = {
   resp_sha?: string;
   req_body?: string;
   resp_body?: string;
+  req_body_state?: "complete" | "incomplete" | "aborted";
+  req_transformed?: boolean;
+  resp_body_state?: "complete" | "incomplete" | "aborted";
   req_headers?: Record<string, string>;
   resp_headers?: Record<string, string>;
   // family identifies which facet plugin emitted this event; facets
@@ -552,6 +611,9 @@ export type EventRecord = {
   // Download action button (site/doc/clawpatrol-test.md).
   endpoint?: string;
   rule?: string;
+  // credential is the bare name of the credential the gateway resolved
+  // for the request before matching; absent when none was resolved.
+  credential?: string;
   // approver/* are populated when action is "approved" or "denied":
   // the approver entity's HCL block name, plugin type
   // (human_approver / llm_approver / dashboard) and the per-approver

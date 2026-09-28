@@ -192,6 +192,7 @@ func TestRouteAuthRequirementsDocumentOnboardingBoundary(t *testing.T) {
 		{path: "/api/onboard/approve", want: authDashboardOrTailnetOperator, wantDashboardPublic: false, wantTailnetPublic: false},
 		{path: "/api/config", want: authDashboard, wantDashboardPublic: false, wantTailnetPublic: false},
 		{path: "/api/env-pushdown", want: authSelfAuthenticating, wantDashboardPublic: true, wantTailnetPublic: true},
+		{path: enrollmentRegisterPath, want: authSelfAuthenticating, wantDashboardPublic: true, wantTailnetPublic: true},
 		{path: "/api/hitl/operations/hitl_op_test/status", want: authSelfAuthenticating, wantDashboardPublic: true, wantTailnetPublic: true},
 		{path: "/info", want: authPublic, wantDashboardPublic: true, wantTailnetPublic: true},
 		{path: "/ca.crt", want: authPublic, wantDashboardPublic: true, wantTailnetPublic: true},
@@ -216,6 +217,36 @@ func TestRouteAuthRequirementsDocumentOnboardingBoundary(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Every method of a multi-method handler has its own row with the same auth.
+func TestRouteTableListsEnrollmentMethods(t *testing.T) {
+	w := newOnboardAuthTestWebMux(t)
+	methods := map[string]authRequirement{}
+	for _, route := range w.routes() {
+		if route.Path == enrollmentRegisterPath {
+			methods[route.Method] = route.Auth
+		}
+	}
+	for _, m := range []string{http.MethodPost, http.MethodDelete} {
+		if got, ok := methods[m]; !ok || got != authSelfAuthenticating {
+			t.Fatalf("%s %s: auth = %v, present = %t; want authSelfAuthenticating", m, enrollmentRegisterPath, got, ok)
+		}
+	}
+	// Building the mux must not register the shared path twice.
+	_ = w.handler()
+}
+
+func TestRouteAuthIndexRejectsConflictingAuth(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Fatal("conflicting auth for one path did not panic")
+		}
+	}()
+	routeAuthIndex([]webRoute{
+		{Method: http.MethodPost, Path: "/x", Auth: authPublic},
+		{Method: http.MethodDelete, Path: "/x", Auth: authDashboard},
+	})
 }
 
 func TestCredentialWebhookPrefixAuthPolicyIsSelfAuthenticating(t *testing.T) {
@@ -295,13 +326,29 @@ func TestOnboardApproveWithDashboardPasswordInTailscaleModeDoesNotRequireTailnet
 // any tailnet member (including tag:client whois "tagged-devices")
 // approve onboards. The fix requires an explicit allowlist match
 // on operator-class routes; the test config now reflects that.
+
+// withTailnetPeer makes w resolve a direct tailnet connection from
+// 100.64.0.9 to login via whois.
+func withTailnetPeer(w *webMux, login string) {
+	w.g.agents = &AgentRegistry{whoisOverride: func(ip string) *whoisResult {
+		if ip != "100.64.0.9" {
+			return nil
+		}
+		return &whoisResult{Node: whoisNode{StableID: "n1", HostName: "laptop"}, UserProfile: whoisProfile{LoginName: login}}
+	}}
+}
+
+func fromTailnetPeer(req *http.Request) {
+	req.RemoteAddr = "100.64.0.9:12345"
+}
+
 func TestOnboardApproveWithTailnetPrincipalInTailscaleModeReachesHandler(t *testing.T) {
 	w := newOnboardAuthTestWebMuxForControl(t, "tailscale")
 	w.g.cfg.Load().Settings.Tailscale.Operators = []string{"*@example.com"}
+	withTailnetPeer(w, "operator@example.com")
 	h := w.handler()
 	req := httptest.NewRequest(http.MethodPost, "/api/onboard/approve?code=NOPE&profile=default", nil)
-	req.RemoteAddr = "127.0.0.1:12345"
-	req.Header.Set("Tailscale-User-Login", "operator@example.com")
+	fromTailnetPeer(req)
 	rr := httptest.NewRecorder()
 
 	h.ServeHTTP(rr, req)
@@ -317,10 +364,10 @@ func TestOnboardApproveWithTailnetPrincipalInTailscaleModeReachesHandler(t *test
 func TestOnboardApproveWithTailnetPrincipalInDefaultTailscaleModeReachesHandler(t *testing.T) {
 	w := newOnboardAuthTestWebMuxForControl(t, "")
 	w.g.cfg.Load().Settings.Tailscale.Operators = []string{"*@example.com"}
+	withTailnetPeer(w, "operator@example.com")
 	h := w.handler()
 	req := httptest.NewRequest(http.MethodPost, "/api/onboard/approve?code=NOPE&profile=default", nil)
-	req.RemoteAddr = "127.0.0.1:12345"
-	req.Header.Set("Tailscale-User-Login", "operator@example.com")
+	fromTailnetPeer(req)
 	rr := httptest.NewRecorder()
 
 	h.ServeHTTP(rr, req)
@@ -342,12 +389,12 @@ func TestOnboardApproveWithTailnetPrincipalInDefaultTailscaleModeReachesHandler(
 func TestOnboardApproveRejectsTailnetPrincipalNotInOperators(t *testing.T) {
 	w := newOnboardAuthTestWebMuxForControl(t, "tailscale")
 	w.g.cfg.Load().Settings.Tailscale.Operators = []string{"*@example.com"}
-	h := w.handler()
-	req := httptest.NewRequest(http.MethodPost, "/api/onboard/approve?code=NOPE&profile=default", nil)
-	req.RemoteAddr = "127.0.0.1:12345"
 	// "tagged-devices" is the tsnet whois reply for a tag:client
 	// peer with no human identity attached.
-	req.Header.Set("Tailscale-User-Login", "tagged-devices")
+	withTailnetPeer(w, "tagged-devices")
+	h := w.handler()
+	req := httptest.NewRequest(http.MethodPost, "/api/onboard/approve?code=NOPE&profile=default", nil)
+	fromTailnetPeer(req)
 	rr := httptest.NewRecorder()
 
 	h.ServeHTTP(rr, req)
@@ -429,15 +476,37 @@ func TestDashboardAuthGateAllowsTailnetOperatorWhenAllowlisted(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			withTailnetPeer(w, tc.login)
 			req := httptest.NewRequest(http.MethodGet, "/api/status", nil)
-			req.RemoteAddr = "127.0.0.1:12345"
-			req.Header.Set("Tailscale-User-Login", tc.login)
+			fromTailnetPeer(req)
 			rr := httptest.NewRecorder()
 			h.ServeHTTP(rr, req)
 			if rr.Code != tc.want {
 				t.Fatalf("status = %d, want %d; body = %q", rr.Code, tc.want, rr.Body.String())
 			}
 		})
+	}
+}
+
+// Headers a `tailscale serve` hop would set carry no weight: a local
+// reverse proxy forwarding public traffic can present the same ones.
+// Identity comes only from a direct tailnet connection.
+func TestDashboardAuthGateIgnoresForwardedTailnetHeaders(t *testing.T) {
+	w := newOnboardAuthTestWebMuxForControl(t, "tailscale")
+	w.g.cfg.Load().Settings.Tailscale.Operators = []string{"alice@example.com"}
+	withTailnetPeer(w, "alice@example.com")
+	h := w.handler()
+
+	for _, remote := range []string{"127.0.0.1:1", "[::1]:1", "203.0.113.7:1"} {
+		req := httptest.NewRequest(http.MethodGet, "/api/status", nil)
+		req.RemoteAddr = remote
+		req.Header.Set("Tailscale-User-Login", "alice@example.com")
+		req.Header.Set("X-Forwarded-For", "100.64.0.9")
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, req)
+		if rr.Code != http.StatusForbidden {
+			t.Fatalf("%s: status = %d, want 403; body = %q", remote, rr.Code, rr.Body.String())
+		}
 	}
 }
 

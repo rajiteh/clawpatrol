@@ -54,6 +54,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 	"unsafe"
@@ -144,7 +145,9 @@ func runRun(args []string) {
 	// none is alive. Hello handshake happens inside daemonConnect.
 	ctrl, err := daemonConnect()
 	if err != nil {
-		fail("daemon connect: %v\n  (if this machine was joined with --whole-machine, run the command directly — `clawpatrol run` isn't needed; traffic already routes through the gateway)", err)
+		// Not a whole-machine join: that case returned above, so the
+		// old hint about it would only mislead here.
+		fail("daemon connect: %v", err)
 	}
 	defer func() { _ = ctrl.Close() }()
 
@@ -274,12 +277,13 @@ func runRun(args []string) {
 	// sup sock fd), fork the supervisor in the host netns. Absence
 	// (--no-auto-expose, unsupported arch) is non-fatal.
 	var relaySup *exec.Cmd
+	relayStderr := newLastLineWriter(os.Stderr)
 	if autoExpose {
 		if relayFDs, err := recvFDs(pSock, 3); err == nil {
 			notifyFile := os.NewFile(uintptr(relayFDs[0]), "seccomp-notify")
 			supSock := os.NewFile(uintptr(relayFDs[1]), "relay-sup-sock")
 			lbSock := os.NewFile(uintptr(relayFDs[2]), "relay-lb-sock")
-			if c, serr := spawnRelaySupervisor(notifyFile, supSock, lbSock); serr != nil {
+			if c, serr := spawnRelaySupervisor(notifyFile, supSock, lbSock, relayStderr); serr != nil {
 				fmt.Fprintf(os.Stderr, "warning: auto-expose relay: %v (webhooks won't be reachable from host, host loopback unreachable from wrapped cmd)\n", serr)
 			} else {
 				relaySup = c
@@ -300,12 +304,26 @@ func runRun(args []string) {
 		}
 	}()
 
-	waitErr := child.Wait()
-
-	if relaySup != nil && relaySup.Process != nil {
-		_ = relaySup.Process.Signal(syscall.SIGTERM)
-		_, _ = relaySup.Process.Wait()
+	// Wait on the wrapped child and the relay supervisor concurrently.
+	// Normally the child exits first and we SIGTERM the supervisor. If
+	// the supervisor exits first the relay is gone for the rest of the
+	// run: the worker has already removed its REDIRECT (#688), so the
+	// wrapped command keeps running with plain in-netns loopback. We
+	// reap the supervisor right away (no <defunct> lingering until the
+	// command ends), warn once with its last stderr line, and keep
+	// waiting on the child — its exit code is the run's exit code.
+	childDoneCh := make(chan error, 1)
+	go func() { childDoneCh <- child.Wait() }()
+	var supDoneCh chan error
+	if relaySup != nil {
+		supDoneCh = make(chan error, 1)
+		go func() { supDoneCh <- relaySup.Wait() }()
 	}
+	waitErr := awaitRunExit(childDoneCh, supDoneCh, relayExitGrace,
+		func() { _ = relaySup.Process.Signal(syscall.SIGTERM) },
+		func(supErr error) {
+			fmt.Fprintln(os.Stderr, relayExitWarning(supErr, relayStderr.LastLine()))
+		})
 
 	// Closing ctrl (via the deferred Close) tears the session down on
 	// the daemon side.
@@ -317,6 +335,109 @@ func runRun(args []string) {
 		}
 		fail("wait: %v", waitErr)
 	}
+}
+
+// relayExitGrace is how long runRun waits for the child's Wait to
+// report after the relay supervisor exits before treating the exit as
+// a relay failure rather than the tail of a normal shutdown.
+const relayExitGrace = 500 * time.Millisecond
+
+// awaitRunExit is runRun's wait/decision logic, factored out so it can
+// be tested with fake channels. childDone carries the wrapped child's
+// Wait result; supDone the relay supervisor's (nil when there is no
+// supervisor). Returns the child's Wait result — the child's exit is
+// always the run's exit.
+//
+//   - Child first: killSup is invoked and supDone drained.
+//   - Supervisor first: the normal cascade (child exits → seccomp filter
+//     empties → supervisor gets ENOENT and exits 0) can reach us before
+//     the child's own Wait does, so the child waiter gets grace to
+//     report. Only if it doesn't is warn called (once) with the
+//     supervisor's Wait result; either way we keep waiting on the
+//     child. The grace only delays the warning, never the run's exit.
+func awaitRunExit(childDone, supDone <-chan error, grace time.Duration, killSup func(), warn func(error)) error {
+	select {
+	case err := <-childDone:
+		if supDone != nil {
+			killSup()
+			<-supDone
+		}
+		return err
+	case supErr := <-supDone:
+		select {
+		case err := <-childDone:
+			return err
+		case <-time.After(grace):
+			warn(supErr)
+			return <-childDone
+		}
+	}
+}
+
+// relayLastLineMaxRunes caps the supervisor line quoted in
+// relayExitWarning so one runaway log line can't swamp the terminal.
+const relayLastLineMaxRunes = 200
+
+// relayExitWarning formats the one-line warning `clawpatrol run` prints
+// when the auto-expose relay supervisor exits while the wrapped command
+// is still running. waitErr is the supervisor's Wait result (nil for a
+// clean exit 0); lastLine is its final stderr line, quoted when present
+// so the operator sees the cause without tailing anything.
+func relayExitWarning(waitErr error, lastLine string) string {
+	var b strings.Builder
+	b.WriteString("⚠ clawpatrol run: auto-expose relay supervisor exited")
+	if waitErr != nil {
+		fmt.Fprintf(&b, " (%v)", waitErr)
+	}
+	b.WriteString("; port auto-expose and host-loopback forwarding are off for the rest of this run")
+	if lastLine != "" {
+		if r := []rune(lastLine); len(r) > relayLastLineMaxRunes {
+			lastLine = string(r[:relayLastLineMaxRunes]) + "…"
+		}
+		fmt.Fprintf(&b, "; last output: %q", lastLine)
+	}
+	return b.String()
+}
+
+// lastLineWriter tees writes to w while keeping a bounded tail so the
+// last line a child wrote can be retrieved after it exits. Live output
+// still streams through in real time; a chatty child can't grow the
+// buffer past lastLineMaxBytes.
+type lastLineWriter struct {
+	mu  sync.Mutex
+	buf []byte
+	w   io.Writer
+}
+
+const lastLineMaxBytes = 4096
+
+func newLastLineWriter(w io.Writer) *lastLineWriter {
+	return &lastLineWriter{w: w}
+}
+
+func (l *lastLineWriter) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	l.buf = append(l.buf, p...)
+	if len(l.buf) > lastLineMaxBytes {
+		l.buf = l.buf[len(l.buf)-lastLineMaxBytes:]
+	}
+	l.mu.Unlock()
+	if l.w == nil {
+		return len(p), nil
+	}
+	return l.w.Write(p)
+}
+
+// LastLine returns the trailing non-empty line with surrounding
+// whitespace stripped, or "" if nothing was captured.
+func (l *lastLineWriter) LastLine() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	s := strings.TrimRight(string(l.buf), "\r\n \t")
+	if i := strings.LastIndexAny(s, "\r\n"); i >= 0 {
+		s = s[i+1:]
+	}
+	return strings.TrimSpace(s)
 }
 
 // runWholeMachineDirect handles `clawpatrol run <cmd>` on a
@@ -613,17 +734,51 @@ func readLenPrefixed(br *bufio.Reader, tag string, maxLen int) (int, error) {
 	return n, nil
 }
 
+// daemonClientWaitAttached blocks on the daemon's post-handoff reply.
+// Two valid frames:
+//   - "ATTACHED\n" — gVisor stack is wired up AND the transport's
+//     WaitReady fired green, so the child can exec into a working
+//     tunnel right away.
+//   - "READYERR <n>\n<n bytes>" — the daemon couldn't confirm
+//     transport readiness within daemonReadyTimeout (handshake
+//     stalled, exit-node ACL missing, etc). We surface the body as
+//     the error so `clawpatrol run` exits with the actual reason
+//     instead of "expected ATTACHED, got ..." gibberish.
+//
+// The deadline is daemonReadyTimeout + buffer so the wrapper's read
+// outlasts the daemon's own WaitReady budget; a bare 5s window (the
+// pre-WaitReady value) would expire before the daemon could even
+// report the timeout.
 func daemonClientWaitAttached(ctrl net.Conn, br *bufio.Reader) error {
-	_ = ctrl.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_ = ctrl.SetReadDeadline(time.Now().Add(daemonReadyTimeout + 5*time.Second))
 	defer func() { _ = ctrl.SetReadDeadline(time.Time{}) }()
 	line, err := br.ReadString('\n')
 	if err != nil {
 		return err
 	}
-	if strings.TrimRight(line, "\r\n") != "ATTACHED" {
+	line = strings.TrimRight(line, "\r\n")
+	switch {
+	case line == "ATTACHED":
+		return nil
+	case strings.HasPrefix(line, "READYERR "):
+		var n int
+		if _, err := fmt.Sscanf(line[len("READYERR "):], "%d", &n); err != nil {
+			return fmt.Errorf("parse READYERR length: %w", err)
+		}
+		if n < 0 || n > 4096 {
+			return fmt.Errorf("READYERR length %d out of range", n)
+		}
+		if n == 0 {
+			return fmt.Errorf("daemon transport not ready")
+		}
+		body := make([]byte, n)
+		if _, err := io.ReadFull(br, body); err != nil {
+			return fmt.Errorf("read READYERR body: %w", err)
+		}
+		return fmt.Errorf("daemon transport not ready: %s", string(body))
+	default:
 		return fmt.Errorf("expected ATTACHED, got %q", line)
 	}
-	return nil
 }
 
 // --- capability manipulation -------------------------------------------------
@@ -805,8 +960,13 @@ func checkUserNS() {
 	}
 	if b, err := os.ReadFile("/proc/sys/kernel/apparmor_restrict_unprivileged_userns"); err == nil {
 		if strings.TrimSpace(string(b)) == "1" {
-			fmt.Fprintf(os.Stderr, "warning: AppArmor may block TUN in user namespaces.\n"+
-				"  if `clawpatrol run` fails: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0\n")
+			self, _ := os.Executable()
+			fmt.Fprintf(os.Stderr, "warning: AppArmor restricts unprivileged user namespaces on this host (Ubuntu 24.04 default).\n"+
+				"  If `clawpatrol run` fails, either give this user passwordless sudo (clawpatrol then\n"+
+				"  sets the namespace up as root and needs no user namespace), or grant this binary\n"+
+				"  the userns permission with an AppArmor profile:\n"+
+				"    https://clawpatrol.dev/docs/cli/#ubuntu-2404-and-apparmor\n"+
+				"  (binary: %s)\n", self)
 		}
 	}
 }

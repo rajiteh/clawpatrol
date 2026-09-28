@@ -77,13 +77,19 @@ clawpatrol login [flags]
 Run a command with its traffic routed through the joined gateway.
 
 ```bash
-clawpatrol run [--conf <path>] -- <command> [args...]
+clawpatrol run -- <command> [args...]
 ```
 
-`--conf` points at the WG conf written by `clawpatrol join`; defaults
-to the standard location so you rarely need it. On Linux the wrapped
+`run` reads the WG conf that `clawpatrol join` wrote to the standard
+location; there is no flag to point it elsewhere. On Linux the wrapped
 command runs in an unprivileged user namespace with a private WG
 tunnel; on macOS the Network Extension does the capture.
+
+Linux only, and only on the no-`sudo` path described below:
+`--no-auto-expose` (before the `--`) disables the loopback relay that
+mirrors TCP listeners inside the namespace back to the host and
+forwards the wrapped command's connections to 127.0.0.1 out to host
+services. macOS does not parse it.
 
 ```bash
 clawpatrol run -- claude
@@ -141,6 +147,82 @@ If you're on the unprivileged path and a command needs to act as root:
   It routes traffic at the host level instead of per-process, so the
   command runs in the normal host environment where `sudo` works —
   you run it directly, not through `clawpatrol run`.
+
+#### Ubuntu 24.04 and AppArmor
+
+Ubuntu 24.04 ships with `kernel.apparmor_restrict_unprivileged_userns=1`,
+which denies unprivileged user namespaces to any program that has no
+AppArmor profile granting them. `clawpatrol run` then prints a
+warning and, without passwordless `sudo`, fails to build its
+namespace. Two ways to run without turning that protection off for
+the whole system:
+
+- **Passwordless `sudo` for the invoking user.** clawpatrol uses the
+  privileged setup path described above and never creates a user
+  namespace. This is the simplest option on a single-user machine.
+- **An AppArmor profile for the clawpatrol binary.** This is the
+  mechanism Ubuntu uses for its own browsers. The profile attaches
+  by path, and whatever sits at that path runs with the `userns`
+  grant, so put the binary somewhere only root can write (for
+  example `/usr/local/bin/clawpatrol`) and name that exact path; a
+  glob over home directories would hand the grant to any file a
+  user drops there. Create `/etc/apparmor.d/clawpatrol`:
+
+  ```
+  abi <abi/4.0>,
+  include <tunables/global>
+
+  profile clawpatrol /usr/local/bin/clawpatrol flags=(unconfined) {
+    userns,
+    include if exists <local/clawpatrol>
+  }
+  ```
+
+  then load it with `sudo apparmor_parser -r /etc/apparmor.d/clawpatrol`.
+  The profile is unconfined apart from granting `userns`, so it
+  changes nothing else about how clawpatrol runs; it has to be
+  reloaded if the binary moves. The warning prints the path of the
+  binary that is running.
+
+Setting `kernel.apparmor_restrict_unprivileged_userns=0` also works
+but removes the restriction for every program on the host, which is
+what it exists to prevent.
+
+### `clawpatrol bridge`
+
+Run the resident Linux data plane used by Kubernetes agent pods. The
+bridge self-enrolls through a configured authorizer, creates a userspace
+WireGuard tunnel, routes the pod network namespace through the gateway,
+and writes the environment and CA handoff files consumed by the
+unprivileged workload container.
+
+```bash
+clawpatrol bridge \
+  --gateway-url=http://clawpatrol-api.clawpatrol.svc:8080 \
+  --authorizer=kubernetes_token_review/agents
+```
+
+| Flag | Default | Notes |
+|---|---|---|
+| `--gateway-url URL` | required | Gateway API URL used for enrollment and env pushdown |
+| `--authorizer TYPE/NAME` | required | Enrollment provider and configured authorizer, for example `kubernetes_token_review/agents` |
+| `--kubernetes-token-path PATH` | `/var/run/secrets/tokens/clawpatrol-token` | Projected ServiceAccount token presented by the Kubernetes enrollment provider |
+| `--env-out PATH` | `/clawpatrol/env` | Shell exports written for the workload container |
+| `--ca-out PATH` | `/clawpatrol/ca.crt` | Gateway CA bundle written for the workload container |
+| `--ready-file PATH` | `/clawpatrol/ready` | Marker written after tunnel and handoff setup succeed |
+| `--iface NAME` | `clawpatrol0` | TUN interface name |
+| `--mtu N` | `1420` | Requested TUN MTU; the gateway's enrollment response can override it |
+| `--local-reset-missed N` | `2` | Failed liveness probes before rebuilding the peer in place; `0` disables the local reset stage |
+| `--route-proto PROTO` | `111` | Route protocol tag on the underlay routes in the bridge's routing table |
+| `--egress-filter on\|off` | `on` | `on` loads an nftables filter that lets Pod traffic leave only through the tunnel, as the bridge's marked traffic, or as replies; bring-up fails if the filter cannot load. `off` skips it |
+| `--fwmark N` | `111` | Socket mark on the bridge's own gateway, DNS, and WireGuard traffic, and the ID of the routing table that sends marked packets to the underlay |
+
+The bridge needs `NET_ADMIN`, `/dev/net/tun`, the projected token, and
+the downward-API `POD_NAME`, `POD_NAMESPACE`, and `POD_UID` environment
+variables. It remains in the foreground, heals a failed tunnel in
+process, and best-effort deregisters on shutdown. See
+[Kubernetes Enrollment](kubernetes-enrollment) for the complete pod
+contract, gateway configuration, and lifecycle.
 
 ### `clawpatrol test`
 

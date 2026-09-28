@@ -55,6 +55,12 @@ type onboardSession struct {
 	profile     string // profile assigned at approval time
 	hostname    string // client-supplied (os.Hostname) at /api/onboard/start
 	apiToken    string // per-peer bearer for gated client API calls (env-pushdown)
+	// delivered is set once the approved auth material has been
+	// handed to a poller. The device code is a bearer capability for
+	// one joining client, so the material goes out exactly once; a
+	// later poll gets expired_token, and a client that lost the
+	// response re-runs join.
+	delivered bool
 	// wholeMachine: client asked at /start to install a persistent tailnet
 	// node (system tailscale on linux, NE-routed on macOS) rather than
 	// per-process tsnet. Determines whether the minted auth key is
@@ -500,6 +506,7 @@ func (r *onboardRegistry) ForgetIP(ip string) {
 	delete(r.profileByIP, ip)
 	delete(r.extV4ByIP, ip)
 	delete(r.extV6ByIP, ip)
+	delete(r.knownDeviceIPs, ip)
 	// Drop the IP from the alias graph too — both as an alias and as a
 	// canonical. Otherwise a stale alias outlives the device and, after
 	// IP reuse, AssignProfile's alias fan-out could re-stamp a profile
@@ -905,10 +912,18 @@ func (w *webMux) apiOnboardApprove(rw http.ResponseWriter, r *http.Request) {
 			w.onboard.mu.Unlock()
 			return
 		}
-		s.authKey = key
-		s.loginServer = loginServer
 		dc := s.deviceCode
 		w.onboard.mu.Unlock()
+		// Publish the key last, after the peer is claimed and its api
+		// token minted below. The poll hands the material out exactly
+		// once; a poll landing between key and token would deliver a
+		// key with no token, and the client would have to re-join.
+		defer func() {
+			w.onboard.mu.Lock()
+			s.authKey = key
+			s.loginServer = loginServer
+			w.onboard.mu.Unlock()
+		}()
 		// WG path: server allocated peerIP and knows the approver, so
 		// register the (ip → owner) mapping right here. Saves the CLI
 		// from making a /api/onboard/claim round-trip after wg-quick
@@ -1065,8 +1080,8 @@ func (w *webMux) retirePlaceholderForClaim(dc, realIP string) {
 	if w.g.agents != nil {
 		w.g.agents.Delete(placeholderID)
 	}
-	if w.g.db != nil {
-		_, _ = w.g.db.Exec("DELETE FROM peer_api_tokens WHERE peer_ip = ?", placeholderID)
+	if err := deletePeerAPITokensForIP(w.g.db, placeholderID); err != nil {
+		log.Printf("onboard: retire placeholder api tokens for %s: %v", placeholderID, err)
 	}
 }
 
@@ -1170,6 +1185,11 @@ func (w *webMux) apiOnboardPoll(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, map[string]string{"error": "slow_down"})
 		return
 	}
+	if s.delivered {
+		writeJSON(rw, map[string]string{"error": "expired_token", "detail": "auth material already delivered; re-run clawpatrol join"})
+		return
+	}
+	s.delivered = true
 	resp := map[string]any{
 		"auth_key":     s.authKey,
 		"api_token":    s.apiToken,

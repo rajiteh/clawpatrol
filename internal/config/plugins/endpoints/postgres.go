@@ -299,7 +299,11 @@ func (PostgresEndpointRuntime) HandleConn(ctx context.Context, ch *runtime.ConnH
 	// Step 5 + 6: drive upstream auth, replay post-auth to agent.
 	postAuth, err := pgPerformAuth(upstream, realUser, realPassword)
 	if err != nil {
-		pgWriteError(ch.Conn, "upstream auth: "+err.Error())
+		// The upstream's own error text names the real user and often
+		// the database or host; the agent must not learn either. Log
+		// the detail for the operator, send a generic failure.
+		log.Printf("pg-upstream-auth %s: credential %q: %v", ch.PeerIP, cc.Credential.Symbol.Name, err)
+		pgWriteError(ch.Conn, "upstream authentication failed (details in the gateway log)")
 		return err
 	}
 	if err := pgWriteAuthOK(ch.Conn, postAuth); err != nil {
@@ -579,7 +583,8 @@ func pgHandleOversizeFrame(ch *runtime.ConnHandle, upstream net.Conn, credName, 
 		}
 		pgWriteDeny(ch.Conn, reason)
 		emit(ch, runtime.ConnEvent{
-			Action: "deny", Reason: reason, Summary: summary, Facets: facets,
+			Credential: credName,
+			Action:     "deny", Reason: reason, Summary: summary, Facets: facets,
 		})
 		log.Printf("pg-deny-truncated %s: %s", ch.PeerIP, reason)
 		return rest, true
@@ -594,7 +599,8 @@ func pgHandleOversizeFrame(ch *runtime.ConnHandle, upstream net.Conn, credName, 
 		}
 	}
 	emit(ch, runtime.ConnEvent{
-		Action: "allow-overflow", Summary: summary, Facets: facets,
+		Credential: credName,
+		Action:     "allow-overflow", Summary: summary, Facets: facets,
 	})
 	return rest, true
 }
@@ -674,7 +680,8 @@ func pgEvaluateInfo(ch *runtime.ConnHandle, info pgInfo, credName, database stri
 		// recorded).
 		if !shadow {
 			emit(ch, runtime.ConnEvent{
-				Action: "allow", Verb: info.Verb, Summary: summary, Facets: facets,
+				Credential: credName,
+				Action:     "allow", Verb: info.Verb, Summary: summary, Facets: facets,
 			})
 		}
 		return "", ""
@@ -690,7 +697,8 @@ func pgEvaluateInfo(ch *runtime.ConnHandle, info pgInfo, credName, database stri
 	if len(cr.Outcome.Approve) > 0 {
 		if ch.Approve == nil {
 			emit(ch, runtime.ConnEvent{
-				Action: "deny", Reason: "HITL not configured",
+				Credential: credName,
+				Action:     "deny", Reason: "HITL not configured",
 				Verb: info.Verb, Summary: summary, Facets: facets, Rule: rule,
 			})
 			return "deny", "approval required but HITL is not configured"
@@ -705,7 +713,8 @@ func pgEvaluateInfo(ch *runtime.ConnHandle, info pgInfo, credName, database stri
 				reason = "denied by approver"
 			}
 			emit(ch, runtime.ConnEvent{
-				Action: "denied", Reason: reason,
+				Credential: credName,
+				Action:     "denied", Reason: reason,
 				Verb: info.Verb, Summary: summary, Facets: facets, Rule: rule,
 				Approver: v.ApproverName, ApproverType: v.ApproverType, ApproverBy: v.By,
 			})
@@ -713,7 +722,9 @@ func pgEvaluateInfo(ch *runtime.ConnHandle, info pgInfo, credName, database stri
 		}
 		if !shadow {
 			emit(ch, runtime.ConnEvent{
-				Action: "approved", Verb: info.Verb, Summary: summary, Facets: facets, Rule: rule,
+				Credential: credName,
+				Action:     "approved", Reason: v.Reason,
+				Verb: info.Verb, Summary: summary, Facets: facets, Rule: rule,
 				Approver: v.ApproverName, ApproverType: v.ApproverType, ApproverBy: v.By,
 			})
 		}
@@ -726,14 +737,16 @@ func pgEvaluateInfo(ch *runtime.ConnHandle, info pgInfo, credName, database stri
 			reason = "denied by policy"
 		}
 		emit(ch, runtime.ConnEvent{
-			Action: "deny", Reason: reason,
+			Credential: credName,
+			Action:     "deny", Reason: reason,
 			Verb: info.Verb, Summary: summary, Facets: facets, Rule: rule,
 		})
 		return "deny", reason
 	}
 	if !shadow {
 		emit(ch, runtime.ConnEvent{
-			Action: "allow", Verb: info.Verb, Summary: summary, Facets: facets, Rule: rule,
+			Credential: credName,
+			Action:     "allow", Verb: info.Verb, Summary: summary, Facets: facets, Rule: rule,
 		})
 	}
 	return "", ""
@@ -765,19 +778,47 @@ func pgWriteError(conn net.Conn, reason string) {
 	_, _ = conn.Write(msg)
 }
 
+// pgSummary renders the one-line event / HITL description for a
+// statement. The uppercased verb is prepended unless the statement
+// text already opens with it — otherwise "NOTIFY NOTIFY chan" shows
+// up on every card. Statements that don't start with their verb keep
+// the prefix: a WITH-CTE whose verb is the inner DML, or the shadow
+// sub-statements visitCTEs synthesises, whose Statement is just the
+// CTE name.
 func pgSummary(info pgInfo) string {
-	parts := []string{strings.ToUpper(info.Verb)}
+	var parts []string
+	if info.Verb != "" && !sqlStatementStartsWithVerb(info.Statement, info.Verb) {
+		parts = append(parts, strings.ToUpper(info.Verb))
+	}
 	if len(info.Tables) > 0 {
 		parts = append(parts, "tables=["+strings.Join(info.Tables, ",")+"]")
 	}
-	if info.Statement != "" {
-		s := info.Statement
+	if s := strings.TrimSpace(info.Statement); s != "" {
 		if len(s) > 80 {
 			s = s[:80] + "..."
 		}
 		parts = append(parts, s)
 	}
 	return strings.Join(parts, " ")
+}
+
+// sqlStatementStartsWithVerb reports whether stmt's first word is verb
+// (case-insensitive, ignoring leading whitespace).
+func sqlStatementStartsWithVerb(stmt, verb string) bool {
+	stmt = strings.TrimLeft(stmt, " \t\r\n")
+	if verb == "" || len(stmt) < len(verb) || !strings.EqualFold(stmt[:len(verb)], verb) {
+		return false
+	}
+	if len(stmt) == len(verb) {
+		return true
+	}
+	return !sqlIdentByte(stmt[len(verb)])
+}
+
+// sqlIdentByte reports whether b can continue an SQL identifier or
+// keyword, so "NOTIFYX" does not count as starting with NOTIFY.
+func sqlIdentByte(b byte) bool {
+	return b == '_' || b >= '0' && b <= '9' || b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z'
 }
 
 func pgUpstreamAddr(ep *config.CompiledEndpoint) string {

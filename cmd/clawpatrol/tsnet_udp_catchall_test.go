@@ -60,10 +60,10 @@ func newTestDNSVIP(t *testing.T) *dnsvip.Allocator {
 	return a
 }
 
-// tsnetUDPDisposition: UDP/53 → dnsvip; UDP/443 to an intercepted (VIP'd)
-// host → drop (force HTTPS to the TCP MITM); UDP/443 to a pass-through
-// host is NOT dropped (we don't intercept it); other UDP from an
-// onboarded peer → relay; the rest → tsnet's default handler.
+// tsnetUDPDisposition: UDP/53 → dnsvip; UDP/443 → drop for every
+// destination (QUIC is never inspected, so HTTPS must take the TCP
+// MITM path); other UDP from an onboarded peer → relay; the rest →
+// tsnet's default handler.
 func TestTsnetUDPDisposition(t *testing.T) {
 	r := newOnboardRegistry()
 	r.knownDeviceIPs["100.64.0.2"] = true
@@ -85,8 +85,8 @@ func TestTsnetUDPDisposition(t *testing.T) {
 		{"dns stranger", mk(pub, 53), stranger, udpDNS},
 		{"quic to intercepted VIP dropped", mk(vip, 443), onboarded, udpDrop},
 		{"quic to intercepted VIP dropped (stranger)", mk(vip, 443), stranger, udpDrop},
-		{"quic to pass-through relayed", mk(pub, 443), onboarded, udpRelay},
-		{"quic to pass-through not relayed for stranger", mk(pub, 443), stranger, udpPassthrough},
+		{"quic to pass-through dropped too", mk(pub, 443), onboarded, udpDrop},
+		{"quic to pass-through dropped for stranger", mk(pub, 443), stranger, udpDrop},
 		{"ntp onboarded relayed", mk(pub, 123), onboarded, udpRelay},
 		{"ntp stranger passthrough", mk(pub, 123), stranger, udpPassthrough},
 	}
@@ -96,10 +96,73 @@ func TestTsnetUDPDisposition(t *testing.T) {
 		}
 	}
 
-	// Without a dnsvip there's no VIP table, so UDP/443 isn't dropped —
-	// it relays for onboarded peers like any other UDP.
+	// The QUIC drop does not depend on the VIP table: it holds with
+	// no dnsvip at all.
 	g2 := &Gateway{onboard: r}
-	if got := g2.tsnetUDPDisposition(mk(vip, 443), onboarded); got != udpRelay {
-		t.Errorf("443 w/o dnsvip from onboarded: disposition = %d, want relay", got)
+	if got := g2.tsnetUDPDisposition(mk(vip, 443), onboarded); got != udpDrop {
+		t.Errorf("443 w/o dnsvip from onboarded: disposition = %d, want drop", got)
+	}
+}
+
+// udpPortDisposition is the one port decision both transports consume:
+// the tsnet catch-all through tsnetUDPDisposition, the WireGuard
+// forwarder and the Linux run daemon through refuseUDPPort (their
+// pre-endpoint gate) plus the udpDNS check in runGateway's udpDispatch.
+// Pin the table, then check every consumer agrees with it port by port
+// so the QUIC refusal can never hold on one transport and not the other.
+func TestUDPPortDisposition(t *testing.T) {
+	want := map[uint16]udpDisposition{
+		53:    udpDNS,
+		443:   udpDrop,
+		0:     udpRelay,
+		123:   udpRelay, // NTP
+		853:   udpRelay, // DoQ is not QUIC-on-443; it relays like any UDP
+		4433:  udpRelay, // alternate QUIC ports are not refused (documented)
+		8443:  udpRelay, // https authority on :8443 is MITM'd on TCP only
+		5353:  udpRelay, // mDNS
+		65535: udpRelay,
+	}
+	for port, d := range want {
+		if got := udpPortDisposition(port); got != d {
+			t.Errorf("udpPortDisposition(%d) = %d, want %d", port, got, d)
+		}
+	}
+
+	r := newOnboardRegistry()
+	r.knownDeviceIPs["100.64.0.2"] = true
+	g := &Gateway{onboard: r, dnsvip: newTestDNSVIP(t)}
+	onboarded := netip.MustParseAddr("100.64.0.2")
+	stranger := netip.MustParseAddr("100.99.99.99")
+	for _, dst := range []netip.Addr{
+		netip.MustParseAddr("10.78.1.2"), // VIP
+		netip.MustParseAddr("8.8.8.8"),   // public
+		netip.MustParseAddr("2001:db8::1"),
+	} {
+		for port := range want {
+			refused := refuseUDPPort(port)
+			if refused != (udpPortDisposition(port) == udpDrop) {
+				t.Errorf("refuseUDPPort(%d) = %v disagrees with udpPortDisposition", port, refused)
+			}
+			for _, src := range []netip.Addr{onboarded, stranger} {
+				got := g.tsnetUDPDisposition(netip.AddrPortFrom(dst, port), src)
+				if (got == udpDrop) != refused {
+					t.Errorf("tsnetUDPDisposition(%s:%d from %s) = %d but refuseUDPPort = %v: transports disagree",
+						dst, port, src, got, refused)
+				}
+				if udpPortDisposition(port) == udpDNS && got != udpDNS {
+					t.Errorf("tsnetUDPDisposition(%s:%d from %s) = %d, want udpDNS", dst, port, src, got)
+				}
+			}
+		}
+	}
+
+	gInspect := gatewayWithPolicy(t, `
+defaults { unknown_host = "inspect" }
+endpoint "https" "unknown" { hosts = [] }
+profile "default" { credentials = [] }
+`)
+	gInspect.onboard = r
+	if got := gInspect.tsnetUDPDisposition(netip.AddrPortFrom(netip.MustParseAddr("8.8.8.8"), 443), onboarded); got != udpDrop {
+		t.Errorf("inspect UDP/443: disposition = %d, want drop", got)
 	}
 }

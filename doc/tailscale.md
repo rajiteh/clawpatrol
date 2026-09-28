@@ -34,15 +34,32 @@ no subnet allocation — Tailscale's control plane handles all of that.
    and relays other UDP from onboarded peers via `relayUDP` — so a
    tsnet-mode `clawpatrol run` child gets arbitrary UDP (NTP, custom
    protocols) without a UDP-over-TCP shim, since the userspace exit node
-   already receives the datagrams. **QUIC / HTTP-3 (UDP/443) to an
-   intercepted host is dropped** in both modes so HTTPS can't ride UDP
-   past the TCP/443 SNI-peek MITM — the client falls back to
-   interceptable TCP. UDP/443 to a host the gateway *passes through* (no
-   VIP) is relayed normally: clawpatrol doesn't intercept that host's
-   HTTPS either, so there's nothing to bypass and no reason to break its
-   HTTP/3. For the hosts it does MITM, the gateway also strips the
-   `Alt-Svc` response header so agents don't discover h3 in the first
-   place (intercepted names already return no SVCB/HTTPS DNS record).
+   already receives the datagrams. **QUIC / HTTP-3 (UDP/443) is refused for every
+   destination** in both modes, so HTTPS can't ride UDP past the
+   TCP/443 SNI-peek MITM. The refusal is an ICMP port unreachable
+   sourced from the original destination (the flow is rejected before
+   a netstack endpoint exists), so the client's connected UDP socket
+   fails with `ECONNREFUSED` and it falls back to interceptable TCP at
+   once rather than after its own handshake timeout. The refusal is
+   unconditional because plain `https` endpoints are dispatched by SNI
+   and carry no VIP, so a per-destination rule would miss exactly the
+   hosts that have rules. Pass-through hosts lose HTTP/3 too (and
+   anything else on UDP/443, such as DTLS or TURN on that port). The
+   port decision itself is one helper, `udpPortDisposition`, consumed
+   by the WireGuard forwarder, the tsnet catch-all and the Linux
+   `clawpatrol run` daemon (which refuses UDP/443 locally, since its
+   datagram relay cannot carry the gateway's ICMP back to the wrapped
+   process). For the hosts it MITMs, the gateway also strips the
+   `Alt-Svc` response header so agents don't try h3 in the first
+   place, and the DNS relay answers HTTPS/SVCB queries NODATA for every
+   name (not only VIP'd ones), so agents learn neither `alpn=h3` nor
+   the origin's `ech=` config — the latter would let a client present
+   the provider's public name as SNI, which is what the MITM dispatches
+   on. That covers DNS the relay sees; a client resolving over DoH/DoT
+   to a passed-through resolver can still obtain the record, and real
+   ECH is indistinguishable from the GREASE ECH browsers always send,
+   so `unknown_host = "deny"` remains the backstop against an outer
+   SNI the policy does not know.
 5. Device identity (hostname, OS, Tailscale user) is populated via
    `tailscale whois` at first connection — richer than WireGuard mode
    which only captures hostname at join time.

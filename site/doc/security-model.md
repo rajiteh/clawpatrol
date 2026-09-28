@@ -71,11 +71,34 @@ Per protocol:
   agent. The agent never participates in auth and never sees the
   credential.
 - **Non-credentialled traffic** (public web, DNS) — forwarded
-  unchanged.
+  unchanged, with one exception: UDP/443 (QUIC) is refused for every
+  destination, because HTTP/3 cannot be inspected and would carry an
+  intercepted host's traffic past its rules. The refusal is an ICMP
+  port unreachable, so clients see a connection refused and fall back
+  to TCP/443 immediately. The refusal is keyed on port 443 only: an
+  `https` endpoint whose authority names another port (`host:8443`)
+  is intercepted on TCP/8443, but UDP to that port is relayed like
+  any other UDP, so an origin that advertises HTTP/3 on the same
+  alternate port (an HTTPS DNS record with `alpn=h3`, or `Alt-Svc`
+  on a connection the gateway does not terminate) could be reached
+  over QUIC there without inspection.
 
 Non-credentialled traffic is outside the security surface. If the
 agent bypasses the tunnel, it gets the same internet it would have
 without Claw Patrol — no credential leaks, just no protection.
+
+`defaults.unknown_host` decides what happens to HTTPS whose SNI
+matches no declared endpoint: `passthrough` (default) splices it
+unchanged, `deny` hangs up at the ClientHello, and `inspect`
+terminates TLS with the same local CA and runs the request through
+the rules of a declared `endpoint "https" "unknown"`. Inspect is a
+policy choice, not a credential path: no credential can be bound to
+`https.unknown` (the compiler rejects it), so an inspected request
+is always forwarded exactly as the agent sent it, and the agent's
+traffic to every unmatched host becomes visible in the action log
+and body captures. Connections the gateway cannot read as HTTP/1.1
+over the minted certificate (no SNI, ECH outer names it cannot
+serve, h2-only ALPN, non-HTTP protocols on 443) are closed.
 
 ### Leaked join credential
 
@@ -93,6 +116,44 @@ disable them or deploy a stable prefix scheme. And an attacker on
 the same NAT shares the public v4, so pinning isn’t a standalone
 defence; it’s a blast-radius limiter for credentials that have
 already escaped.
+
+## Kubernetes enrollment (agent pods)
+
+Kubernetes enrollment is a remote-mode variant for stateless
+agent pods. The gateway and agents run in the same cluster, and each
+agent pod self-registers as a short-lived WireGuard peer using a
+projected ServiceAccount token. There is no durable join credential
+and no human approval step for each pod; authorization comes from
+Kubernetes TokenReview plus the gateway's enrollment allowlist.
+
+The pod has two different trust zones:
+
+- The **WireGuard sidecar init container** holds the pod networking
+  grants: `NET_ADMIN` and `/dev/net/tun`. It does not run as a
+  privileged container. It also holds the projected ServiceAccount
+  token, the WireGuard private key in memory, and the peer API token
+  used for env pushdown.
+- The **agent container** is the sandboxed execution environment. It
+  should drop all capabilities, and have no Kubernetes API token, no
+  `/dev/net/tun`, and only a read-only mount of the shared handoff
+  volume. The sidecar sends its own control-plane traffic around the
+  tunnel with a socket mark; `NET_ADMIN` or `NET_RAW` would let the
+  agent set that mark too.
+
+The shared volume is intentionally narrow. The sidecar writes the CA
+bundle, env exports, and `/clawpatrol/ready`; it must not write the
+WireGuard private key or peer API token where the agent can read them.
+The gateway also derives the pod's profile from the live Pod label,
+not from a client-submitted field, so an agent cannot choose a more
+privileged profile by changing the registration request.
+
+This is still a pod-level network boundary: the sidecar changes routes
+for the whole pod network namespace, so the agent's traffic goes
+through the tunnel once setup is complete. The security bar is that
+the execution container does not receive the Kubernetes token, routing
+capabilities, peer API token, WireGuard private key, gateway
+state, or upstream credentials. Management APIs remain protected by
+the same app-layer dashboard auth described below.
 
 ## Local mode
 
@@ -142,6 +203,34 @@ helpers, cloud CLI configs, SSH keys. These are outside Claw
 Patrol’s control. Onboarding offers to import recognised
 credentials and delete the originals; anything not recognised or
 not migrated stays readable to the agent.
+
+### Secrets at rest
+
+Everything the gateway needs across restarts lives in `state_dir`,
+mostly in `clawpatrol.db`. That file holds, in plaintext: the MITM CA
+private key, the WireGuard server key, OAuth access and refresh
+tokens, and every credential value pasted into the dashboard. The
+dashboard root password and per-device API tokens are stored as
+hashes. There is no application-level encryption; file permissions
+are the defense. The gateway creates `state_dir` mode `0700` and
+warns at startup when it finds it looser.
+
+Consequences for operators:
+
+- Anyone who can read `state_dir` as the gateway user or root holds
+  every injected credential and can mint certificates the agents
+  trust. Run the gateway under a dedicated user with no other role.
+- Backups, disk snapshots, and copies of `clawpatrol.db` are as
+  sensitive as the live file. Encrypt them, or exclude the state
+  directory and re-enter credentials after a restore.
+- Full-disk encryption on the gateway host covers the stolen-disk
+  case; it does not help against a process running as the gateway
+  user.
+
+Encrypting the sensitive columns with an operator-held key is a
+possible future hardening; it would move the problem to where that
+key lives rather than remove it, which is why it has not been
+prioritised over the controls above.
 
 ## Dashboard and management API
 
@@ -408,6 +497,16 @@ over a side channel it opens outside the tunnel; if that is in your
 threat model, use whole-machine mode or an external network egress
 control.
 
+The same holds for everything else on the client host. `clawpatrol
+run` is not a sandbox: the wrapped process runs as your OS user and
+can read whatever that user can read — files, the environment of the
+shell it was launched from, other processes, keychains and credential
+helpers. Claw Patrol does not try to strip or hide any of that from
+the wrapped process, because it could not do so reliably, and a
+partial measure would only suggest a boundary that is not there. Keep
+real secrets out of the shell you launch agents from; put them in the
+gateway, where the agent only ever sees placeholders.
+
 ## Out of scope
 
 Claw Patrol does not defend against:
@@ -421,4 +520,7 @@ Claw Patrol does not defend against:
 - cross-user side channels (shared-CPU timing, etc.);
 - exfiltration of locally-readable data by a process that bypasses
   per-process egress interception (see [Egress interception is
-  best-effort](#egress-interception-is-best-effort)).
+  best-effort](#egress-interception-is-best-effort));
+- anything the wrapped process's OS user can already read on the
+  client host, including secrets in the launching shell's environment
+  (`clawpatrol run` is not a sandbox).

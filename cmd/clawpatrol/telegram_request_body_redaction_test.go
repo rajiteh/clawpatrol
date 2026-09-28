@@ -59,8 +59,11 @@ rule "allow-telegram" {
 			t.Errorf("read upstream body: %v", err)
 		}
 		upstreamBodies <- string(body)
+		// Echo the request back, the way an API error page or a debug
+		// endpoint reflects what it received, so the response sample
+		// carries the injected token unless it is redacted too.
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok"))
+		_, _ = w.Write([]byte("echo: " + string(body)))
 	}))
 	defer upstream.Close()
 
@@ -142,8 +145,24 @@ rule "allow-telegram" {
 	if strings.Contains(end.ReqBody, string(fakeTelegramRequestBodyToken)) {
 		t.Fatal("request body audit sample contains injected Telegram token")
 	}
+	if strings.Contains(end.RespBody, string(fakeTelegramRequestBodyToken)) {
+		t.Fatal("response body audit sample contains injected Telegram token echoed by upstream")
+	}
+	if !strings.HasPrefix(end.RespBody, "echo: ") {
+		t.Fatalf("response body audit sample = %q, want the echoed body", end.RespBody)
+	}
 	if !strings.Contains(end.ReqBody, telegramTestPlaceholder) && !strings.Contains(strings.ToLower(end.ReqBody), "redact") {
 		t.Fatalf("request body audit sample = %q, want placeholder or redaction marker", end.ReqBody)
+	}
+	rw := httptest.NewRecorder()
+	(&webMux{g: g}).writeActionFixture(rw, &end)
+	if rw.Code != http.StatusBadRequest {
+		t.Fatalf("fixture export status = %d, want 400 for redacted request body; body=%s", rw.Code, rw.Body.String())
+	}
+	// Token injection edits the body, so the capture is both
+	// transformed and redacted; either reason must be spelled out.
+	if b := rw.Body.String(); !strings.Contains(b, "redacted") && !strings.Contains(b, "transformed") {
+		t.Fatalf("fixture export error = %q, want redacted-body or transformed explanation", b)
 	}
 
 	_ = clientTLS.Close()

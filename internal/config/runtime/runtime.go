@@ -311,6 +311,12 @@ type ConnEvent struct {
 	// the action-fixture exporter can pin a downloaded action to a
 	// specific rule (site/doc/clawpatrol-test.md).
 	Rule string
+	// Credential is the bare name of the credential the runtime
+	// resolved for this connection (the value it put on
+	// match.Request.Credential), "" when none was resolved. Copied
+	// onto the dashboard Event so the fixture exporter can replay
+	// the action against the same credential-pinned rules.
+	Credential string
 	// Approver* mirror ApproveVerdict — set for Action=="approved" /
 	// "denied" so the dashboard can show which approver (and what
 	// kind: human / llm / dashboard) produced the verdict.
@@ -372,6 +378,41 @@ type PostgresStartup struct {
 	Password string
 }
 
+// CredentialVerifier is the optional interface a credential plugin
+// implements when it can synchronously confirm that the operator-
+// supplied secret material is live — Slack's auth.test, Discord's
+// users/@me, Postgres's SELECT 1, etc. The dashboard's connect-form
+// save handler invokes Verify immediately after persisting slot
+// bytes so the credential's reported status reflects the verified
+// state instead of mere slot presence.
+//
+// Verify returns nil on success. A non-nil error describes the
+// failure in operator-readable terms (e.g. "invalid_auth"); the
+// gateway persists the message and surfaces it inline on the
+// connect form.
+//
+// Credentials without a cheap synchronous primitive (generic
+// bearer tokens, mTLS bundles without a probe target) leave this
+// unimplemented; the gateway then falls back to slot-presence for
+// the live status badge.
+type CredentialVerifier interface {
+	VerifyCredential(ctx context.Context, sec Secret) error
+}
+
+// CredentialRejectedError is the error a CredentialVerifier returns
+// when the provider answered and rejected the material (Slack
+// invalid_auth, Discord 401). Any other error — transport failure,
+// timeout, 5xx, rate limit — means the probe could not reach a
+// verdict, and the gateway keeps the last known verification state
+// instead of recording a failure. Reason is the operator-readable
+// message and is what Error() returns; it must never contain the
+// secret.
+type CredentialRejectedError struct {
+	Reason string
+}
+
+func (e *CredentialRejectedError) Error() string { return e.Reason }
+
 // HITLNotifier is the optional interface a credential plugin
 // implements when it can deliver a HITL approval prompt to a human
 // (Slack chat.postMessage, Discord webhook, Telegram sendMessage,
@@ -419,6 +460,11 @@ type HITLMessageUpdate struct {
 	Profile        string
 	UpstreamCalled bool
 	LastError      string
+	// DecidedBy names the operator whose decision produced this update
+	// ("dashboard:alice", "slack:bob"). Empty for states no human
+	// chose: expiry, client disconnect, and the async retry-relay
+	// transitions.
+	DecidedBy string
 }
 
 // HITLTarget is the per-approver config the notifier needs:
@@ -631,10 +677,15 @@ const (
 type HITLOperationState string
 
 // HITLOperationState values: durable lifecycle states for async-HITL
-// operations.
+// operations, plus HITLOperationStateApproved, which only ever
+// appears in HITLMessageUpdate: a sync_waiting prompt was approved
+// while the client was still connected, so the held request goes
+// upstream immediately and no retry grant exists. It is never stored
+// and never shown as a pending entry's operation_state.
 const (
 	HITLOperationStateSyncWaiting             HITLOperationState = "sync_waiting"
 	HITLOperationStatePendingApproval         HITLOperationState = "pending_approval"
+	HITLOperationStateApproved                HITLOperationState = "approved"
 	HITLOperationStateApprovedWaitingForRetry HITLOperationState = "approved_waiting_for_retry"
 	HITLOperationStateDenied                  HITLOperationState = "denied"
 	HITLOperationStateExpired                 HITLOperationState = "expired"
@@ -751,6 +802,10 @@ func HITLApprovalMessage(state HITLOperationState, effect HITLApprovalEffect, up
 	switch state {
 	case HITLOperationStatePendingApproval:
 		return "The original synchronous wait ended and Claw Patrol returned an async polling response to the client.\nUpstream has not been called.\nApprove will not send the request upstream now.\nApprove will allow the client to retry the same request once."
+	case HITLOperationStateApproved:
+		// Stage-neutral on purpose: a later stage of an approve chain
+		// can still deny, so this must not promise the upstream call.
+		return "Approved.\nThe client was still connected, so the decision applies to the held request directly; no client retry is needed."
 	case HITLOperationStateApprovedWaitingForRetry:
 		return "Approved.\nWaiting for the client to retry the original request.\nUpstream has not been called yet."
 	case HITLOperationStateDenied:

@@ -161,13 +161,27 @@ type GatewaySettings struct {
 	// DashboardConfigWrites allows authenticated dashboard users to
 	// append generated config snippets to the gateway HCL. Default
 	// false: config remains read-only and changes happen out-of-band.
+	// Enabling it hands every dashboard login full control of the
+	// gateway: rules, credential bindings, and tunnels, including
+	// `local_command` tunnels that run a program as the gateway's
+	// service user. Treat the dashboard password as a root credential
+	// when this is on, and keep it off for gateways whose dashboard
+	// is reachable beyond the operators you trust with that.
 	DashboardConfigWrites bool `hcl:"dashboard_config_writes,optional"`
 
 	// Resolver is the DNS resolver address the gateway uses for
 	// upstream lookups when the runtime needs an explicit resolver.
 	Resolver string `hcl:"resolver,optional"`
 
-	// LogPath is an optional file path for gateway log output.
+	// LogPath, when set, appends every gateway log line (the same
+	// lines written to stderr: startup, config reloads, denials,
+	// tunnel and plugin events) to this file, created 0600. It is
+	// not an audit log: allowed requests are recorded in the state
+	// database and shown in the dashboard, not logged. The gateway
+	// never rotates the file. Opened right after state_dir is
+	// created, so a path inside state_dir works on a first run;
+	// lines logged while the config itself is being parsed go to
+	// stderr only. Changing it requires a restart.
 	LogPath string `hcl:"log_path,optional"`
 
 	// Telemetry opts in/out of the update-checker / anonymous usage
@@ -326,12 +340,21 @@ type TailscaleBlock struct {
 // needed to override one.
 type Defaults struct {
 	// UnknownHost controls traffic whose destination does not match
-	// any endpoint. "passthrough" relays it; "deny" closes it.
+	// any endpoint. "passthrough" relays it; "deny" closes it;
+	// "inspect" MITMs it as the declared https.unknown endpoint.
 	UnknownHost string `hcl:"unknown_host,optional"`
 
-	// LLMFailMode controls requests guarded by LLM approvers when
-	// the model call errors or times out. "closed" denies; "open"
-	// allows.
+	// LLMFailMode controls requests guarded by an llm_approver when
+	// the judge is unavailable: transport error or timeout, 429 or
+	// 5xx status, or an undecodable response. "closed" (the default)
+	// denies; "open" allows, records the failure as the reason, and
+	// logs a line per request so an outage is visible. A model that
+	// answers, even ambiguously, is judged as usual. Anything that
+	// points at the gateway's own configuration always denies
+	// regardless of this setting: no model, a credential that is not
+	// declared or whose secret cannot be fetched or injected, unknown
+	// model family, and any other 4xx such as 401/403 from a revoked
+	// judge key.
 	LLMFailMode string `hcl:"llm_fail_mode,optional"`
 
 	// LLMCacheTTL is the LLM decision cache lifetime in seconds.
@@ -357,6 +380,14 @@ func (g *Gateway) IsWireGuardEnabled() bool {
 // `tailscale { ... }` sub-block.
 func (g *Gateway) IsTailscaleEnabled() bool {
 	return g != nil && g.Settings != nil && g.Settings.Tailscale != nil
+}
+
+// IsEnrollmentEnabled reports whether workload self-enrollment is
+// configured. Presence of at least one `enrollment "<type>" "<name>"`
+// block (routed through the config-plugin registry into
+// Policy.Enrollments) enables it.
+func (g *Gateway) IsEnrollmentEnabled() bool {
+	return g != nil && g.Policy != nil && len(g.Policy.Enrollments) > 0
 }
 
 // settings returns g.Settings, or a zero-value pointer when nil so
@@ -531,6 +562,7 @@ type Policy struct {
 	Endpoints   map[string]*Entity
 	Rules       map[string]*Entity
 	Tunnels     map[string]*Entity
+	Enrollments map[string]*Entity
 
 	Profiles map[string]*Profile
 
@@ -952,6 +984,7 @@ func loadFiles(files []*hcl.File, configDir string, diags hcl.Diagnostics) (*Gat
 		Endpoints:   make(map[string]*Entity),
 		Rules:       make(map[string]*Entity),
 		Tunnels:     make(map[string]*Entity),
+		Enrollments: make(map[string]*Entity),
 		Profiles:    make(map[string]*Profile),
 	}
 
@@ -985,6 +1018,10 @@ func loadFiles(files []*hcl.File, configDir string, diags hcl.Diagnostics) (*Gat
 	resolveDiags := decodePolicyBlocks(gw.Policy, table, evalCtx, configDir)
 	diags = append(diags, resolveDiags...)
 	diags = append(diags, validateHITLAsyncConfig(gw)...)
+	// Cross-block precondition: workload enrollment provisions WireGuard
+	// peers, so it requires a wireguard data-plane block. Mirrors how
+	// #753 runs validateOIDCEnrollmentsForGateway after the policy decode.
+	diags = append(diags, validateEnrollmentGateway(gw)...)
 
 	// Post-decode pass: substitute `<<file:NAME>>` markers in plugin
 	// body fields that opted in via FileIncludable. Runs after Build
@@ -1227,6 +1264,7 @@ func extractPolicyBlocks(body hcl.Body) (hcl.Blocks, hcl.Diagnostics) {
 			{Type: "approver", LabelNames: []string{"type", "name"}},
 			{Type: "credential", LabelNames: []string{"type", "name"}},
 			{Type: "endpoint", LabelNames: []string{"type", "name"}},
+			{Type: "enrollment", LabelNames: []string{"type", "name"}},
 			{Type: "rule", LabelNames: []string{"name"}},
 			{Type: "profile", LabelNames: []string{"name"}},
 			{Type: "tunnel", LabelNames: []string{"type", "name"}},
@@ -1312,7 +1350,7 @@ func decodePolicyBlocks(p *Policy, table *SymbolTable, evalCtx *hcl.EvalContext,
 	// ordering — symbols are populated in pass 1 — but matching decode
 	// order to compile order keeps Order[] stable across the file's
 	// declaration sequence and avoids surprising readers.
-	for _, kind := range []Kind{KindApprover, KindCredential, KindTunnel, KindEndpoint, KindRule} {
+	for _, kind := range []Kind{KindApprover, KindCredential, KindTunnel, KindEndpoint, KindRule, KindEnrollment} {
 		for _, sym := range table.byKind[kind] {
 			plugin := Lookup(sym.Kind, sym.Type)
 			if plugin == nil {
@@ -1344,7 +1382,7 @@ func decodePolicyBlocks(p *Policy, table *SymbolTable, evalCtx *hcl.EvalContext,
 			}
 			refs, refDiags := resolveRefs(target, sym.Name, plugin, table, sym.Block.DefRange)
 			diags = append(diags, refDiags...)
-			ctx := &BuildCtx{Refs: refs, Symbols: table, Block: sym.Block}
+			ctx := &BuildCtx{Refs: refs, Symbols: table, Policy: p, Block: sym.Block}
 			if plugin.Validate != nil {
 				diags = append(diags, plugin.Validate(target, sym.Name, ctx)...)
 			}
@@ -1368,6 +1406,8 @@ func decodePolicyBlocks(p *Policy, table *SymbolTable, evalCtx *hcl.EvalContext,
 				p.Endpoints[sym.Name] = ent
 			case KindRule:
 				p.Rules[sym.Name] = ent
+			case KindEnrollment:
+				p.Enrollments[sym.Name] = ent
 			}
 			p.Order = append(p.Order, sym.Name)
 		}

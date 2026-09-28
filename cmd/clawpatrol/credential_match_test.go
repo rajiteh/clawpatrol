@@ -4,12 +4,14 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -69,7 +71,7 @@ profile "default" {
 }
 `
 
-	h := newCredentialMatchHarness(t, policyHCL)
+	h := newCredentialMatchHarness(t, policyHCL, "api")
 
 	t.Run("pinned credential allows mutation", func(t *testing.T) {
 		resp := h.send(t, http.MethodPost, `{"app":"avocet-test"}`)
@@ -85,16 +87,44 @@ profile "default" {
 	// `http.method != 'GET'` condition, so it still falls through to the
 	// default deny. This guards against a "fix" that ignores the condition.
 	t.Run("condition still gates the pinned rule", func(t *testing.T) {
+		events, cancelEvents := h.gateway.sink.Subscribe()
+		defer cancelEvents()
 		resp := h.send(t, http.MethodGet, "")
 		if resp.status != http.StatusForbidden {
 			t.Fatalf("GET status = %d (body %q); want 403 from the default deny", resp.status, resp.body)
+		}
+
+		end := waitHTTPSAuditEnd(t, events, "deny")
+		if end.ReqBodyState != bodyCaptureComplete {
+			t.Fatalf("request body state = %q, want %q", end.ReqBodyState, bodyCaptureComplete)
+		}
+		if end.ReqBody != "" {
+			t.Fatalf("recorded request body = %q, want empty", end.ReqBody)
+		}
+		// The resolved credential rides on the event and into the
+		// exported fixture so a replay reaches the same pinned rule.
+		if end.Credential != "pat" {
+			t.Fatalf("event credential = %q, want pat", end.Credential)
+		}
+		rw := httptest.NewRecorder()
+		(&webMux{g: h.gateway}).writeActionFixture(rw, &end)
+		if rw.Code != http.StatusOK {
+			t.Fatalf("fixture export status = %d, want 200; body=%s", rw.Code, rw.Body.String())
+		}
+		var f Fixture
+		if err := json.Unmarshal(rw.Body.Bytes(), &f); err != nil {
+			t.Fatalf("reparse fixture: %v\nbody=%s", err, rw.Body.String())
+		}
+		if f.Action.Credential != "pat" {
+			t.Fatalf("fixture action.credential = %q, want pat", f.Action.Credential)
 		}
 	})
 }
 
 type credentialMatchHarness struct {
-	gateway  *Gateway
-	endpoint *config.CompiledEndpoint
+	gateway    *Gateway
+	endpoint   *config.CompiledEndpoint
+	dialedAddr atomic.Value
 }
 
 type credentialMatchResponse struct {
@@ -102,7 +132,7 @@ type credentialMatchResponse struct {
 	body   string
 }
 
-func newCredentialMatchHarness(t *testing.T, policyHCL string) *credentialMatchHarness {
+func newCredentialMatchHarness(t *testing.T, policyHCL, endpointName string) *credentialMatchHarness {
 	t.Helper()
 
 	db, err := OpenDB(filepath.Join(t.TempDir(), "test.db"))
@@ -119,9 +149,9 @@ func newCredentialMatchHarness(t *testing.T, policyHCL string) *credentialMatchH
 	if err != nil {
 		t.Fatalf("compile config: %v", err)
 	}
-	ep := policy.Endpoints["api"]
+	ep := policy.Endpoints[endpointName]
 	if ep == nil {
-		t.Fatal("missing compiled api endpoint")
+		t.Fatalf("missing compiled %s endpoint", endpointName)
 	}
 
 	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -132,8 +162,10 @@ func newCredentialMatchHarness(t *testing.T, policyHCL string) *credentialMatchH
 	t.Cleanup(upstream.Close)
 
 	upstreamAddr := upstream.Listener.Addr().String()
+	h := &credentialMatchHarness{}
 	transport := &http.Transport{
-		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+			h.dialedAddr.Store(address)
 			var d net.Dialer
 			return d.DialContext(ctx, network, upstreamAddr)
 		},
@@ -160,8 +192,9 @@ func newCredentialMatchHarness(t *testing.T, policyHCL string) *credentialMatchH
 	g.cfg.Store(gw)
 	g.policy.Store(policy)
 	g.transports.Store(ep, transport)
-
-	return &credentialMatchHarness{gateway: g, endpoint: ep}
+	h.gateway = g
+	h.endpoint = ep
+	return h
 }
 
 func (h *credentialMatchHarness) send(t *testing.T, method, body string) credentialMatchResponse {

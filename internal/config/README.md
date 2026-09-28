@@ -76,7 +76,7 @@ declaration.
 Global fallbacks for fail-mode, cache TTL, unknown-host policy.
 
 ```hcl
-unknown_host     = "passthrough"   # "passthrough" | "deny"
+unknown_host     = "passthrough"   # "passthrough" | "deny" | "inspect"
 llm_fail_mode    = "closed"        # "closed" | "open"
 llm_cache_ttl    = 300             # seconds
 human_timeout    = 600             # seconds
@@ -362,7 +362,16 @@ Per request:
    forwarded request.
 
 Unknown hosts fall through to `defaults.unknown_host`
-(`passthrough` by default).
+(`passthrough` by default):
+
+- `passthrough` — splice the TLS stream; the plugin never sees the URL
+- `deny` — hang up at SNI; the plugin never sees the URL
+- `inspect` — MITM unmatched SNI as `https.unknown` (declare
+  `endpoint "https" "unknown" { hosts = [] }`; `hosts` is required
+  by the `https` schema but never consulted on this path) and run
+  its rules on method/path/headers. No credential may bind to
+  `https.unknown`. UDP/443 is refused globally so clients fall back
+  to TCP.
 
 ## Plugin system
 

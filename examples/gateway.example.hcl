@@ -118,7 +118,7 @@ gateway {
 }
 
 defaults {
-  unknown_host     = "passthrough"
+  unknown_host     = "passthrough" # passthrough | deny | inspect
   llm_fail_mode    = "closed"
   llm_cache_ttl    = 300
   human_timeout    = 600

@@ -52,6 +52,12 @@ type CompiledPolicy struct {
 	// pointers into the same Entity records, no copies.
 	Approvers   map[string]*Entity
 	Credentials map[string]*Entity
+
+	// Enrollments authorize new peers into profiles independently of endpoint
+	// routing. Each generic envelope carries the plugin-specific compiled body
+	// and the shared liveness policy.
+	Enrollments       []*CompiledEnrollment
+	EnrollmentsByName map[string]*CompiledEnrollment
 }
 
 // CompiledProfile binds an identity to the endpoint set its requests
@@ -283,6 +289,14 @@ func Compile(gw *Gateway) (*CompiledPolicy, error) {
 	if d == nil {
 		d = &Defaults{}
 	}
+	switch d.LLMFailMode {
+	case "", "closed", "open":
+	default:
+		return nil, fmt.Errorf("defaults.llm_fail_mode %q must be \"closed\" or \"open\"", d.LLMFailMode)
+	}
+	if err := validateUnknownHost(d.UnknownHost); err != nil {
+		return nil, err
+	}
 	cp := &CompiledPolicy{
 		UnknownHost:    d.UnknownHost,
 		LLMFailMode:    d.LLMFailMode,
@@ -295,6 +309,8 @@ func Compile(gw *Gateway) (*CompiledPolicy, error) {
 		Tunnels:        map[string]*CompiledTunnel{},
 		Approvers:      p.Approvers,
 		Credentials:    p.Credentials,
+
+		EnrollmentsByName: map[string]*CompiledEnrollment{},
 	}
 
 	// Compile tunnels first so endpoint compilation can resolve
@@ -347,6 +363,10 @@ func Compile(gw *Gateway) (*CompiledPolicy, error) {
 			}
 			ce.Rules = append(ce.Rules, cr)
 		}
+	}
+
+	if err := validateUnknownInspect(cp); err != nil {
+		return nil, err
 	}
 
 	// Sort each endpoint's rules by priority descending. Ties keep
@@ -449,7 +469,58 @@ func Compile(gw *Gateway) (*CompiledPolicy, error) {
 		cp.Profiles[name] = profile
 	}
 
+	if err := compileEnrollments(cp, p); err != nil {
+		return nil, err
+	}
+
 	return cp, nil
+}
+
+// UnknownInspectEndpoint is the compiled name of endpoint "https" "unknown".
+const UnknownInspectEndpoint = "unknown"
+
+func validateUnknownHost(value string) error {
+	switch value {
+	case "", "passthrough", "deny", "inspect":
+		return nil
+	default:
+		return fmt.Errorf("defaults.unknown_host %q must be passthrough, deny, or inspect", value)
+	}
+}
+
+func validateUnknownInspect(cp *CompiledPolicy) error {
+	ce, ok := cp.Endpoints[UnknownInspectEndpoint]
+	httpsUnknown := ok && ce.Plugin != nil && ce.Plugin.Type == "https"
+	if cp.UnknownHost == "inspect" {
+		if !httpsUnknown {
+			return fmt.Errorf("unknown_host=inspect requires endpoint \"https\" \"unknown\"")
+		}
+	}
+	if !httpsUnknown {
+		return nil
+	}
+	if len(ce.Credentials) > 0 {
+		return fmt.Errorf("https.unknown cannot bind credentials")
+	}
+	enabled := 0
+	for _, r := range ce.Rules {
+		// No credential can bind to https.unknown, so a credential
+		// pin never resolves and MatchRequest would skip the rule
+		// silently — a pinned deny would fall through to the forward
+		// path. Reject it at compile time instead.
+		if r.Credential != "" {
+			return fmt.Errorf("rule %q on https.unknown cannot pin a credential: no credential can bind to https.unknown", r.Name)
+		}
+		if !r.Disabled {
+			enabled++
+		}
+	}
+	// Disabled rules are inert; they must not stop an operator from
+	// switching unknown_host away from inspect without deleting them.
+	if enabled > 0 && cp.UnknownHost != "inspect" {
+		return fmt.Errorf("rules on https.unknown require defaults.unknown_host = \"inspect\"")
+	}
+	return nil
 }
 
 // CredentialEndpointTargets returns the endpoint names a credential

@@ -1,9 +1,9 @@
 package credentials
 
-// clickhouse_credential: HTTPS API takes user + password as query
-// params (?user=…&password=…) or basic-auth header. We populate both
-// — basic-auth handles default-auth ClickHouse setups, query params
-// handle setups that disable header auth.
+// clickhouse_credential: the HTTPS API accepts user + password as a
+// basic-auth header or as ?user=…&password=… query params. Only the
+// header is used: a secret in the URL ends up in access and proxy
+// logs, so any query copy (placeholder or not) is stripped.
 
 import (
 	"context"
@@ -59,10 +59,20 @@ func (c *ClickhouseCredential) InjectHTTP(_ context.Context, req *http.Request, 
 	}
 	password := string(sec.Bytes)
 	req.SetBasicAuth(c.User, password)
-	q := req.URL.Query()
-	q.Set("user", c.User)
-	q.Set("password", password)
-	req.URL.RawQuery = q.Encode()
+	// Auth goes in the header only. ClickHouse accepts ?user=&password=
+	// too, but a secret in the URL ends up in upstream access logs,
+	// proxy logs and error strings. Strip any copy the agent sent so a
+	// placeholder never reaches the server either.
+	if q := req.URL.Query(); q.Has("user") || q.Has("password") {
+		q.Del("user")
+		q.Del("password")
+		req.URL.RawQuery = q.Encode()
+	}
+	// The X-ClickHouse-User / X-ClickHouse-Key placeholder form must go
+	// too: ClickHouse rejects a request that carries those headers and
+	// an Authorization header at the same time.
+	req.Header.Del("X-ClickHouse-User")
+	req.Header.Del("X-ClickHouse-Key")
 	return nil
 }
 

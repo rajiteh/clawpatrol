@@ -23,6 +23,7 @@ import (
 	"github.com/denoland/clawpatrol/internal/config"
 	"github.com/denoland/clawpatrol/internal/config/extplugin"
 	"github.com/denoland/clawpatrol/internal/config/plugins/tailscaleproto"
+	"github.com/denoland/clawpatrol/internal/config/runtime"
 )
 
 type Agent struct {
@@ -107,11 +108,13 @@ func detectAgentTypeFromHost(host string) string {
 }
 
 type AgentRegistry struct {
-	mu      sync.RWMutex
-	agents  map[string]*Agent
-	lc      *local.Client
-	onboard *onboardRegistry // set by Gateway ctor; supplies hostname/owner overrides in WG mode
-	db      *sql.DB          // optional; persists Session rows. nil → in-memory only.
+	mu     sync.RWMutex
+	agents map[string]*Agent
+	lc     *local.Client
+	// whoisOverride replaces the LocalClient whois in tests.
+	whoisOverride func(ip string) *whoisResult
+	onboard       *onboardRegistry // set by Gateway ctor; supplies hostname/owner overrides in WG mode
+	db            *sql.DB          // optional; persists Session rows. nil → in-memory only.
 
 	// persistState debounces per-session DB writes (see persistSession).
 	// Separate mutex from r.mu so a slow SQLite write doesn't block
@@ -256,6 +259,12 @@ func (r *AgentRegistry) trackUA(remoteAddr, host, ua string, in, out int64) {
 // lookupWhois does a synchronous whois (short timeout). Used for
 // credential-owner derivation per-request. Returns nil on failure.
 func (r *AgentRegistry) lookupWhois(ip string) *whoisResult {
+	if r.whoisOverride != nil {
+		return r.whoisOverride(ip)
+	}
+	if r.lc == nil {
+		return nil
+	}
 	addr, err := netip.ParseAddr(ip)
 	if err != nil {
 		return nil
@@ -638,6 +647,13 @@ type IntegrationRow struct {
 	// most recently connected credential surfaces at the top of the
 	// non-pending rows.
 	UpdatedAt int64 `json:"updated_at,omitempty"`
+	// VerifyError carries the operator-readable reason the credential
+	// plugin's last synchronous verification probe rejected the saved
+	// material (e.g. "slack auth.test: invalid_auth"). Populated when
+	// the plugin implements runtime.CredentialVerifier and the most
+	// recent probe failed; empty for verified-ok and for plugins
+	// without a verifier.
+	VerifyError string `json:"verify_error,omitempty"`
 }
 
 // TailscaleAuthStatusUI is the dashboard-facing slice of a
@@ -726,6 +742,24 @@ func (w *webMux) statusList(r *http.Request) []IntegrationRow {
 			present, _ := credentialSlotPresence(w.g.db, name)
 			if len(present) > 0 {
 				row.Connected = true
+			}
+			// Plugins that ship a synchronous verification probe
+			// (Slack auth.test, Discord users/@me) downgrade Connected
+			// to the verification outcome: a paste that Slack rejects
+			// must surface as disconnected with the failure reason,
+			// not as connected just because tokens are in the DB.
+			// Credentials without a verifier fall through with the
+			// slot-presence answer above.
+			if _, hasVerifier := ent.Body.(runtime.CredentialVerifier); hasVerifier {
+				if v, ok := getCredentialVerification(w.g.db, name); ok {
+					// Slot presence stays a precondition: a verification
+					// row that outlives its slots must not report a
+					// credential with nothing to inject as connected.
+					row.Connected = len(present) > 0 && v.Status == "ok"
+					if v.Status == "failed" {
+						row.VerifyError = v.Error
+					}
+				}
 			}
 		}
 		if _, ok := ent.Body.(tailscaleproto.TailscaleAuthProvider); ok {

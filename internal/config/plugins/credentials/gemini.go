@@ -1,10 +1,9 @@
 package credentials
 
 // gemini_api_key: Google Gemini accepts the API key in either the
-// `x-goog-api-key` header or the `?key=` query parameter. Always
-// overwrite both — agents that send placeholder values get them
-// swapped; agents that don't send anything get the real key stamped
-// in.
+// `x-goog-api-key` header or the `?key=` query parameter. Only the
+// header is used: a `?key=` the agent sent (a placeholder) is removed
+// rather than swapped, so the real key never travels in the URL.
 
 import (
 	"context"
@@ -24,12 +23,12 @@ func (g *GeminiAPIKey) InjectHTTP(_ context.Context, req *http.Request, sec runt
 	}
 	key := string(sec.Bytes)
 	req.Header.Set("x-goog-api-key", key)
-	q := req.URL.Query()
-	if q.Get("key") != "" {
-		// Only rewrite the param when the agent set one — otherwise
-		// header injection above is sufficient and we don't want to
-		// surprise the agent with an extra param.
-		q.Set("key", key)
+	// The header is sufficient for every Gemini endpoint. An agent
+	// that put a placeholder in ?key= gets it removed rather than
+	// replaced: the real key must not travel in the URL, where
+	// upstream and proxy logs record it.
+	if q := req.URL.Query(); q.Has("key") {
+		q.Del("key")
 		req.URL.RawQuery = q.Encode()
 	}
 	return nil
