@@ -68,6 +68,7 @@ func TestBridgeReplyRoutingInNetns(t *testing.T) {
 		peerRun("ip", "link", "set", remote, "up")
 	}
 	run("ip", "link", "set", "lo", "up")
+	peerRun("ip", "link", "set", "lo", "up")
 	addLink(underlay, "cni")
 	peerRun("ip", "addr", "add", gateway+"/32", "dev", "cni")
 	for _, addr := range []string{client1, outside} {
