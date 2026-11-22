@@ -4,8 +4,8 @@ package main
 // (oauth-*.json, onboarded.json, wg-peers.json, gateway.log JSONL)
 // with a single ${state_dir}/clawpatrol.db.
 //
-// Schema lives in migrations/sqlite/, applied in numbered order on
-// every boot. The _schema table tracks the highest version applied;
+// Schema migrations run in numbered order on every boot. Most are SQL
+// files in migrations/sqlite/. The _schema table tracks the highest version applied;
 // migrations <= that number are skipped. Pattern mirrors
 // ../unclaw/src/migrations.ts.
 //
@@ -76,15 +76,20 @@ func tightenDBPerms(dbPath string) {
 	}
 }
 
-// migrate applies any unapplied .sql files from migrations/sqlite/.
+// migrate applies pending SQL and schema repair migrations atomically.
 // File names must start with a zero-padded number (0001_*, 0002_*),
 // applied in ascending order.
 func migrate(db *sql.DB) error {
-	if _, err := db.Exec("CREATE TABLE IF NOT EXISTS _schema (version INTEGER NOT NULL)"); err != nil {
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("migrate: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.Exec("CREATE TABLE IF NOT EXISTS _schema (version INTEGER NOT NULL)"); err != nil {
 		return fmt.Errorf("migrate: create _schema: %w", err)
 	}
 	current := 0
-	if err := db.QueryRow("SELECT COALESCE(MAX(version), 0) FROM _schema").Scan(&current); err != nil {
+	if err := tx.QueryRow("SELECT COALESCE(MAX(version), 0) FROM _schema").Scan(&current); err != nil {
 		return fmt.Errorf("migrate: read current version: %w", err)
 	}
 	files, err := fs.ReadDir(migrationsFS, "migrations/sqlite")
@@ -95,7 +100,11 @@ func migrate(db *sql.DB) error {
 		num  int
 		name string
 	}
-	pending := []m{}
+	var pending []m
+	used := map[int]string{peerEnrollmentRepairVersion: peerEnrollmentRepairName}
+	if current < peerEnrollmentRepairVersion {
+		pending = append(pending, m{num: peerEnrollmentRepairVersion, name: peerEnrollmentRepairName})
+	}
 	for _, f := range files {
 		if f.IsDir() || !strings.HasSuffix(f.Name(), ".sql") {
 			continue
@@ -108,6 +117,10 @@ func migrate(db *sql.DB) error {
 		if err != nil {
 			continue
 		}
+		if prior, ok := used[n]; ok {
+			return fmt.Errorf("migrate: duplicate version %d: %s and %s", n, prior, f.Name())
+		}
+		used[n] = f.Name()
 		if n <= current {
 			continue
 		}
@@ -115,26 +128,46 @@ func migrate(db *sql.DB) error {
 	}
 	sort.Slice(pending, func(i, j int) bool { return pending[i].num < pending[j].num })
 	for _, p := range pending {
-		body, err := fs.ReadFile(migrationsFS, "migrations/sqlite/"+p.name)
-		if err != nil {
-			return fmt.Errorf("migrate %s: read file: %w", p.name, err)
-		}
-		if _, err := db.Exec(string(body)); err != nil {
+		if err := applySQLiteMigration(tx, p.name); err != nil {
 			return fmt.Errorf("migrate %s: apply: %w", p.name, err)
 		}
 		// Migration files MAY insert their own _schema row (0001
 		// does, since it's the first to run). Catch-all here for
 		// later migrations that don't.
 		var have int
-		if err := db.QueryRow("SELECT COALESCE(MAX(version), 0) FROM _schema").Scan(&have); err != nil {
+		if err := tx.QueryRow("SELECT COALESCE(MAX(version), 0) FROM _schema").Scan(&have); err != nil {
 			return fmt.Errorf("migrate %s: recheck version: %w", p.name, err)
 		}
 		if have < p.num {
-			if _, err := db.Exec("INSERT INTO _schema (version) VALUES (?)", p.num); err != nil {
+			if _, err := tx.Exec("INSERT INTO _schema (version) VALUES (?)", p.num); err != nil {
 				return fmt.Errorf("migrate %s: record version: %w", p.name, err)
 			}
 		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("migrate: commit: %w", err)
+	}
+	for _, p := range pending {
 		log.Printf("[migrate] applied %s", p.name)
 	}
 	return nil
+}
+
+func applySQLiteMigration(tx *sql.Tx, name string) error {
+	switch name {
+	case peerEnrollmentRepairName:
+		return repairPeerEnrollmentSchema(tx)
+	// Earlier releases committed their DDL separately from the version
+	// marker, so these steps must tolerate a column from a previous attempt.
+	case "0020_action_body_state.sql":
+		return ensureActionBodyState(tx)
+	case "0024_device_node_id.sql":
+		return ensureDeviceNodeID(tx)
+	}
+	body, err := fs.ReadFile(migrationsFS, "migrations/sqlite/"+name)
+	if err != nil {
+		return fmt.Errorf("read file: %w", err)
+	}
+	_, err = tx.Exec(string(body))
+	return err
 }
