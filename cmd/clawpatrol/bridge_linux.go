@@ -29,6 +29,7 @@ type bridgeState struct {
 	reconnects     int
 	bringUpFails   int
 	handoffWritten bool
+	replyRuleReady bool
 }
 
 // bridgeSession is one live tunnel: the userspace WireGuard device, its TUN,
@@ -69,6 +70,13 @@ func bridgeRun(ctx context.Context, opt bridgeOptions) error {
 	}
 
 	st := &bridgeState{}
+	defer func() {
+		if st.replyRuleReady {
+			if err := removeReplyRouting(opt.Iface, opt.FWMark, opt.ReplyPodCIDR); err != nil {
+				log.Printf("bridge: remove reply routing: %v", err)
+			}
+		}
+	}()
 	backoff := time.Second
 	for {
 		sess, err := bridgeBringUp(sigCtx, opt, st)
@@ -144,8 +152,14 @@ func bridgeBringUp(ctx context.Context, opt bridgeOptions, st *bridgeState) (_ *
 	if err := installUnderlayRouting(route4, route6, have6, opt.FWMark, opt.FWMark, opt.RouteProto); err != nil {
 		return nil, err
 	}
+	if opt.ReplyPodCIDR.IsValid() {
+		if err := ensureReplyRule(opt.ReplyPodCIDR, opt.FWMark); err != nil {
+			return nil, err
+		}
+		st.replyRuleReady = true
+	}
 	if opt.EgressFilter {
-		if err := installEgressFilter(opt.Iface, opt.FWMark); err != nil {
+		if err := installEgressFilter(opt.Iface, opt.FWMark, bridgeReplyRouting{cidr: opt.ReplyPodCIDR, dev: route4.Dev}); err != nil {
 			return nil, err
 		}
 	}

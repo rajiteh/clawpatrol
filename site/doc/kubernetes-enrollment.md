@@ -494,6 +494,25 @@ It builds the current workspace image, deploys the Kustomize example, checks
 the restricted agent contract and tunneled traffic, exercises reaping and
 in-process recovery, and verifies cleanup.
 
+## Replies through the CNI
+
+Some CNIs give the Pod an IPv4 /32 address and route other Pods through the
+original default gateway. When the bridge replaces that default, replies to
+an ingress proxy in that range also take the tunnel.
+
+For these networks, pass `--reply-pod-cidr=<IPv4 pod CIDR>` in the bridge
+sidecar arguments. Use the range containing the proxy's source IP as seen by
+the workload. The option is off by default and requires the nftables egress
+filter. It uses the discovered CNI device and gateway for tracked replies to
+connections initiated through that device from within the range. New
+workload connections still use the existing tunnel and egress policy.
+
+The bridge uses IPv4 rule priority 92 and reserves packet mark and conntrack
+mark bit `0x40000000` for this option. Strict reverse-path filtering on the
+CNI device must already allow the ingress path. Replies that need the tunnel
+default for their initial route lookup can pause while a reconnect replaces
+that route.
+
 ## Limitations
 
 - v1 assumes the gateway and agents run in the same Kubernetes cluster.
@@ -502,10 +521,7 @@ in-process recovery, and verifies cleanup.
 - Peer capacity is bounded by the configured WireGuard IPv4 subnet.
 - The bridge needs Pod-network privileges; the agent container should remain
   restricted.
-- Replies to inbound connections (kubelet `httpGet` and `tcpSocket` probes,
-  Services that point at agent Pods) follow the Pod's routes. They leave on
-  the underlay only when the client address matches a CNI route that is more
-  specific than the default route; otherwise they go into the tunnel and are
-  lost. This depends on the CNI. Where it fails, for example when kubelet
-  probes come from the node IP and the Pod has only a link route to its
-  gateway, use exec probes.
+- By default, replies to inbound connections follow the Pod's routes. Use
+  `--reply-pod-cidr` for eligible CNI ingress. For kubelet probes from node
+  IPs outside that CIDR, check whether the CNI has a specific route to the
+  node IP or use exec probes.

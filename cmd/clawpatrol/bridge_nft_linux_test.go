@@ -30,7 +30,7 @@ func TestApplyEgressFilterBatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("nftables.New: %v", err)
 	}
-	if err := applyEgressFilter(c, "clawpatrol0", 111); err != nil {
+	if err := applyEgressFilter(c, "clawpatrol0", 111, bridgeReplyRouting{}); err != nil {
 		t.Fatalf("applyEgressFilter: %v", err)
 	}
 	want := map[int]int{
@@ -85,7 +85,7 @@ func TestEgressFilterInNetns(t *testing.T) {
 	}
 	run("ip", "route", "replace", "default", "dev", "tun1")
 	for range 2 { // replacing the table must work
-		if err := installEgressFilter("tun1", 111); err != nil {
+		if err := installEgressFilter("tun1", 111, bridgeReplyRouting{}); err != nil {
 			t.Fatalf("installEgressFilter: %v", err)
 		}
 	}
