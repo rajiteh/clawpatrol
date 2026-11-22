@@ -63,11 +63,11 @@ func addMissingMigrationColumns(tx *sql.Tx, table string, columns []migrationCol
 	if err != nil {
 		return fmt.Errorf("inspect %s: %w", table, err)
 	}
+	defer func() { _ = rows.Close() }()
 	have := make(map[string]bool)
 	for rows.Next() {
 		var name string
 		if err := rows.Scan(&name); err != nil {
-			_ = rows.Close()
 			return fmt.Errorf("inspect %s: %w", table, err)
 		}
 		have[name] = true
