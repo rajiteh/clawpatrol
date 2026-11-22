@@ -10,6 +10,8 @@ import (
 	"os"
 	"strconv"
 	"strings"
+
+	"github.com/denoland/clawpatrol/internal/config"
 )
 
 // kubernetesDefaultTokenPath is the projected ServiceAccount token the
@@ -93,7 +95,7 @@ func runBridge(args []string) {
 	fs.StringVar(&opt.CAOut, "ca-out", "/clawpatrol/ca.crt", "path to write the gateway CA bundle")
 	fs.StringVar(&opt.ReadyFile, "ready-file", "/clawpatrol/ready", "path to touch after network and env setup succeed")
 	fs.StringVar(&opt.Iface, "iface", "clawpatrol0", "TUN interface name")
-	fs.IntVar(&opt.MTU, "mtu", enrollmentDefaultMTU, "TUN MTU")
+	fs.IntVar(&opt.MTU, "mtu", config.WireGuardDefaultMTU, "TUN MTU when enrollment does not supply it")
 	fs.IntVar(&opt.LocalResetMisses, "local-reset-missed", bridgeWatchdogDefaultResetMisses,
 		"missed keepalives before an in-place tunnel rebuild; 0 disables it, and a value at or above the gateway's reconnect threshold skips directly to re-enrollment")
 	fs.StringVar(&opt.RouteProto, "route-proto", defaultRouteProto,
@@ -136,6 +138,15 @@ func runBridge(args []string) {
 		log.Printf("bridge: %v", err)
 		os.Exit(1)
 	}
+}
+
+// bridgeEffectiveMTU uses the gateway's value when present. Older enrollment
+// responses can omit it, in which case the sidecar uses its local flag.
+func bridgeEffectiveMTU(enrolled, local int) int {
+	if enrolled != 0 {
+		return enrolled
+	}
+	return local
 }
 
 // preferV4 returns the first IPv4 address (unmapped), falling back to the

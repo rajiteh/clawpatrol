@@ -220,6 +220,28 @@ initContainers:
 The complete Pod spec is in
 [`examples/kubernetes/kustomization`](https://github.com/denoland/clawpatrol/tree/main/examples/kubernetes/kustomization).
 
+## WireGuard MTU
+
+The gateway and enrolled bridges default to an inner MTU of 1420 bytes.
+If the network path needs a smaller MTU, set `mtu` inside the gateway's
+existing `wireguard` block. For example, add `mtu = 1404`.
+
+Values from 1280 through 65475 are valid. IPv6 needs at least 1280 bytes.
+Choose an MTU that leaves room for IP, UDP, and WireGuard headers on the
+underlay path.
+
+The gateway applies the value to its WireGuard TUN when it starts. New bridge
+enrollments and bridge reconnects use the gateway's running MTU. An active
+bridge keeps its MTU until it re-enrolls. The bridge's `--mtu` flag provides a
+fallback when an enrollment response omits the MTU. Manually configured
+WireGuard clients set their interface MTU separately.
+
+After a canary gateway starts with the new configuration, check the
+`mtu=` field in the bridge enrollment log or run
+`ip link show dev clawpatrol0` in the bridge container. Verify the value on
+a new Pod and after a bridge reconnect. Repeat a request with a large response
+over the tunnel.
+
 ## Runtime compatibility
 
 The bridge needs a network namespace that it can change with `NET_ADMIN`, a
