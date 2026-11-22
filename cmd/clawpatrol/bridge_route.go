@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"net/netip"
 	"strconv"
 	"strings"
 )
@@ -26,25 +27,50 @@ const (
 	// defaultBridgeFwmark is the default --fwmark. The same number is the
 	// routing table ID.
 	defaultBridgeFwmark = 111
+	bridgeReplyRulePref = "92"
+	// Separate from the control-plane mark, which exempts packets from the
+	// egress filter. The conntrack bit is reserved only when replies are enabled.
+	bridgeReplyMark = 0x40000000
 )
 
 type linuxDefaultRoute struct {
-	Dev string
-	Via string
+	Dev    string
+	Via    string
+	OnLink bool
+}
+
+func parseBridgeReplyCIDR(s string, filter bool, mark int) (netip.Prefix, error) {
+	if s == "" {
+		return netip.Prefix{}, nil
+	}
+	prefix, err := netip.ParsePrefix(s)
+	if err != nil || !prefix.Addr().Is4() || prefix.Bits() == 0 {
+		return netip.Prefix{}, fmt.Errorf("--reply-pod-cidr must be an IPv4 CIDR more specific than /0, got %q", s)
+	}
+	if !filter {
+		return netip.Prefix{}, fmt.Errorf("--reply-pod-cidr requires --egress-filter=on")
+	}
+	if mark == bridgeReplyMark {
+		return netip.Prefix{}, fmt.Errorf("--fwmark %#x is reserved with --reply-pod-cidr", mark)
+	}
+	return prefix.Masked(), nil
 }
 
 func parseDefaultRoute(out []byte) (linuxDefaultRoute, error) {
-	fields := strings.Fields(string(out))
+	line, _, _ := strings.Cut(string(out), "\n")
+	fields := strings.Fields(line)
 	if len(fields) == 0 {
 		return linuxDefaultRoute{}, fmt.Errorf("no default route")
 	}
 	var r linuxDefaultRoute
-	for i := 0; i < len(fields)-1; i++ {
-		switch fields[i] {
-		case "via":
+	for i, field := range fields {
+		switch {
+		case field == "via" && i+1 < len(fields):
 			r.Via = fields[i+1]
-		case "dev":
+		case field == "dev" && i+1 < len(fields):
 			r.Dev = fields[i+1]
+		case field == "onlink":
+			r.OnLink = true
 		}
 	}
 	if r.Dev == "" {
@@ -60,7 +86,11 @@ func underlayTableArgs(family string, route linuxDefaultRoute, table int, proto 
 	if route.Via != "" {
 		args = append(args, "via", route.Via)
 	}
-	return append(args, "dev", route.Dev, "table", strconv.Itoa(table), "proto", proto)
+	args = append(args, "dev", route.Dev, "table", strconv.Itoa(table), "proto", proto)
+	if route.OnLink {
+		args = append(args, "onlink")
+	}
+	return args
 }
 
 // markRuleArgs returns the two policy rules for marked packets, in the order

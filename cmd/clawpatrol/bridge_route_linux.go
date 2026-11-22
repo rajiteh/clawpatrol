@@ -7,7 +7,11 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/netip"
 	"os/exec"
+	"slices"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -80,6 +84,33 @@ func ensureMarkRules(family string, mark, table int) error {
 		if err := runIP(markRuleArgs(family, mark, table)[i]...); err != nil {
 			return fmt.Errorf("mark rule: %w", err)
 		}
+	}
+	return nil
+}
+
+// The reply rule uses the bridge's IPv4 underlay default. The destination
+// selector bounds the rule even if another component sets the packet mark.
+func replyRuleArgs(action string, cidr netip.Prefix, table int) []string {
+	return []string{
+		"ip", "-4", "rule", action, "pref", bridgeReplyRulePref, "to", cidr.String(),
+		"fwmark", fmt.Sprintf("%#x", bridgeReplyMark), "lookup", strconv.Itoa(table), "protocol", defaultRouteProto,
+	}
+}
+
+func ensureReplyRule(cidr netip.Prefix, table int) error {
+	out, err := exec.Command("ip", "-4", "-N", "rule", "show", "pref", bridgeReplyRulePref).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("show reply routing rule: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	if len(strings.Fields(string(out))) == 0 {
+		return runIP(replyRuleArgs("add", cidr, table)...)
+	}
+	// ip prints a host prefix without /32 and spells the rule tag "proto".
+	dst := strings.TrimSuffix(cidr.String(), "/32")
+	want := []string{bridgeReplyRulePref + ":", "from", "all", "to", dst, "fwmark",
+		fmt.Sprintf("%#x", bridgeReplyMark), "lookup", strconv.Itoa(table), "proto", defaultRouteProto}
+	if !slices.Equal(strings.Fields(string(out)), want) {
+		return fmt.Errorf("IPv4 rule priority %s is already in use: %s", bridgeReplyRulePref, strings.TrimSpace(string(out)))
 	}
 	return nil
 }

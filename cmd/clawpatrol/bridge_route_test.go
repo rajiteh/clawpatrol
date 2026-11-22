@@ -18,6 +18,10 @@ func TestParseDefaultRoute(t *testing.T) {
 	if _, err := parseDefaultRoute(nil); err == nil {
 		t.Fatal("empty output parsed")
 	}
+	r, err = parseDefaultRoute([]byte("default via 10.47.0.1 dev eth0 onlink\ndefault via 10.99.0.1 dev eth1 metric 100\n"))
+	if err != nil || r != (linuxDefaultRoute{Via: "10.47.0.1", Dev: "eth0", OnLink: true}) {
+		t.Fatalf("parseDefaultRoute(onlink) = %+v, %v", r, err)
+	}
 }
 
 func TestUnderlayRoutingArgs(t *testing.T) {
@@ -30,6 +34,10 @@ func TestUnderlayRoutingArgs(t *testing.T) {
 	if slices.Contains(got, "via") {
 		t.Fatalf("underlayTableArgs without a gateway = %q", got)
 	}
+	got = underlayTableArgs("-4", linuxDefaultRoute{Via: "10.47.0.1", Dev: "eth0", OnLink: true}, 111, "111")
+	if got[len(got)-1] != "onlink" {
+		t.Fatalf("underlayTableArgs lost onlink: %v", got)
+	}
 
 	rules := markRuleArgs("-4", 111, 111)
 	if len(rules) != 2 {
@@ -40,6 +48,33 @@ func TestUnderlayRoutingArgs(t *testing.T) {
 	}
 	if got := strings.Join(rules[1], " "); got != "ip -4 rule add pref 91 fwmark 0x6f lookup 111" {
 		t.Fatalf("table rule = %q", got)
+	}
+}
+
+func TestParseBridgeReplyCIDR(t *testing.T) {
+	for _, tc := range []struct {
+		value  string
+		filter bool
+		mark   int
+		want   string
+	}{
+		{value: "", want: "invalid Prefix"},
+		{value: "10.47.0.22/16", filter: true, mark: 111, want: "10.47.0.0/16"},
+		{value: "10.47.0.22/32", filter: true, mark: 111, want: "10.47.0.22/32"},
+		{value: "10.47.0.22", filter: true, mark: 111},
+		{value: "0.0.0.0/0", filter: true, mark: 111},
+		{value: "fd00::/64", filter: true, mark: 111},
+		{value: "10.47.0.0/16", filter: false, mark: 111},
+		{value: "10.47.0.0/16", filter: true, mark: bridgeReplyMark},
+	} {
+		got, err := parseBridgeReplyCIDR(tc.value, tc.filter, tc.mark)
+		if tc.want == "" {
+			if err == nil {
+				t.Errorf("parseBridgeReplyCIDR(%q, %v, %#x) = %v, want error", tc.value, tc.filter, tc.mark, got)
+			}
+		} else if err != nil || got.String() != tc.want {
+			t.Errorf("parseBridgeReplyCIDR(%q, %v, %#x) = %v, %v, want %s", tc.value, tc.filter, tc.mark, got, err, tc.want)
+		}
 	}
 }
 

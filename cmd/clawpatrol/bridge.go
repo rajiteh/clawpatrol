@@ -69,6 +69,10 @@ type bridgeOptions struct {
 	// EgressFilter loads the nftables output filter (bridge_nft_linux.go).
 	// Off is an escape hatch for runtimes without nf_tables.
 	EgressFilter bool
+
+	// ReplyPodCIDR is the IPv4 source range eligible for replies via the CNI.
+	// An invalid (zero) prefix leaves reply routing disabled.
+	ReplyPodCIDR netip.Prefix
 }
 
 // defaultRouteProto is the rt_proto the bridge tags its underlay routes with
@@ -102,6 +106,8 @@ func runBridge(args []string) {
 		"on: load an nftables filter that lets pod traffic leave only through the tunnel, and bring-up fails if it cannot load; off: skip it")
 	fs.IntVar(&opt.FWMark, "fwmark", defaultBridgeFwmark,
 		"socket mark for the bridge's own gateway, DNS, and WireGuard traffic, and the ID of the routing table that sends it to the underlay")
+	replyPodCIDR := fs.String("reply-pod-cidr", "",
+		"IPv4 pod CIDR whose inbound CNI connections can receive replies via the CNI; requires --egress-filter=on")
 	_ = fs.Parse(args)
 
 	if len(fs.Args()) > 0 {
@@ -122,6 +128,11 @@ func runBridge(args []string) {
 	case "off":
 	default:
 		fail("clawpatrol bridge: --egress-filter must be on or off, got %q", *egressFilter)
+	}
+	var err error
+	opt.ReplyPodCIDR, err = parseBridgeReplyCIDR(*replyPodCIDR, opt.EgressFilter, opt.FWMark)
+	if err != nil {
+		fail("clawpatrol bridge: %v", err)
 	}
 	if gatewayURLIsPlaintext(opt.GatewayURL) {
 		log.Printf("bridge: WARNING: --gateway-url %s is plain HTTP; the ServiceAccount token and the peer API token cross the network unencrypted. Use the gateway's public_url behind TLS.", opt.GatewayURL)
