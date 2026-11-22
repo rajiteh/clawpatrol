@@ -163,11 +163,9 @@ func bridgeBringUp(ctx context.Context, opt bridgeOptions, st *bridgeState) (_ *
 	if err != nil {
 		return nil, err
 	}
-	if registerResp.MTU != 0 {
-		opt.MTU = registerResp.MTU
-	}
-	log.Printf("bridge: enrolled peer_ip=%s keepalive=%ds reap_count=%d gateway_tunnel_ip=%s",
-		registerResp.PeerIP, registerResp.KeepaliveIntervalSeconds, registerResp.KeepaliveReapCount, registerResp.GatewayTunnelIP)
+	opt.MTU = bridgeEffectiveMTU(registerResp.MTU, opt.MTU)
+	log.Printf("bridge: enrolled peer_ip=%s mtu=%d keepalive=%ds reap_count=%d gateway_tunnel_ip=%s",
+		registerResp.PeerIP, opt.MTU, registerResp.KeepaliveIntervalSeconds, registerResp.KeepaliveReapCount, registerResp.GatewayTunnelIP)
 
 	endpointIP, endpointAddr, err := resolveWGEndpoint(registerResp.Endpoint)
 	if err != nil {
