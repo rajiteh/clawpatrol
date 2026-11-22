@@ -44,14 +44,19 @@ func newEnrollmentTestGateway(t *testing.T) *Gateway {
 // device won't start; CI runs it for real.
 func startEnrollmentTestWGServer(t *testing.T, g *Gateway) *WGServer {
 	t.Helper()
-	prevDB := globalDB
-	prevWG := globalWG
-	globalDB = g.db
-	wg, err := StartWGServer(JoinConfig{
+	return startEnrollmentTestWGServerWithConfig(t, g, JoinConfig{
 		WGSubnetCIDR: "10.55.0.0/24",
 		WGListenPort: freeUDPPort(t),
 		PublicURL:    "https://gateway.example.com",
 	})
+}
+
+func startEnrollmentTestWGServerWithConfig(t *testing.T, g *Gateway, join JoinConfig) *WGServer {
+	t.Helper()
+	prevDB := globalDB
+	prevWG := globalWG
+	globalDB = g.db
+	wg, err := StartWGServer(join)
 	if err != nil {
 		globalDB = prevDB
 		t.Skipf("WGServer unavailable in this environment: %v", err)
@@ -115,6 +120,49 @@ func registerFor(t *testing.T, g *Gateway, subjectKey, replacementKey, pub strin
 		Transport:          enrollmentTransportWireGuard,
 		WireGuardPublicKey: pub,
 	})
+}
+
+func TestWireGuardEnrollmentMTU(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		hcl  string
+		want int
+	}{
+		{name: "default", want: 1420},
+		{name: "configured", hcl: "mtu = 1404", want: 1404},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, diags := config.LoadBytes([]byte(`
+gateway {
+  public_url = "https://gateway.example.com"
+  wireguard {
+    subnet_cidr = "10.55.0.0/24"
+    `+tc.hcl+`
+  }
+}
+`), "mtu.hcl")
+			if diags.HasErrors() {
+				t.Fatal(diags)
+			}
+			join := cfg.Join()
+			join.WGListenPort = freeUDPPort(t)
+			g := newEnrollmentTestGateway(t)
+			wg := startEnrollmentTestWGServerWithConfig(t, g, join)
+			if mtu, err := wg.tun.MTU(); err != nil || mtu != tc.want || wg.tun.ep.MTU() != uint32(tc.want) {
+				t.Fatalf("gateway TUN MTU = %d, channel MTU = %d, err = %v; want %d", mtu, wg.tun.ep.MTU(), err, tc.want)
+			}
+			// A bridge re-enrolls with a new key while retaining its identity.
+			for _, key := range []string{keyA, keyB} {
+				resp, err := registerFor(t, g, "kubernetes:agents:uid-1", "kubernetes:agents:agent-1", key)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if resp.MTU != tc.want {
+					t.Errorf("enrollment MTU = %d, want %d", resp.MTU, tc.want)
+				}
+			}
+		})
+	}
 }
 
 func TestRegisterEnrolledPeerFresh(t *testing.T) {
