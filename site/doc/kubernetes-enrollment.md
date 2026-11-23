@@ -242,17 +242,17 @@ Values from 1280 through 65475 are valid. IPv6 needs at least 1280 bytes.
 Choose an MTU that leaves room for IP, UDP, and WireGuard headers on the
 underlay path.
 
-The gateway applies the value to its WireGuard TUN when it starts. New bridge
-enrollments and bridge reconnects use the gateway's running MTU. An active
-bridge keeps its MTU until it re-enrolls. The bridge's `--mtu` flag provides a
-fallback when an enrollment response omits the MTU. Manually configured
-WireGuard clients set their interface MTU separately.
+The gateway applies the value to its WireGuard TUN when it starts. A config
+reload that changes `mtu` logs a message and has no effect until the gateway
+restarts. New bridge enrollments and bridge reconnects use the gateway's
+running MTU. An active bridge keeps its MTU until it re-enrolls, so restart the
+workload Pods after you lower the MTU. The bridge's `--mtu` flag provides a
+fallback when an enrollment response omits the MTU or sends a value outside
+the valid range.
 
-After a canary gateway starts with the new configuration, check the
-`mtu=` field in the bridge enrollment log or run
-`ip link show dev clawpatrol0` in the bridge container. Verify the value on
-a new Pod and after a bridge reconnect. Repeat a request with a large response
-over the tunnel.
+The setting applies only to the gateway and enrolled bridges. `clawpatrol run`
+and the macOS client always use 1420. Manually configured WireGuard clients set
+their interface MTU separately.
 
 ## Runtime compatibility
 

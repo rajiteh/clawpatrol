@@ -268,10 +268,12 @@ type GenAITelemetryBlock struct {
 const (
 	// WireGuardDefaultMTU is the inner MTU in bytes when no override is set.
 	WireGuardDefaultMTU = 1420
-	// The tunnel carries IPv6. The upper limit fits a maximum-length IPv4
-	// datagram after 20 bytes of IP, 8 of UDP, and 32 of WireGuard overhead.
-	wireGuardMinMTU = 1280
-	wireGuardMaxMTU = 65535 - 20 - 8 - 32
+	// WireGuardMinMTU and WireGuardMaxMTU bound the inner MTU. The tunnel
+	// carries IPv6, which needs 1280. The upper limit fits a maximum-length
+	// IPv4 datagram after 20 bytes of IP, 8 of UDP, and 32 of WireGuard
+	// overhead.
+	WireGuardMinMTU = 1280
+	WireGuardMaxMTU = 65535 - 20 - 8 - 32
 )
 
 // WireGuardBlock is the body of the `wireguard { ... }` sub-block
@@ -287,7 +289,8 @@ type WireGuardBlock struct {
 	ListenPort int `hcl:"listen_port,optional"`
 
 	// MTU is the inner packet size in bytes for the gateway WireGuard TUN
-	// and enrolled bridges. Default 1420. Changes take effect on gateway restart.
+	// and enrolled bridges. Default 1420. Changes take effect on gateway
+	// restart. `clawpatrol run` and the macOS client always use 1420.
 	MTU *int `hcl:"mtu,optional"`
 
 	// HostLoopbackPort is the TCP port the gateway binds on
@@ -1190,11 +1193,11 @@ func validateOperational(gw *Gateway) hcl.Diagnostics {
 
 	if gw.IsWireGuardEnabled() {
 		w := gw.Settings.WireGuard
-		if w.MTU != nil && (*w.MTU < wireGuardMinMTU || *w.MTU > wireGuardMaxMTU) {
+		if w.MTU != nil && (*w.MTU < WireGuardMinMTU || *w.MTU > WireGuardMaxMTU) {
 			diags = append(diags, &hcl.Diagnostic{
 				Severity: hcl.DiagError,
 				Summary:  "Invalid wireguard.mtu",
-				Detail:   fmt.Sprintf("mtu = %d must be between %d and %d bytes.", *w.MTU, wireGuardMinMTU, wireGuardMaxMTU),
+				Detail:   fmt.Sprintf("mtu = %d must be between %d and %d bytes.", *w.MTU, WireGuardMinMTU, WireGuardMaxMTU),
 			})
 		}
 		if w.SubnetCIDR == "" {
