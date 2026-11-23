@@ -212,7 +212,7 @@ clawpatrol bridge \
 | `--ca-out PATH` | `/clawpatrol/ca.crt` | Gateway CA bundle written for the workload container |
 | `--ready-file PATH` | `/clawpatrol/ready` | Marker written after tunnel and handoff setup succeed |
 | `--iface NAME` | `clawpatrol0` | TUN interface name |
-| `--mtu N` | `1420` | Requested TUN MTU; the gateway's enrollment response can override it |
+| `--mtu N` | `1420` | TUN MTU when the enrollment response omits it or sends a value outside 1280-65475 |
 | `--local-reset-missed N` | `2` | Failed liveness probes before rebuilding the peer in place; `0` disables the local reset stage |
 | `--route-proto PROTO` | `111` | Route protocol tag on the underlay routes in the bridge's routing table |
 | `--egress-filter on\|off` | `on` | `on` loads an nftables filter that lets Pod traffic leave only through the tunnel, as the bridge's marked traffic, or as replies; bring-up fails if the filter cannot load. `off` skips it |
