@@ -66,7 +66,7 @@ Environment knobs:
                                  closed and re-enrolls in process with a fresh
                                  key, no container restart)
   CLAWPATROL_E2E_CHECK_VARIANTS  set 0 to skip the bridge variants (raw ICMP
-                                 socket, no ICMP socket, egress filter off)
+                                 socket, no ICMP socket)
   CLAWPATROL_E2E_CHECK_ADMISSION set 0 to skip the example admission policy
                                  check (skipped anyway when the cluster does
                                  not serve MutatingAdmissionPolicy v1)
@@ -255,14 +255,14 @@ agent_exec sh -lc "ip route get '${AGENT_DNS_IP}' | grep -q 'dev clawpatrol0'"
 wait_until "agent reaches the echo Service by DNS name through the tunnel" 30 \
   agent_exec sh -lc "test \"\$(curl -sS --max-time 10 'http://${E2E_HTTP}.${AGENTS_NS}.svc.cluster.local:8081/')\" = 'ok'"
 
-log "checking the egress filter blocks CNI routes outside the tunnel"
-# A pod IP on a CNI subnet route (not the default route) would bypass the
-# tunnel without the bridge's nftables filter. Only check when the route
-# really avoids clawpatrol0, e.g. the echo pod on the same node.
+log "checking CNI routes other than the default still work"
+# The bridge replaces only the default route. On kindnet the same-node echo
+# pod is on a more specific CNI route, so the agent reaches it directly.
 ECHO_POD_IP="$("${KUBECTL[@]}" -n "${AGENTS_NS}" get pod -l "app=${E2E_HTTP}" -o jsonpath='{.items[0].status.podIP}')"
 [[ -n "${ECHO_POD_IP}" ]] || fail "could not resolve the echo pod IP"
 if agent_exec sh -lc "! ip route get '${ECHO_POD_IP}' | grep -q 'dev clawpatrol0'"; then
-  agent_exec sh -lc "! curl -sS --max-time 5 'http://${ECHO_POD_IP}:8081/' >/dev/null 2>&1"
+  wait_until "agent reaches the echo pod on its CNI route" 30 \
+    agent_exec sh -lc "test \"\$(curl -sS --max-time 5 'http://${ECHO_POD_IP}:8081/')\" = 'ok'"
 fi
 
 log "checking inbound connections to the agent pod get replies"
@@ -371,8 +371,8 @@ if [[ "${CHECK_ESCALATION}" == "1" ]]; then
 fi
 
 if [[ "${CHECK_VARIANTS}" == "1" ]]; then
-  log "starting bridge variants: raw ICMP socket, no ICMP socket, egress filter off"
-  VARIANT_PODS=(clawpatrol-agent-raw-probe clawpatrol-agent-no-probe clawpatrol-agent-egress-off)
+  log "starting bridge variants: raw ICMP socket, no ICMP socket"
+  VARIANT_PODS=(clawpatrol-agent-raw-probe clawpatrol-agent-no-probe)
   variant_exec() { local pod="$1"; shift; "${KUBECTL[@]}" -n "${AGENTS_NS}" exec "${pod}" -c agent -- "$@"; }
   bridge_log() { "${KUBECTL[@]}" -n "${AGENTS_NS}" logs "$1" -c clawpatrol-bridge; }
   variant_absent() { [[ "$(sqlite_query "SELECT count(*) FROM wg_peers WHERE enrolled = 1 AND display_name = '${AGENTS_NS}/$1';" 2>/dev/null || printf '1')" -eq 0 ]]; }
@@ -386,14 +386,6 @@ if [[ "${CHECK_VARIANTS}" == "1" ]]; then
     fail "raw-probe bridge did not fall back to a raw ICMP socket"
   bridge_log clawpatrol-agent-no-probe | grep -q 'icmp probe unavailable' ||
     fail "no-probe bridge did not report the probe as unavailable"
-  bridge_log clawpatrol-agent-egress-off | grep -q -- '--egress-filter=off' ||
-    fail "egress-off bridge did not warn that the egress filter is off"
-
-  # With the filter off, a CNI route that avoids the tunnel works again.
-  if variant_exec clawpatrol-agent-egress-off sh -lc "! ip route get '${ECHO_POD_IP}' | grep -q 'dev clawpatrol0'"; then
-    wait_until "egress-off variant reaches the echo pod on a CNI route" 30 \
-      variant_exec clawpatrol-agent-egress-off sh -lc "test \"\$(curl -sS --max-time 5 'http://${ECHO_POD_IP}:8081/')\" = 'ok'"
-  fi
 
   # Without a probe the watchdog uses the handshake age. A healthy tunnel must
   # not flap: stay past two liveness windows without a reconnect.

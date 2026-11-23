@@ -197,14 +197,10 @@ default route would drop the replies from DNS and the gateway API to the
 bridge, and it could not re-enroll. Unmarked packets that use the loopback
 route are dropped, so the gap still fails closed.
 
-The CNI can also leave link and subnet routes in the main table, and
-unmarked traffic could use them to leave outside the tunnel. So the bridge
-loads its own nftables table (`inet clawpatrol`, from
-[`bridge_nft_linux.go`](../cmd/clawpatrol/bridge_nft_linux.go)) with an
-output chain whose policy is drop. It accepts loopback, `clawpatrol0`, marked
-packets, established and related connections, and IPv6 neighbor discovery.
-The filter does not reroute packets. Bring-up fails when it cannot load the
-table; `--egress-filter=off` skips it.
+The bridge changes only the default route. The CNI's link and subnet routes,
+and routes that processes in the Pod add later, stay in the main table, and
+unmarked traffic uses them outside the tunnel. The cluster controls that
+traffic with NetworkPolicy.
 
 The bridge watchdog samples its receive counter every 5 seconds. Because an
 idle tunnel may have no inbound traffic, receive silence alone is not treated

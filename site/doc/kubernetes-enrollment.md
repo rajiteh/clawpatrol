@@ -256,9 +256,8 @@ their interface MTU separately.
 
 ## Runtime compatibility
 
-The bridge needs a network namespace that it can change with `NET_ADMIN`, a
-TUN device from the hostPath `/dev/net/tun`, and `nf_tables` for its egress
-filter.
+The bridge needs a network namespace that it can change with `NET_ADMIN` and
+a TUN device from the hostPath `/dev/net/tun`.
 
 | Runtime | Status |
 |---------|--------|
@@ -270,14 +269,11 @@ Kata runs the Pod in a guest kernel, and gVisor has its own network stack, so
 check these before you rely on either:
 
 - the bridge can open `/dev/net/tun` and create `clawpatrol0`,
-- `NET_ADMIN` lets it change routes and policy rules in the Pod,
-- the egress filter loads (or start the bridge with `--egress-filter=off`),
-  and
+- `NET_ADMIN` lets it change routes and policy rules in the Pod, and
 - the ICMP liveness probe can open a socket (see "Liveness probe
   permissions").
 
-The bridge's error messages for a missing TUN device and a filter that cannot
-load point to this section.
+The bridge's error message for a missing TUN device points to this section.
 
 ### Pod Security
 
@@ -470,20 +466,17 @@ volume assumptions that must be reviewed before applying it.
 
 ### Restrict Pod egress (recommended)
 
-The bridge already fails closed at the routing layer, and its nftables filter
-drops Pod traffic that would leave outside the tunnel through CNI link or
-subnet routes. The filter needs `nf_tables` in the node kernel and the
-runtime; start the bridge with `--egress-filter=off` where it is not
-available. For a cluster-enforced layer as well, use a NetworkPolicy that
-permits only:
+The bridge replaces only the Pod's default route. Traffic on other routes,
+for example a CNI subnet route or a `docker0` bridge inside the sandbox, does
+not go through the tunnel. Use a NetworkPolicy to control in-cluster egress.
+For agents that may reach only clawpatrol, permit only:
 
 - the gateway API and WireGuard endpoint, and
 - cluster DNS.
 
 A ready-to-adapt example is
 [`examples/kubernetes/agent-egress-networkpolicy.yaml`](https://github.com/denoland/clawpatrol/blob/main/examples/kubernetes/agent-egress-networkpolicy.yaml).
-It is optional defense-in-depth and only takes effect on a CNI that enforces
-NetworkPolicy.
+It takes effect only on a CNI that enforces NetworkPolicy.
 
 ### Restrict gateway ingress (recommended)
 
