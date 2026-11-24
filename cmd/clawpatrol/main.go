@@ -417,11 +417,27 @@ type Gateway struct {
 	blobs runtime.BlobStore
 	// pluginMgr supervises the external plugin subprocesses; the
 	// dashboard reads it for the Plugins page.
-	pluginMgr *extplugin.Manager
-	oauth     *OAuthRegistry
-	agents    *AgentRegistry
-	hitl      *HITLRegistry
-	onboard   *onboardRegistry
+	pluginMgr    *extplugin.Manager
+	oauth        *OAuthRegistry
+	agents       *AgentRegistry
+	hitl         *HITLRegistry
+	onboard      *onboardRegistry
+	enrollmentMu sync.Mutex
+	// enrollLive tracks per-peer WireGuard rx_bytes progress for the
+	// enrollment liveness reaper. Guarded by enrollmentMu.
+	enrollLive map[string]enrollmentLiveness
+	// peerStats overrides globalWG.PeerStats for the reaper. Tests only.
+	peerStats func() map[string]wgDevPeerStat
+	// k8sVerifier lets tests inject a fake Kubernetes verifier. In
+	// production it stays nil and k8sRegistrationVerifier builds k8sClient
+	// once, guarded by k8sClientMu.
+	k8sVerifier k8sRegistrationVerifier
+	k8sClientMu sync.Mutex
+	k8sClient   *inClusterK8sClient
+	// enrollRegisterSem bounds concurrent enrollment registrations across
+	// every listener. Created once by acquireRegisterSlot.
+	enrollRegisterOnce sync.Once
+	enrollRegisterSem  chan struct{}
 	// secrets hands credential plugins the secret bytes they inject
 	// at request time. gatewaySecretStore stacks the credential_secrets
 	// table (dashboard slots), OAuthRegistry (refreshed access tokens),
@@ -1014,6 +1030,9 @@ func (g *Gateway) reloadConfigFromFileLocked(path string) error {
 	// Tailscale process / log_path changes are still restart-only.
 	if prev := g.cfg.Load(); prev != nil && prev.LogPath() != next.LogPath() {
 		log.Printf("config reload: log_path changed to %q; takes effect on restart", next.LogPath())
+	}
+	if prev := g.cfg.Load(); prev != nil && prev.Join().WGMTU != next.Join().WGMTU {
+		log.Printf("config reload: wireguard.mtu changed to %d; takes effect on restart", next.Join().WGMTU)
 	}
 	g.cfg.Store(next)
 	log.Printf("config reloaded: %d endpoints across %d profile(s)",
@@ -2252,6 +2271,7 @@ func (g *Gateway) handlePostgresConn(c net.Conn, dstIP string) {
 	if eventHost == "" {
 		eventHost = dstIP
 	}
+	principalID, principalDisplayName := g.approvalPrincipal(agentPip)
 	ch := &runtime.ConnHandle{
 		Conn:     c,
 		Endpoint: ep,
@@ -2288,8 +2308,13 @@ func (g *Gateway) handlePostgresConn(c net.Conn, dstIP string) {
 			})
 		},
 		Approve: func(req runtime.ApproveCallRequest) runtime.ApproveVerdict {
-			return g.runApproveChain(context.Background(), req.Stages, runApproveCtx{
+			approveCtx := req.Context
+			if approveCtx == nil {
+				approveCtx = context.Background()
+			}
+			return g.runApproveChain(approveCtx, req.Stages, runApproveCtx{
 				AgentIP: agentPip, Host: eventHost, Method: req.Verb, Path: req.Summary,
+				PrincipalID: principalID, PrincipalDisplayName: principalDisplayName,
 				Reason:   ifNotEmpty(req.Rule, func(r *config.CompiledRule) string { return r.Outcome.Reason }),
 				Endpoint: ep, Rule: req.Rule, Profile: profile,
 			})
@@ -2404,6 +2429,7 @@ func (g *Gateway) dispatchConnEndpoint(c net.Conn, dstIP string, dstPort uint16,
 	if eventHost == "" {
 		eventHost = dstIP
 	}
+	principalID, principalDisplayName := g.approvalPrincipal(agentPip)
 	ch := &runtime.ConnHandle{
 		Conn:         c,
 		Endpoint:     ep,
@@ -2458,8 +2484,13 @@ func (g *Gateway) dispatchConnEndpoint(c net.Conn, dstIP string, dstPort uint16,
 			})
 		},
 		Approve: func(req runtime.ApproveCallRequest) runtime.ApproveVerdict {
-			return g.runApproveChain(context.Background(), req.Stages, runApproveCtx{
+			approveCtx := req.Context
+			if approveCtx == nil {
+				approveCtx = context.Background()
+			}
+			return g.runApproveChain(approveCtx, req.Stages, runApproveCtx{
 				AgentIP: agentPip, Host: eventHost, Method: req.Verb, Path: req.Summary,
+				PrincipalID: principalID, PrincipalDisplayName: principalDisplayName,
 				Reason:   ifNotEmpty(req.Rule, func(r *config.CompiledRule) string { return r.Outcome.Reason }),
 				Endpoint: ep, Rule: req.Rule, Profile: profile,
 			})
@@ -2983,6 +3014,7 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 		var asyncOp HITLOperation
 		var asyncSyncWait time.Duration
 		if cr != nil && len(cr.Outcome.Approve) > 0 && !hitlRetryBypassedApproval {
+			principalID, principalDisplayName := g.approvalPrincipal(agentAddr)
 			if approverID, asyncApprover, ok := g.asyncHumanApproverFor(cr.Outcome.Approve); ok {
 				start, started, err := g.maybeStartAsyncHITLOperation(req.Context(), hitlAsyncOperationInput{
 					ProfileID:   profile,
@@ -3006,6 +3038,7 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 			}
 			v := g.runApproveChain(req.Context(), cr.Outcome.Approve, runApproveCtx{
 				AgentIP: agentAddr, Host: host, Method: req.Method, Path: req.URL.RequestURI(),
+				PrincipalID: principalID, PrincipalDisplayName: principalDisplayName,
 				UA: req.Header.Get("User-Agent"), BodySample: string(matchBody), Reason: cr.Outcome.Reason,
 				ThreadTS:      req.Header.Get("X-HITL-Thread-TS"),
 				NotifyChannel: req.Header.Get("X-HITL-Channel"),
@@ -3471,6 +3504,8 @@ func secretEnvName(credName string) string {
 // HITL prompt fields + the matching rule + the device's profile.
 type runApproveCtx struct {
 	AgentIP                   string
+	PrincipalID               string
+	PrincipalDisplayName      string
 	Host                      string
 	Method                    string
 	Path                      string
@@ -3535,6 +3570,8 @@ func (g *Gateway) runApproveChain(ctx context.Context, stages []config.ApproveSt
 			Request:                   c.Request,
 			ApproverName:              st.Name,
 			AgentIP:                   c.AgentIP,
+			PrincipalID:               c.PrincipalID,
+			PrincipalDisplayName:      c.PrincipalDisplayName,
 			Profile:                   c.Profile,
 			Method:                    c.Method,
 			Host:                      c.Host,
@@ -3610,6 +3647,14 @@ func resolveUndecidedVerdict(policy *config.CompiledPolicy, name, approverType s
 	return v
 }
 
+func (g *Gateway) approvalPrincipal(agentIP string) (id, displayName string) {
+	id = hitlPeerPrincipalID(agentIP)
+	if g.onboard != nil {
+		displayName = g.onboard.HostnameForIP(agentIP)
+	}
+	return id, displayName
+}
+
 // ifNotEmpty returns f(v) when v != nil, else "".
 func ifNotEmpty(r *config.CompiledRule, f func(*config.CompiledRule) string) string {
 	if r == nil {
@@ -3633,6 +3678,10 @@ func main() {
 		runJoin(os.Args[2:])
 	case "run":
 		runRun(os.Args[2:])
+	case "bridge":
+		// Foreground data plane: self-enroll through an authorizer, bring up
+		// and host a userspace WireGuard tunnel, route the netns, stay up.
+		runBridge(os.Args[2:])
 	case "daemon-internal":
 		// internal: re-exec'd by `clawpatrol run` (Linux only) to host
 		// the per-user tsnet daemon. Hidden from usage(); name carries
@@ -3689,11 +3738,11 @@ func peerIP(c net.Conn) string {
 	return canonicalPeerIP(host)
 }
 
-// canonicalPeerIP collapses a wg-side v6 source (fd77::<n>) into its
-// v4 equivalent (<wg-subnet-prefix>.<n>) so the agent registry,
-// onboard registry, and dashboard track one device per peer
-// regardless of which IP family the inbound flow used. Non-wg
-// addresses pass through unchanged.
+// canonicalPeerIP collapses a wg-side v6 source (fd77::<host-bits>) into
+// its v4 equivalent in the wg subnet so the agent registry, onboard
+// registry, and dashboard track one device per peer regardless of which
+// IP family the inbound flow used. Non-wg addresses pass through
+// unchanged.
 func canonicalPeerIP(ip string) string {
 	if !strings.Contains(ip, ":") {
 		return ip
@@ -3702,27 +3751,22 @@ func canonicalPeerIP(ip string) string {
 	if err != nil || !a.Is6() {
 		return ip
 	}
-	b := a.As16()
-	if b[0] != 0xfd || b[1] != 0x77 {
-		return ip
+	// Use the configured wg subnet to reconstruct the v4. Fall back to the
+	// example config's subnet when nothing's loaded yet (early-boot).
+	prefix := defaultWGPrefix
+	if globalWG != nil && globalWG.prefix.IsValid() {
+		prefix = globalWG.prefix
 	}
-	last := b[15]
-	// Use the configured wg subnet prefix to reconstruct the v4. Fall
-	// back to 10.55.0.0/24 — same default the example config uses —
-	// when nothing's loaded yet (early-boot).
-	prefixV4 := defaultWGV4Prefix
-	if globalWG != nil && globalWG.serverIP.Is4() {
-		s := globalWG.serverIP.As4()
-		prefixV4 = [3]byte{s[0], s[1], s[2]}
+	if v4, ok := wgV4FromV6(prefix, a); ok {
+		return v4.String()
 	}
-	v4 := netip.AddrFrom4([4]byte{prefixV4[0], prefixV4[1], prefixV4[2], last})
-	return v4.String()
+	return ip
 }
 
-// defaultWGV4Prefix matches the example config's wg_subnet_cidr
+// defaultWGPrefix matches the example config's wg_subnet_cidr
 // (10.55.0.0/24). Lets canonicalPeerIP work before the WGServer is
 // up.
-var defaultWGV4Prefix = [3]byte{10, 55, 0}
+var defaultWGPrefix = netip.MustParsePrefix("10.55.0.0/24")
 
 func printVersion() {
 	v := buildVersion
@@ -3745,6 +3789,9 @@ usage:
                                          with no public URL (creds discarded
                                          once join completes)
   clawpatrol run -- <cmd> [args...]      route one process tree through gateway
+  clawpatrol bridge --authorizer <type>/<name> [flags]
+                                         resident sidecar: self-enroll, host the
+                                         WireGuard tunnel, route the netns
   clawpatrol status                      report install + tunnel state
   clawpatrol uninstall                   remove local join state and tunnel config
   clawpatrol env                         print shell exports for sourcing
@@ -4036,6 +4083,16 @@ func runGateway(args []string) {
 			log.Fatalf("wireguard: %v", err)
 		}
 		setWGServer(wg)
+		// Restore any persisted enrolled peers into the device + registry,
+		// then run the liveness reaper. Both are always-on once WireGuard is
+		// up: enrollment can be turned on by a later config reload, and any
+		// peers left behind must keep getting reaped after the feature is
+		// turned off. The reaper is a cheap no-op while there are none.
+		g.logEnrollmentReconcile(context.Background())
+		go g.startEnrollmentReaper(context.Background())
+		if cfg.IsEnrollmentEnabled() {
+			log.Printf("enrollment: enabled")
+		}
 		dashMux := newWebMux(g, cfg.Join(), cfg.PublicURL())
 		dashPort := portOf(dashListen)
 		tcpDispatch := func(c net.Conn, dstIP string, dstPort uint16) {
