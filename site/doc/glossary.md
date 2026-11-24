@@ -85,8 +85,9 @@ endpoints see.
 
 An entity that arbitrates an `approve = [...]` chain stage. Built-in
 types: `llm_approver` (Claude / GPT proctor that reads a
-`policy` prompt) and
-`human_approver` (Slack / dashboard, with optional N-of-N quorum).
+`policy` prompt), `human_approver` (Slack / dashboard, with optional
+N-of-N quorum), and `webhook_approver` (synchronous external HTTPS
+decision service).
 
 ### Profile
 
