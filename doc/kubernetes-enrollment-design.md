@@ -175,7 +175,7 @@ The Linux implementation is in
 Before replacing the Pod's default route, the bridge:
 
 - discovers the original IPv4 and IPv6 default routes (it needs at least
-  one; a Pod on a single-stack IPv6 cluster has only IPv6),
+  one),
 - copies them into routing table 111 (`--fwmark`), tagged with route
   protocol 111 (`--route-proto`), and
 - adds three policy rules for packets with firewall mark 0x6f:
