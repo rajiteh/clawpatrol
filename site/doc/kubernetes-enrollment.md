@@ -354,18 +354,12 @@ drops all capabilities and adds only `NET_ADMIN`, also add `MKNOD`.
 | Kata Containers | Tested on EKS with the QEMU and Cloud Hypervisor handlers |
 | gVisor | Not tested yet |
 
-The EKS tests used the Amazon VPC CNI on an IPv6 cluster. There the VPC CNI
-also gives each Pod an IPv4 egress interface, `v4if0`, with a link route for
-`169.254.172.0/22` that stays outside the tunnel. A Pod with `NET_ADMIN` can
-route all IPv4 through it, and VPC CNI NetworkPolicy does not apply to it.
-The cluster operator must close this path: turn off IPv4 egress
-(`ENABLE_V4_EGRESS=false` on `aws-node`), or block IPv4 egress from agent
-Pods on the node. The bridge needs only one underlay family. With IPv6 only,
-it reaches the gateway over IPv6 and agent IPv4 goes only through the tunnel.
-The setting applies to every Pod in the cluster, the gateway included. A
-gateway without IPv4 egress cannot reach IPv4 destinations for its agents, so
-give it another IPv4 path (for example NAT64 with DNS64) or run it outside the
-cluster.
+The EKS tests used the Amazon VPC CNI on an IPv6 cluster.
+
+> **IPv6 EKS with the Amazon VPC CNI:** the CNI gives each Pod an IPv4
+> egress interface, `v4if0`, that stays outside the tunnel. Set
+> `ENABLE_V4_EGRESS=false` on `aws-node`, or accept that the bridge does not
+> enforce IPv4 traffic on that route.
 
 Under Kata, the bridge runs in the guest kernel and creates `/dev/net/tun`
 there, so the Pod needs no hostPath. This matters on clusters that refuse
